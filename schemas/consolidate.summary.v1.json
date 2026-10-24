@@ -1,0 +1,25 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "consolidate.summary.v1",
+  "title": "consolidate.summary.v1",
+  "description": "Day/week summary (spec 12.3): summary.v1 plus period.",
+  "type": "object",
+  "required": ["next_steps", "period"],
+  "properties": {
+    "request": {"type": ["string", "null"], "maxLength": 600},
+    "investigated": {"type": ["string", "null"], "maxLength": 600},
+    "learned": {"type": ["string", "null"], "maxLength": 600},
+    "completed": {"type": ["string", "null"], "maxLength": 600},
+    "next_steps": {"type": "string", "minLength": 1, "maxLength": 600},
+    "notes": {"type": ["string", "null"], "maxLength": 600},
+    "period": {
+      "type": "object",
+      "required": ["start", "end"],
+      "properties": {
+        "grain": {"enum": ["day", "week", null]},
+        "start": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"},
+        "end": {"type": "string", "pattern": "^\\d{4}-\\d{2}-\\d{2}$"}
+      }
+    }
+  }
+}

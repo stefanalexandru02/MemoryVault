@@ -1,0 +1,19 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "consolidate.procedures.v1",
+  "title": "consolidate.procedures.v1",
+  "description": "One procedure, new or a revision when supersedes_id is set (spec 12.3). skip/skip_reason (not in the spec) let the model decline when the hints do not describe a reusable procedure; without skip=true the four body fields are required.",
+  "type": "object",
+  "properties": {
+    "skip": {"type": "boolean"},
+    "skip_reason": {"type": ["string", "null"]},
+    "name": {"type": "string", "minLength": 1, "maxLength": 200},
+    "task_class": {"type": "string", "minLength": 1},
+    "trigger_text": {"type": "string", "minLength": 1},
+    "body_md": {"type": "string", "minLength": 1},
+    "supersedes_id": {"type": ["string", "null"]},
+    "confidence": {"type": "number", "minimum": 0, "maximum": 1}
+  },
+  "if": {"properties": {"skip": {"const": true}}, "required": ["skip"]},
+  "else": {"required": ["name", "task_class", "trigger_text", "body_md"]}
+}

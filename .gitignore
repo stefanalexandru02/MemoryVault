@@ -8,3 +8,7 @@ __pycache__/
 dist/
 build/
 .env
+
+# Rust
+/target/
+**/*.rs.bk

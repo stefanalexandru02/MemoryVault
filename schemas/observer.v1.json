@@ -1,0 +1,70 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "observer.v1",
+  "title": "observer.v1",
+  "description": "Extract output (spec 10.3), code mode. Unknown keys are ignored.",
+  "type": "object",
+  "required": ["skip", "observations", "fact_candidates"],
+  "properties": {
+    "skip": {"type": "boolean"},
+    "skip_reason": {"type": ["string", "null"]},
+    "observations": {
+      "type": "array",
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["type", "title", "facts", "concepts", "importance", "source_event_seqs"],
+        "properties": {
+          "type": {"enum": ["bugfix", "feature", "refactor", "change", "discovery", "decision", "security_alert", "security_note", "sensitive"]},
+          "title": {"type": "string", "minLength": 1, "maxLength": 120},
+          "subtitle": {"type": ["string", "null"], "maxLength": 200},
+          "narrative": {"type": ["string", "null"], "maxLength": 2000},
+          "facts": {"type": "array", "maxItems": 10, "items": {"type": "string", "maxLength": 300}},
+          "concepts": {
+            "type": "array",
+            "minItems": 1,
+            "maxItems": 5,
+            "items": {"enum": ["how-it-works", "why-it-exists", "what-changed", "problem-solution", "gotcha", "pattern", "trade-off"]}
+          },
+          "entities": {"type": "array", "items": {"type": "string"}},
+          "files": {"type": "array", "items": {"type": "string"}},
+          "importance": {"type": "number", "minimum": 0, "maximum": 1},
+          "sensitivity": {"enum": ["normal", "sensitive", "secret"]},
+          "source_event_seqs": {"type": "array", "minItems": 1, "items": {"type": "integer"}},
+          "scope_hint": {"enum": ["global", "project", "device", "agent", null]}
+        }
+      }
+    },
+    "fact_candidates": {
+      "type": "array",
+      "maxItems": 6,
+      "items": {
+        "type": "object",
+        "required": ["subject", "predicate", "value", "value_text", "confidence", "evidence_seqs"],
+        "properties": {
+          "subject": {
+            "type": "object",
+            "required": ["kind", "name"],
+            "properties": {"kind": {"type": "string", "minLength": 1}, "name": {"type": "string", "minLength": 1}}
+          },
+          "predicate": {"type": "string", "pattern": "^[a-z0-9_]+(\\.[a-z0-9_]+)*$"},
+          "value": {},
+          "value_text": {"type": "string", "maxLength": 300},
+          "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+          "scope_hint": {"enum": ["global", "project", "device", "agent", null]},
+          "valid_from": {"type": ["string", "null"]},
+          "evidence_seqs": {"type": "array", "items": {"type": "integer"}}
+        }
+      }
+    },
+    "procedure_hints": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["task_class", "note"],
+        "properties": {"task_class": {"type": "string", "minLength": 1}, "note": {"type": "string", "minLength": 1}}
+      }
+    },
+    "needs_escalation": {"type": "boolean"}
+  }
+}

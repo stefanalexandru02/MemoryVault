@@ -1,0 +1,77 @@
+[workspace]
+resolver = "3"
+members = ["crates/*"]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+rust-version = "1.85"
+publish = false
+
+[workspace.dependencies]
+# workspace crates
+memvault-core = { path = "crates/core" }
+memvault-ingest = { path = "crates/ingest" }
+memvault-recall = { path = "crates/recall" }
+memvault-memories = { path = "crates/memories" }
+memvault-consolidate = { path = "crates/consolidate" }
+memvault-worker = { path = "crates/worker" }
+memvault-evals = { path = "crates/evals" }
+
+# HTTP server
+axum = { version = "0.8.9", features = ["macros"] }
+tokio = { version = "1.54", features = ["full"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+tower = { version = "0.5.3", features = ["util"] }
+tower-http = { version = "0.7.1", features = ["trace", "limit", "timeout", "request-id", "util"] }
+http = "1"
+http-body-util = "0.1.5"
+
+# Postgres (runtime queries only; `macros` is needed for migrate! and #[sqlx::test])
+sqlx = { version = "0.8.6", default-features = false, features = ["postgres", "runtime-tokio", "tls-rustls", "uuid", "chrono", "json", "migrate", "macros"] }
+pgvector = { version = "0.4.2", features = ["sqlx"] }
+
+# JSON, schemas, prompts
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+jsonschema = { version = "0.60", default-features = false }
+serde_yaml = "0.9"
+minijinja = { version = "3", features = ["serde", "json"] }
+
+# MCP (official Rust SDK), streamable HTTP server mounted in axum
+rmcp = { version = "3.7", features = ["server", "macros", "transport-streamable-http-server"] }
+
+# TEI client
+reqwest = { version = "0.13", default-features = false, features = ["json", "rustls", "http2"] }
+
+# CLI, logging, metrics
+clap = { version = "4.6", features = ["derive", "env"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["json", "env-filter"] }
+metrics = "0.24"
+metrics-exporter-prometheus = { version = "0.18", default-features = false }
+
+# ids, crypto, misc
+uuid = { version = "1.29", features = ["v7", "serde"] }
+hmac = "0.13"
+sha2 = "0.11"
+rand = "0.10"
+hex = "0.4"
+chrono = { version = "0.4.45", default-features = false, features = ["std", "clock", "serde"] }
+thiserror = "2"
+anyhow = "1"
+async-trait = "0.1"
+futures = "0.3"
+
+# hook binary (no async runtime)
+ureq = { version = "3.5", features = ["json"] }
+
+# test helpers
+axum-test = "21"
+wiremock = "0.6"
+tempfile = "3"
+serde_urlencoded = "0.7"
+
+[profile.release]
+lto = "thin"
+strip = true
