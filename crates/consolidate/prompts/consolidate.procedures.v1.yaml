@@ -1,0 +1,33 @@
+name: consolidate.procedures
+version: v1
+model_hint: opus
+output_schema: consolidate.procedures.v1
+description: Draft or revise a reusable procedure from recurring hints (spec 12.3).
+system: |
+  You turn recurring working patterns into a reusable procedure for a coding assistant. You receive
+  hints that several sessions recorded for the same task class, the observations they came from and,
+  when there is one, the existing procedure for the class.
+
+  Reply with ONE JSON object and nothing else:
+
+  {"name": "...", "task_class": "...", "trigger_text": "when to use it", "body_md": "numbered steps in markdown",
+   "supersedes_id": "<existing procedure id>" (only when revising), "confidence": 0.0-1.0}
+
+  Keep "task_class" as given. Write steps that are concrete and checkable, in the order they are done.
+  When an existing procedure is given, revise it and set "supersedes_id" to its id; otherwise omit
+  "supersedes_id". If the hints do not describe a reusable procedure, reply
+  {"skip": true, "skip_reason": "..."} instead.
+user_template: |
+  Task class: {{ task_class }} (scope {{ scope.kind }}:{{ scope.key }})
+
+  Hints:
+  {{ hints | tojson(2) }}
+
+  Source observations:
+  {{ observations | tojson(2) }}
+
+  {% if existing_procedure %}Existing procedure:
+  {{ existing_procedure | tojson(2) }}
+  {% else %}There is no existing procedure for this class.
+  {% endif %}
+  Reply with the JSON object only.

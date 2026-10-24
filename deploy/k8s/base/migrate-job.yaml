@@ -1,0 +1,53 @@
+# Runs `memvault migrate` as memsvc_system. Idempotent: sqlx records applied versions in _sqlx_migrations.
+# Run it before the API rollout. With Argo CD the PreSync hook does that; with plain kubectl, apply this
+# Job first and wait for completion (`kubectl wait --for=condition=complete job/memory-migrate`).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: memory-migrate
+  annotations:
+    argocd.argoproj.io/hook: PreSync
+    argocd.argoproj.io/hook-delete-policy: BeforeHookCreation
+spec:
+  backoffLimit: 3
+  ttlSecondsAfterFinished: 3600
+  template:
+    metadata:
+      labels:
+        app: memory-migrate
+        memvault.io/db-client: "true"
+    spec:
+      restartPolicy: Never
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: migrate
+          image: memvault:0.1.0
+          args: ["migrate"]
+          envFrom:
+            - configMapRef:
+                name: memory-config
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: memory-pg-memsvc-system
+                  key: password
+            - name: DATABASE_SYSTEM_URL
+              value: postgres://memsvc_system:$(DB_PASSWORD)@memory-pg-rw:5432/memsvc?sslmode=require
+            - name: DATABASE_URL
+              value: postgres://memsvc_system:$(DB_PASSWORD)@memory-pg-rw:5432/memsvc?sslmode=require
+          resources:
+            requests:
+              cpu: 100m
+              memory: 64Mi
+            limits:
+              memory: 256Mi
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]

@@ -1,0 +1,128 @@
+# API: `memvault serve`. Rust, so one process per pod with the tokio runtime; 2 replicas and an HPA 2-4 on CPU.
+# Spec section 14, with the Rust resource numbers (250m / 128Mi requests instead of the Python 500m / 512 MB).
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: memory-api
+  labels:
+    app: memory-api
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: memory-api
+  template:
+    metadata:
+      labels:
+        app: memory-api
+        memvault.io/db-client: "true"
+        memvault.io/tei-client: "true"
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 10001
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: api
+          image: memvault:0.1.0
+          args: ["serve"]
+          ports:
+            - name: http
+              containerPort: 8000
+          envFrom:
+            - configMapRef:
+                name: memory-config
+          env:
+            - name: DB_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: memory-pg-memsvc-app
+                  key: password
+            # Known gap, blocked on a design decision (see the deploy notes, request R1): the API has no
+            # DATABASE_SYSTEM_URL by design (spec 14), so db.system is this memsvc_app pool. The runner
+            # result route (POST /v1/work/{id}/result) calls system_tx, which refuses a login without
+            # BYPASSRLS. Until that is resolved, runner result posts fail here. Do not add a system URL to
+            # this Deployment without that decision.
+            - name: DATABASE_URL
+              value: postgres://memsvc_app:$(DB_PASSWORD)@memory-pg-rw:5432/memsvc?sslmode=require
+            - name: TOKEN_PEPPER
+              valueFrom:
+                secretKeyRef:
+                  name: memory-secrets
+                  key: TOKEN_PEPPER
+          resources:
+            requests:
+              cpu: 250m
+              memory: 128Mi
+            limits:
+              cpu: "1"
+              memory: 512Mi
+          # /health runs SELECT 1 and checks TEI. TEI down is `degraded` (still 200), so a TEI outage
+          # does not restart the API pods.
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            initialDelaySeconds: 20
+            periodSeconds: 20
+            timeoutSeconds: 3
+            failureThreshold: 3
+          securityContext:
+            allowPrivilegeEscalation: false
+            readOnlyRootFilesystem: true
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: prompts
+              mountPath: /app/prompts
+              readOnly: true
+            - name: schemas
+              mountPath: /app/schemas
+              readOnly: true
+      volumes:
+        - name: prompts
+          configMap:
+            name: memory-prompts
+        - name: schemas
+          configMap:
+            name: memory-schemas
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: memory-api
+  labels:
+    app: memory-api
+spec:
+  selector:
+    app: memory-api
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: memory-api
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: memory-api
+  minReplicas: 2
+  maxReplicas: 4
+  metrics:
+    - type: Resource
+      resource:
+        name: cpu
+        target:
+          type: Utilization
+          averageUtilization: 70

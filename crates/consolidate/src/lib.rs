@@ -1,35 +1,34 @@
 //! memvault-consolidate: planner, consolidation appliers, revert, admin routes and CLI (spec 6.7,
-//! 12). Skeleton: the owner fills it in, keeping the public signatures.
+//! 12).
+//!
+//! - [`planner`]: the nightly pass (`memvault planner`, `POST /v1/admin/consolidate`): fact
+//!   clusters, auto-activation, decay and archival, day/week summaries, procedure mining, profiles.
+//! - [`appliers`]: results of `consolidate_facts`, `consolidate_summary`, `consolidate_procedures`
+//!   packets, applied by code with audit rows.
+//! - [`revert`]: undo a run from its audit rows.
+//! - [`admin`], [`admin_cli`], [`ops`]: users, spaces, memberships, tokens, packets, jobs, reindex,
+//!   project remap, over REST and the command line.
+//! - [`profiles`]: cached profile blocks.
 
 use axum::Router;
 use memvault_core::{AppState, AppliersRegistry};
 
+pub mod admin;
+pub mod admin_cli;
+pub mod appliers;
+pub mod audit;
+pub mod ops;
+pub mod planner;
+pub mod profiles;
+pub mod revert;
+mod tx;
+
 /// Routes under `/v1` (paths without the prefix): `/admin/...`.
 pub fn router() -> Router<AppState> {
-    Router::new()
+    admin::router()
 }
 
 /// Register the `consolidate_facts`, `consolidate_summary` and `consolidate_procedures` appliers.
-pub fn register_appliers(_registry: &mut AppliersRegistry) {}
-
-pub mod planner {
-    use memvault_core::schemas::admin::ConsolidateResponse;
-    use memvault_core::{ApiError, AppState};
-    use uuid::Uuid;
-
-    /// One planning pass (spec 12.1) for one space, or every space when `None`.
-    /// `memvault planner` and `POST /v1/admin/consolidate` call it.
-    pub async fn run_planner(_state: &AppState, _space_id: Option<Uuid>) -> Result<ConsolidateResponse, ApiError> {
-        todo!("memvault-consolidate: run_planner")
-    }
-}
-
-pub mod admin_cli {
-    use memvault_core::AppState;
-
-    /// `memvault admin <args...>` (users, spaces, memberships, tokens, consolidate, revert,
-    /// reindex, ...). `args` excludes `admin` itself; parse them with clap inside.
-    pub async fn run(_state: AppState, _args: Vec<String>) -> anyhow::Result<()> {
-        anyhow::bail!("memvault admin is not implemented yet")
-    }
+pub fn register_appliers(registry: &mut AppliersRegistry) {
+    appliers::register(registry);
 }

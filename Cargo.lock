@@ -1715,8 +1715,10 @@ dependencies = [
 name = "mem-hook"
 version = "0.1.0"
 dependencies = [
+ "libc",
  "serde",
  "serde_json",
+ "tempfile",
  "ureq",
 ]
 
@@ -1755,10 +1757,18 @@ name = "memvault-consolidate"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "chrono",
+ "clap",
+ "hex",
  "memvault-core",
+ "memvault-ingest",
+ "metrics",
+ "pgvector",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tracing",
@@ -1819,11 +1829,17 @@ name = "memvault-ingest"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "chrono",
+ "hex",
  "memvault-core",
+ "metrics",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
+ "tempfile",
  "tokio",
  "tracing",
  "uuid",
@@ -1833,13 +1849,17 @@ dependencies = [
 name = "memvault-memories"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "axum",
+ "chrono",
+ "futures",
+ "hex",
+ "http",
  "memvault-core",
  "memvault-recall",
  "rmcp",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tracing",
@@ -1851,10 +1871,16 @@ name = "memvault-recall"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "chrono",
+ "hex",
  "memvault-core",
+ "metrics",
+ "pgvector",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "sqlx",
  "tokio",
  "tokio-util",
@@ -1867,10 +1893,14 @@ name = "memvault-worker"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "axum",
+ "chrono",
  "memvault-core",
  "memvault-ingest",
  "memvault-recall",
+ "metrics",
+ "pgvector",
  "serde",
  "serde_json",
  "sqlx",

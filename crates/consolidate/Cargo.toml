@@ -9,9 +9,16 @@ publish.workspace = true
 memvault-core.workspace = true
 
 anyhow.workspace = true
+async-trait.workspace = true
 axum.workspace = true
+chrono.workspace = true
+clap.workspace = true
+hex.workspace = true
+metrics.workspace = true
+pgvector.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+sha2.workspace = true
 sqlx.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -19,3 +26,4 @@ uuid.workspace = true
 
 [dev-dependencies]
 memvault-core = { workspace = true, features = ["test-support"] }
+memvault-ingest.workspace = true

@@ -1,0 +1,58 @@
+# Kustomize base for the MemoryVault deployment (namespace `memory`). Apply an overlay, not this file:
+#   kubectl apply -k deploy/k8s/overlays/home
+#
+# Secrets are NOT part of this kustomization. Create them out of band from secret-template.yaml
+# before the first apply; see the comments there.
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+namespace: memory
+
+resources:
+  - namespace.yaml
+  - postgres-cluster.yaml
+  - migrate-job.yaml
+  - api.yaml
+  - worker.yaml
+  - consolidate-cronjob.yaml
+  - tei.yaml
+  - ingress.yaml
+  - networkpolicy.yaml
+  - servicemonitor.yaml
+
+# Prompts and schemas are the repository's own files, symlinked into this directory because kustomize
+# refuses paths outside the kustomization root. Adding a prompt or schema means adding a line here.
+configMapGenerator:
+  - name: memory-prompts
+    files:
+      - prompts/consolidate.facts.yaml
+      - prompts/consolidate.procedures.yaml
+      - prompts/consolidate.summary.yaml
+      - prompts/observer.code.yaml
+      - prompts/summary.prompt.yaml
+      - prompts/summary.session.yaml
+  - name: memory-schemas
+    files:
+      - schemas/consolidate.facts.v1.json
+      - schemas/consolidate.procedures.v1.json
+      - schemas/consolidate.summary.v1.json
+      - schemas/observer.v1.json
+      - schemas/summary.v1.json
+  - name: memory-config
+    literals:
+      - HOST=0.0.0.0
+      - PORT=8000
+      - LOG_FORMAT=json
+      - PROMPTS_DIR=/app/prompts
+      - SCHEMAS_DIR=/app/schemas
+      - TEI_EMBED_URL=http://tei-embed:80
+      - TEI_RERANK_URL=http://tei-rerank:80
+      - EMBED_MODEL=bge-m3
+      - EMBED_DIMS=1024
+      - RERANK_MODEL=bge-reranker-v2-m3
+
+# Image tags: the overlay sets the registry and tag. `memvault` is the one image for every role.
+images:
+  - name: memvault
+    newName: memvault
+    newTag: 0.1.0

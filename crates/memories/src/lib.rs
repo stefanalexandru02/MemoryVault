@@ -1,21 +1,23 @@
-//! memvault-memories: memories + work-state routes and the MCP server (spec 6.4, 6.5, 7).
-//! Skeleton: the owner fills it in, keeping the public signatures.
+//! memvault-memories: explicit memory writes, work state and the MCP server (spec 6.4, 6.5, 7).
+//!
+//! - [`memories`]: `POST /v1/memories` (remember) and `DELETE /v1/memories/{id}` (forget).
+//! - [`work_state`]: `GET`/`POST /v1/work-state`.
+//! - [`mcp`]: the streamable-HTTP MCP service the server mounts at `/mcp`; its tools call the
+//!   functions of memvault-recall and of this crate.
+
+mod db;
+pub mod mcp;
+pub mod memories;
+pub mod work_state;
 
 use axum::Router;
+use axum::routing::{delete, get, post};
 use memvault_core::AppState;
 
 /// Routes under `/v1` (paths without the prefix): memories (remember, forget), work-state.
 pub fn router() -> Router<AppState> {
     Router::new()
-}
-
-pub mod mcp {
-    use axum::Router;
-    use memvault_core::{ApiError, AppState};
-
-    /// The streamable-HTTP MCP service mounted by the server at `/mcp` (stateless, same bearer
-    /// auth as REST via `memvault_core::auth::authenticate_header`). Stub: 501 for every request.
-    pub fn service(state: AppState) -> Router {
-        Router::new().fallback(|| async { ApiError::not_implemented("MCP") }).with_state(state)
-    }
+        .route("/memories", post(memories::create))
+        .route("/memories/{id}", delete(memories::delete))
+        .route("/work-state", get(work_state::get).post(work_state::post))
 }

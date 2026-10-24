@@ -1,0 +1,16 @@
+# Prometheus Operator scrape of /metrics on the API (metric prefix memsvc_, spec 15). The worker is not
+# scraped until it serves /metrics; see worker.yaml.
+apiVersion: monitoring.coreos.com/v1
+kind: ServiceMonitor
+metadata:
+  name: memory-api
+  labels:
+    app: memory-api
+spec:
+  selector:
+    matchLabels:
+      app: memory-api
+  endpoints:
+    - port: http
+      path: /metrics
+      interval: 30s

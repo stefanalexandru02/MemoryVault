@@ -1,0 +1,10 @@
+# Build-context exclusions for server.Dockerfile (BuildKit reads <Dockerfile>.dockerignore).
+**/target
+.git
+legacy-python
+clients
+evals
+docs
+deploy
+**/.venv
+**/__pycache__

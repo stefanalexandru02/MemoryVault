@@ -10,6 +10,9 @@ memvault-core.workspace = true
 memvault-ingest.workspace = true
 memvault-recall.workspace = true
 tokio-util.workspace = true
+chrono.workspace = true
+metrics.workspace = true
+pgvector.workspace = true
 anyhow.workspace = true
 axum.workspace = true
 serde.workspace = true
@@ -20,4 +23,5 @@ tracing.workspace = true
 uuid.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 memvault-core = { workspace = true, features = ["test-support"] }

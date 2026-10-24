@@ -1,0 +1,209 @@
+# Text Embeddings Inference: embed (bge-m3, 1024d) and rerank (bge-reranker-v2-m3). Spec sections 13 and 14.
+# Model caches sit on PVCs so restarts do not re-download. The first start needs internet egress to
+# huggingface.co (see the tei-model-download NetworkPolicy in networkpolicy.yaml).
+#
+# The image tag is pinned to a CPU build (cpu-1.8 exists in ghcr.io/huggingface/text-embeddings-inference).
+#
+# Pod Security `restricted` applies to the namespace, so the pods run non-root with RuntimeDefault seccomp.
+# A non-root process cannot bind port 80 with all capabilities dropped, so TEI listens on 8080 and the
+# Services keep port 80 (TEI_EMBED_URL / TEI_RERANK_URL stay http://tei-*:80). The UID/GID 1000 is set by
+# the pod, not taken from the image, and fsGroup 1000 makes the model-cache PVCs writable for it.
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tei-embed-cache
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: tei-rerank-cache
+spec:
+  accessModes: ["ReadWriteOnce"]
+  resources:
+    requests:
+      storage: 5Gi
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tei-embed
+  labels:
+    app: tei-embed
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tei-embed
+  template:
+    metadata:
+      labels:
+        app: tei-embed
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: tei
+          image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+          args:
+            - --model-id
+            - BAAI/bge-m3
+            - --max-batch-tokens
+            - "16384"
+            - --port
+            - "8080"
+          env:
+            - name: HUGGINGFACE_HUB_CACHE
+              value: /data
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: "2"
+              memory: 4Gi
+            limits:
+              cpu: "2"
+              memory: 4Gi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            failureThreshold: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: cache
+              mountPath: /data
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: tei-embed-cache
+---
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: tei-rerank
+  labels:
+    app: tei-rerank
+spec:
+  replicas: 1
+  strategy:
+    type: Recreate
+  selector:
+    matchLabels:
+      app: tei-rerank
+  template:
+    metadata:
+      labels:
+        app: tei-rerank
+    spec:
+      securityContext:
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+        - name: tei
+          image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+          args:
+            - --model-id
+            - BAAI/bge-reranker-v2-m3
+            - --port
+            - "8080"
+          env:
+            - name: HUGGINGFACE_HUB_CACHE
+              value: /data
+          ports:
+            - name: http
+              containerPort: 8080
+          resources:
+            requests:
+              cpu: "2"
+              memory: 3Gi
+            limits:
+              cpu: "2"
+              memory: 3Gi
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            failureThreshold: 90
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+          livenessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 30
+            failureThreshold: 5
+          securityContext:
+            allowPrivilegeEscalation: false
+            capabilities:
+              drop: ["ALL"]
+          volumeMounts:
+            - name: cache
+              mountPath: /data
+      volumes:
+        - name: cache
+          persistentVolumeClaim:
+            claimName: tei-rerank-cache
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tei-embed
+  labels:
+    app: tei-embed
+spec:
+  selector:
+    app: tei-embed
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: tei-rerank
+  labels:
+    app: tei-rerank
+spec:
+  selector:
+    app: tei-rerank
+  ports:
+    - name: http
+      port: 80
+      targetPort: http
