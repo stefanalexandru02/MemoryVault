@@ -39,13 +39,19 @@ spec:
                 secretKeyRef:
                   name: memory-pg-memsvc-app
                   key: password
-            # Known gap, blocked on a design decision (see the deploy notes, request R1): the API has no
-            # DATABASE_SYSTEM_URL by design (spec 14), so db.system is this memsvc_app pool. The runner
-            # result route (POST /v1/work/{id}/result) calls system_tx, which refuses a login without
-            # BYPASSRLS. Until that is resolved, runner result posts fail here. Do not add a system URL to
-            # this Deployment without that decision.
+            - name: DB_SYSTEM_PASSWORD
+              valueFrom:
+                secretKeyRef:
+                  name: memory-pg-memsvc-system
+                  key: password
             - name: DATABASE_URL
               value: postgres://memsvc_app:$(DB_PASSWORD)@memory-pg-rw:5432/memsvc?sslmode=require
+            # The API process also runs the work-packet broker (spec 4.7: broker = memsvc_system):
+            # result application (POST /v1/work/{id}/result) and the /v1/admin routes run in system_tx,
+            # after the route has checked the caller's token and space membership. Every user-facing read
+            # and write runs on DATABASE_URL under RLS.
+            - name: DATABASE_SYSTEM_URL
+              value: postgres://memsvc_system:$(DB_SYSTEM_PASSWORD)@memory-pg-rw:5432/memsvc?sslmode=require
             - name: TOKEN_PEPPER
               valueFrom:
                 secretKeyRef:

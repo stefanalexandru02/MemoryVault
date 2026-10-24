@@ -1,12 +1,10 @@
 //! `memvault`: serve, worker, planner, migrate, admin, evals (spec 2, 14).
 
-use std::time::Duration;
-
 use anyhow::Context;
 use clap::{Parser, Subcommand};
 use memvault_core::db::MIGRATOR;
 use memvault_core::{AppState, Db, Settings};
-use memvault_server::{all_appliers, build_router, shutdown_signal};
+use memvault_server::{all_appliers, serve, shutdown_signal};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
 
@@ -70,29 +68,12 @@ async fn main() -> anyhow::Result<()> {
 
     match cli.command {
         Command::Serve { host, port } => {
+            settings.require_token_pepper()?;
             let addr = format!("{}:{}", host.unwrap_or_else(|| settings.host.clone()), port.unwrap_or(settings.port));
             let state = AppState::connect(settings, all_appliers()).await?;
-            let handle = memvault_core::metrics::prometheus_handle();
-            let shutdown = CancellationToken::new();
-            let upkeep = {
-                let shutdown = shutdown.clone();
-                tokio::spawn(async move {
-                    let mut tick = tokio::time::interval(Duration::from_secs(5));
-                    while !shutdown.is_cancelled() {
-                        tokio::select! {
-                            _ = tick.tick() => handle.run_upkeep(),
-                            () = shutdown.cancelled() => {},
-                        }
-                    }
-                })
-            };
-            let listener = memvault_recall::cache::spawn_listener(state.clone(), shutdown.clone());
             let tcp = tokio::net::TcpListener::bind(&addr).await.with_context(|| format!("binding {addr}"))?;
             tracing::info!(%addr, "memvault serving");
-            axum::serve(tcp, build_router(state)).with_graceful_shutdown(shutdown_signal()).await?;
-            shutdown.cancel();
-            let _ = tokio::join!(upkeep, listener);
-            Ok(())
+            serve(state, tcp, shutdown_signal()).await
         }
         Command::Worker => {
             let state = AppState::connect(settings, all_appliers()).await?;
@@ -104,7 +85,8 @@ async fn main() -> anyhow::Result<()> {
                     shutdown.cancel();
                 })
             };
-            let result = memvault_worker::run_worker(state, shutdown).await;
+            let batch_tei = memvault_worker::batch_embedder(&state);
+            let result = memvault_worker::run_worker_with(state, batch_tei, shutdown).await;
             signal.abort();
             result
         }
@@ -124,6 +106,7 @@ async fn main() -> anyhow::Result<()> {
             Ok(())
         }
         Command::Admin { args } => {
+            settings.require_token_pepper()?;
             let db = Db::connect_lazy(&settings)?;
             let state = AppState::new(settings, db, all_appliers())?;
             memvault_consolidate::admin_cli::run(state, args).await

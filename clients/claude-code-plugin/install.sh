@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Builds mem-hook, installs it into this plugin's bin/, and prepares ~/.memory.
 #
-#   ./install.sh                  build with cargo (release) and install
+#   ./install.sh                  build with cargo (profile release-small) and install
 #   MEM_HOOK_BIN=/path/mem-hook ./install.sh   install a prebuilt binary instead of building
 #   MEMORY_HOME=/other/dir ./install.sh        use another memory home (default ~/.memory)
 set -euo pipefail
@@ -14,8 +14,8 @@ if [ -n "${MEM_HOOK_BIN:-}" ]; then
   built=$MEM_HOOK_BIN
 else
   command -v cargo >/dev/null || { echo "cargo not found: install Rust, or set MEM_HOOK_BIN to a prebuilt mem-hook" >&2; exit 1; }
-  (cd "$repo" && cargo build --release -p mem-hook)
-  built=$(cd "$repo" && cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/release/mem-hook
+  (cd "$repo" && cargo build --profile release-small -p mem-hook)
+  built=$(cd "$repo" && cargo metadata --format-version 1 --no-deps | sed -n 's/.*"target_directory":"\([^"]*\)".*/\1/p')/release-small/mem-hook
 fi
 [ -x "$built" ] || { echo "mem-hook binary not found at $built" >&2; exit 1; }
 mkdir -p "$here/bin"

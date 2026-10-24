@@ -36,7 +36,10 @@ fn prune(dir: &Path, max_age: Duration, max_bytes: u64) {
     if total <= max_bytes {
         return;
     }
-    eprintln!("memory: spool exceeds {} bytes (server unreachable or rejecting?); discarding oldest entries", max_bytes);
+    eprintln!(
+        "memory: spool exceeds {} bytes (server unreachable or rejecting?); discarding oldest entries",
+        max_bytes
+    );
     for (i, (p, len)) in files.iter().enumerate() {
         if total <= max_bytes {
             break;

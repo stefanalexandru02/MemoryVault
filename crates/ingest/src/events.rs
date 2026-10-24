@@ -19,8 +19,8 @@ use serde_json::{Map, Value};
 use uuid::Uuid;
 
 use crate::sessions::lock_own_session;
-use crate::tx::user_tx;
 use crate::windows::{self, NewEvent};
+use memvault_core::user_tx;
 
 /// The per-string limits are halved down to this before the excerpt fallback.
 const MIN_HEAD_CHARS: usize = 64;

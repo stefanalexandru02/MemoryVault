@@ -5,7 +5,6 @@
 //! - [`mcp`]: the streamable-HTTP MCP service the server mounts at `/mcp`; its tools call the
 //!   functions of memvault-recall and of this crate.
 
-mod db;
 pub mod mcp;
 pub mod memories;
 pub mod work_state;

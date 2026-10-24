@@ -1,19 +1,15 @@
-//! memvault-evals: record, redact, replay, compare (spec 16). Skeleton: the owner fills it in,
-//! keeping the public signatures.
+//! memvault-evals: record, redact, replay and compare (spec 16.2, 16.3), run as
+//! `memvault evals <subcommand>`.
+//!
+//! - [`record`]: export a session's events and packet outputs to `evals/sessions/<id>.jsonl`.
+//! - [`redact`]: mask secrets, emails, tokens and home paths in recorded sessions.
+//! - [`replay`]: rebuild a scratch space from the sessions, run `evals/questions.yaml` through
+//!   recall and score it against `evals/facts_gold.yaml` and `evals/baseline.json`.
+//! - [`compare`]: claude-mem's SQLite and this service side by side for the same session ids.
 
-use axum::Router;
-use memvault_core::AppState;
-
-/// Routes under `/v1` (paths without the prefix), if any.
-pub fn router() -> Router<AppState> {
-    Router::new()
-}
-
-pub mod cli {
-    use memvault_core::AppState;
-
-    /// `memvault evals <args...>` (`args` excludes `evals`); parse them with clap inside.
-    pub async fn run(_state: AppState, _args: Vec<String>) -> anyhow::Result<()> {
-        anyhow::bail!("memvault evals is not implemented yet")
-    }
-}
+pub mod cli;
+pub mod compare;
+pub mod record;
+pub mod redact;
+pub mod replay;
+pub mod session;

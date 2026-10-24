@@ -11,7 +11,6 @@
 pub mod cache;
 pub mod candidates;
 pub mod context;
-mod db;
 pub mod engine;
 pub mod render;
 pub mod scoring;

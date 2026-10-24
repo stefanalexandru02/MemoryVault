@@ -69,6 +69,9 @@ fn parse_args(args: &[String]) -> Result<Opts, String> {
     Ok(Opts { session, final_run, kinds, max })
 }
 
+/// Passes one observer process runs at most (its own plus replayed requests).
+const MAX_PASSES: usize = 10;
+
 pub fn run(args: &[String]) {
     let opts = match parse_args(args) {
         Ok(o) => o,
@@ -77,31 +80,95 @@ pub fn run(args: &[String]) {
     let home = config::memory_home();
     let Some(cfg) = Config::load(&home) else { return };
     let _ = util::mkdir_private(&home);
-    // One observer per machine at a time; the lock is released when the process exits.
-    let Some(_lock) = util::open_lock(&home.join("observe.lock")).filter(util::try_lock) else { return };
+    let lock_path = home.join("observe.lock");
+    let requests = home.join("observe.again");
+    // One observer per machine at a time (the lock is held by the open file). A busy lock leaves
+    // this run's arguments for the holder, which replays them before it lets go, so a window that
+    // closes while another observer is finishing is not left waiting for the next run.
+    let Some(lock) = util::open_lock(&lock_path) else { return };
+    if !util::try_lock(&lock) {
+        request_again(&requests, args);
+        if !util::try_lock(&lock) {
+            return;
+        }
+    }
     let api = Api::new(&cfg);
-    log(&home, &format!("observer start {opts:?}"));
+    let mut lock = Some(lock);
+    let mut queue = vec![opts];
+    let mut passes = 0;
+    while let Some(held) = lock.take() {
+        loop {
+            for o in std::mem::take(&mut queue) {
+                if passes < MAX_PASSES {
+                    passes += 1;
+                    pass(&home, &api, &cfg, &o);
+                }
+            }
+            queue = take_requests(&requests);
+            if queue.is_empty() {
+                break;
+            }
+        }
+        drop(held);
+        // A request written after the last take but before the unlock: pick it up unless another
+        // observer got the lock first (it replays requests itself).
+        if passes < MAX_PASSES && requests.exists() {
+            lock = util::open_lock(&lock_path).filter(util::try_lock);
+        }
+    }
+}
+
+/// Appends `args` (one JSON array per line) to the request file.
+fn request_again(path: &Path, args: &[String]) {
+    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+        let _ = writeln!(f, "{}", json!(args));
+    }
+}
+
+/// Takes every pending request (rename, then read), deduplicated.
+fn take_requests(path: &Path) -> Vec<Opts> {
+    let taken = path.with_extension(format!("taken.{}", std::process::id()));
+    if std::fs::rename(path, &taken).is_err() {
+        return Vec::new();
+    }
+    let text = std::fs::read_to_string(&taken).unwrap_or_default();
+    let _ = std::fs::remove_file(&taken);
+    let mut out: Vec<Opts> = Vec::new();
+    for line in text.lines() {
+        let Ok(args) = serde_json::from_str::<Vec<String>>(line) else { continue };
+        if let Ok(o) = parse_args(&args)
+            && !out.contains(&o)
+        {
+            out.push(o);
+        }
+    }
+    out
+}
+
+/// Leases and runs up to `opts.max` packets.
+fn pass(home: &Path, api: &Api, cfg: &Config, opts: &Opts) {
+    log(home, &format!("observer start {opts:?}"));
     let mut done = 0;
     while done < opts.max {
         let lease = json!({ "session_id": opts.session, "kinds": opts.kinds, "max": 1 });
         let packet = match api.post("/v1/work/lease", &lease, LEASE_TIMEOUT) {
             Ok(r) if r.ok() => r.json().and_then(|v| v["packets"].get(0).cloned()),
             Ok(r) => {
-                log(&home, &format!("lease failed: HTTP {}", r.status));
+                log(home, &format!("lease failed: HTTP {}", r.status));
                 None
             }
             Err(e) => {
-                log(&home, &format!("lease failed: {e}"));
+                log(home, &format!("lease failed: {e}"));
                 None
             }
         };
         let Some(packet) = packet else { break };
         done += 1;
-        if !process(&cfg, &api, &packet) {
+        if !process(cfg, api, &packet) {
             break;
         }
     }
-    log(&home, &format!("observer done, {done} packet(s), final={}", opts.final_run));
+    log(home, &format!("observer done, {done} packet(s), final={}", opts.final_run));
 }
 
 fn log(home: &Path, msg: &str) {

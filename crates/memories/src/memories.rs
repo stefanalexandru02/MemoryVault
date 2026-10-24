@@ -20,7 +20,7 @@ use memvault_core::schemas::memories::{
 };
 use memvault_core::{ApiError, AppState, Identity, require_scope};
 
-use crate::db::user_tx;
+use memvault_core::user_tx;
 use memvault_recall::engine::validate_scopes;
 use memvault_recall::render;
 use serde_json::{Value, json};

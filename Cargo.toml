@@ -65,6 +65,7 @@ futures = "0.3"
 
 # hook binary (no async runtime)
 ureq = { version = "3.5", features = ["json"] }
+libc = "0.2"
 
 # test helpers
 axum-test = "21"
@@ -72,6 +73,23 @@ wiremock = "0.6"
 tempfile = "3"
 serde_urlencoded = "0.7"
 
+# Debug info for workspace crates only (line tables keep backtraces useful); dependencies carry
+# none, which keeps the target directory small.
+[profile.dev]
+debug = "line-tables-only"
+
+[profile.dev.package."*"]
+debug = false
+
 [profile.release]
-lto = "thin"
+lto = "fat"
+codegen-units = 1
 strip = true
+
+# The hook binary runs on every tool call and is copied to every machine: optimise it and its
+# dependencies for size (`cargo build --profile release-small -p mem-hook`; install.sh does this).
+# mem-hook's panic hook exits 0 before the abort, so a panic still never fails a Claude Code hook.
+[profile.release-small]
+inherits = "release"
+opt-level = "s"
+panic = "abort"

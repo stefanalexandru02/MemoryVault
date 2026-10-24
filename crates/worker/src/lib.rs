@@ -21,29 +21,22 @@ use embed::EmbedTarget;
 use queue::Job;
 
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
-const OTHER_JOB_TYPES: &[&str] = &["render_context", "reindex", "retention"];
 const RENDER_JOB_TYPES: &[&str] = &["render_context"];
 const BULK_JOB_TYPES: &[&str] = &["reindex", "retention"];
 
-/// Routes under `/v1` (paths without the prefix), if any. The worker has none.
-pub fn router() -> Router<AppState> {
-    Router::new()
-}
-
 /// Embedder for worker batches: same model as `state.tei` but with `TEI_EMBED_BATCH_TIMEOUT_S`
-/// (default 60 s) instead of the 2 s single-query timeout.
-pub fn batch_embedder(settings: &memvault_core::config::Settings) -> Arc<dyn Embedder> {
-    let timeout = std::env::var("TEI_EMBED_BATCH_TIMEOUT_S")
-        .ok()
-        .and_then(|v| v.parse::<f64>().ok())
-        .filter(|v| *v > 0.0)
-        .map_or(Duration::from_secs(60), Duration::from_secs_f64);
+/// instead of the 2 s single-query timeout. With `FAKE_TEI` it is `state.tei` itself.
+pub fn batch_embedder(state: &AppState) -> Arc<dyn Embedder> {
+    let settings = &state.settings;
+    if settings.fake_tei {
+        return state.tei.clone();
+    }
     Arc::new(TeiClient::new(
         &settings.tei_embed_url,
         &settings.tei_rerank_url,
         &settings.embed_model,
         settings.embed_dims,
-        timeout,
+        settings.tei_embed_batch_timeout,
         settings.tei_rerank_timeout,
     ))
 }
@@ -118,11 +111,6 @@ async fn run_embed_jobs(state: &AppState, tei: &Arc<dyn Embedder>, jobs: &[Job])
         }
     }
     Ok(())
-}
-
-/// Claim and run one `render_context`, `reindex` or `retention` job. Returns the number claimed.
-pub async fn other_pass(state: &AppState, worker: &str) -> anyhow::Result<usize> {
-    job_pass(state, worker, OTHER_JOB_TYPES).await
 }
 
 /// Claim and run one job of the given types, renewing its lock while it runs.
@@ -252,8 +240,11 @@ pub async fn run_worker_with(
     let id = format!("worker-{}", memvault_core::ids::short_id(&memvault_core::ids::new_id()));
     tracing::info!(worker = id, "worker started");
     let mut tasks = tokio::task::JoinSet::new();
-    let addr = std::env::var("WORKER_METRICS_ADDR")
-        .unwrap_or_else(|_| format!("{}:{}", state.settings.host, state.settings.port));
+    let addr = state
+        .settings
+        .worker_metrics_addr
+        .clone()
+        .unwrap_or_else(|| format!("{}:{}", state.settings.host, state.settings.port));
     match tokio::net::TcpListener::bind(&addr).await {
         Ok(listener) => {
             tracing::info!(%addr, "worker metrics listening");

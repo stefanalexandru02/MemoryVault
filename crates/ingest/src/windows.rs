@@ -16,11 +16,11 @@
 //!   the window observations' titles and the session summary the prompt summaries.
 //!   [`after_packet_settled`] and the sweep trigger that.
 
-use crate::tx::system_tx;
 use chrono::{DateTime, Utc};
 use memvault_core::Settings;
 use memvault_core::prompts::PromptRegistry;
 use memvault_core::schemas::common::{EventKind, PacketKind};
+use memvault_core::system_tx;
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
@@ -350,11 +350,13 @@ pub async fn end_session(
             .fetch_one(&mut *conn)
             .await?;
         if !exists {
-            sqlx::query("UPDATE session_windows SET prompt_summary_pending = true WHERE session_id = $1 AND window_no = $2")
-                .bind(session.id)
-                .bind(window_no)
-                .execute(&mut *conn)
-                .await?;
+            sqlx::query(
+                "UPDATE session_windows SET prompt_summary_pending = true WHERE session_id = $1 AND window_no = $2",
+            )
+            .bind(session.id)
+            .bind(window_no)
+            .execute(&mut *conn)
+            .await?;
             packets.extend(maybe_create_prompt_summary(conn, prompts, session, prompt_no).await?);
         }
     }

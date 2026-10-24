@@ -23,7 +23,6 @@ pub mod prompts;
 pub mod queue;
 pub mod sessions;
 pub mod summaries;
-mod tx;
 pub mod windows;
 pub mod work;
 

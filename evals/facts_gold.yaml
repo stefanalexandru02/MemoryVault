@@ -1,0 +1,6 @@
+# Hand-labelled facts. Fact precision = extracted facts that equal a gold entry
+# (subject, predicate, value; case-insensitive) / all extracted facts.
+facts:
+  - subject: acme-app
+    predicate: project.stack.language
+    value: Rust

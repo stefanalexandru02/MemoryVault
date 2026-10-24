@@ -13,8 +13,8 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::builders::{SessionRow, lock_session};
-use crate::tx::user_tx;
 use crate::windows;
+use memvault_core::user_tx;
 
 pub fn window_policy(settings: &Settings) -> WindowPolicy {
     WindowPolicy { tool_uses: settings.window_tool_uses, idle_seconds: settings.window_idle_seconds }

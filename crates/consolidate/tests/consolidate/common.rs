@@ -2,7 +2,6 @@
 
 #![allow(dead_code)]
 
-use std::path::PathBuf;
 use std::sync::Arc;
 
 use chrono::{DateTime, Duration, Utc};
@@ -27,11 +26,9 @@ pub struct Ctx {
 }
 
 pub fn ctx(pool: PgPool) -> Ctx {
-    let mut settings = test_settings();
-    settings.prompts_dir = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("prompts");
     let mut registry = AppliersRegistry::default();
     memvault_consolidate::register_appliers(&mut registry);
-    let (state, tei) = test_state_with(pool.clone(), settings, registry);
+    let (state, tei) = test_state_with(pool.clone(), test_settings(), registry);
     Ctx { pool, state, tei }
 }
 

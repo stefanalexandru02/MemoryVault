@@ -11,6 +11,7 @@ use memvault_core::db::caps;
 use memvault_core::http::{BODY_LIMIT_BYTES, api_router};
 use memvault_core::schemas::common::{HealthResponse, HealthTei};
 use memvault_core::{AppState, AppliersRegistry};
+use tokio_util::sync::CancellationToken;
 use tower_http::limit::RequestBodyLimitLayer;
 use tower_http::request_id::{MakeRequestUuid, PropagateRequestIdLayer, SetRequestIdLayer};
 use tower_http::timeout::TimeoutLayer;
@@ -34,9 +35,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(memvault_ingest::router())
         .merge(memvault_recall::router())
         .merge(memvault_memories::router())
-        .merge(memvault_consolidate::router())
-        .merge(memvault_worker::router())
-        .merge(memvault_evals::router());
+        .merge(memvault_consolidate::router());
     let mcp = memvault_memories::mcp::service(state.clone()).layer(RequestBodyLimitLayer::new(BODY_LIMIT_BYTES));
     api_router(v1)
         .route("/health", get(health))
@@ -81,6 +80,34 @@ async fn health(State(state): State<AppState>) -> impl IntoResponse {
 /// `GET /metrics`: Prometheus text format.
 async fn metrics() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], memvault_core::metrics::prometheus_handle().render())
+}
+
+/// `memvault serve` on a bound listener until `shutdown` resolves: the full router, the
+/// context-cache invalidation listener (spec 11.6) and Prometheus recorder upkeep.
+pub async fn serve(
+    state: AppState,
+    tcp: tokio::net::TcpListener,
+    shutdown: impl Future<Output = ()> + Send + 'static,
+) -> anyhow::Result<()> {
+    let handle = memvault_core::metrics::prometheus_handle();
+    let stop = CancellationToken::new();
+    let upkeep = {
+        let stop = stop.clone();
+        tokio::spawn(async move {
+            let mut tick = tokio::time::interval(Duration::from_secs(5));
+            loop {
+                tokio::select! {
+                    _ = tick.tick() => handle.run_upkeep(),
+                    () = stop.cancelled() => return,
+                }
+            }
+        })
+    };
+    let listener = memvault_recall::cache::spawn_listener(state.clone(), stop.clone());
+    let served = axum::serve(tcp, build_router(state)).with_graceful_shutdown(shutdown).await;
+    stop.cancel();
+    let _ = tokio::join!(upkeep, listener);
+    Ok(served?)
 }
 
 /// Resolves on Ctrl-C or SIGTERM.

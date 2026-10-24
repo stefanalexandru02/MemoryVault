@@ -5,6 +5,7 @@ mod auth;
 mod db;
 mod http;
 mod migrations;
+mod prompts;
 mod rls;
 mod schemas;
 mod tei;

@@ -414,6 +414,35 @@ impl PacketApplier for ExtractApplier {
     }
 }
 
+/// Spec 8.3: observations citing events a subagent produced carry `subagent:<agent_type>` in
+/// `entities`, whatever the model wrote. The agent types come from the packet's immutable
+/// `inputs.events` (see [`crate::builders::packet_event`]).
+pub fn tag_subagent_observations(observations: &[ObservedObservation], inputs: &Value) -> Vec<ObservedObservation> {
+    let agent_types: HashMap<i64, &str> = inputs
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| Some((e.get("seq")?.as_i64()?, e.get("agent_type")?.as_str()?)))
+        .filter(|(_, t)| !t.is_empty())
+        .collect();
+    observations
+        .iter()
+        .map(|obs| {
+            let mut obs = obs.clone();
+            for seq in &obs.source_event_seqs {
+                if let Some(t) = agent_types.get(seq) {
+                    let tag = format!("subagent:{t}");
+                    if !obs.entities.contains(&tag) {
+                        obs.entities.push(tag);
+                    }
+                }
+            }
+            obs
+        })
+        .collect()
+}
+
 pub async fn apply_extract(
     conn: &mut PgConnection,
     packet: &PacketRecord,
@@ -448,7 +477,8 @@ pub async fn apply_extract(
     let mut obs_by_seq: HashMap<i64, Vec<Uuid>> = HashMap::new();
     let mut packet_obs: Vec<Uuid> = Vec::new();
     let mut first_new: Option<Uuid> = None;
-    for obs in &output.observations {
+    let observations = tag_subagent_observations(&output.observations, &packet.inputs);
+    for obs in &observations {
         let scope = scope_for(obs.scope_hint, &session);
         let hash = content_hash(obs);
         let subagent = obs.entities.iter().any(|e| e.starts_with("subagent:"));
@@ -564,6 +594,29 @@ pub async fn apply_extract(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tags_observations_citing_subagent_events() {
+        let obs = |seqs: Vec<i64>, entities: Vec<&str>| -> ObservedObservation {
+            serde_json::from_value(json!({
+                "type": "discovery", "title": "t", "facts": [], "concepts": ["how-it-works"], "importance": 0.5,
+                "source_event_seqs": seqs, "entities": entities,
+            }))
+            .unwrap()
+        };
+        let inputs = json!({"events": [
+            {"seq": 1, "kind": "tool_use"},
+            {"seq": 2, "kind": "tool_use", "agent_id": "a1", "agent_type": "Explore"},
+            {"seq": 3, "kind": "subagent_stop", "agent_id": "a1", "agent_type": "Explore"},
+        ]});
+        let tagged = tag_subagent_observations(
+            &[obs(vec![1], vec!["x"]), obs(vec![2, 3], vec!["x"]), obs(vec![2], vec!["subagent:Explore"])],
+            &inputs,
+        );
+        assert_eq!(tagged[0].entities, vec!["x"]);
+        assert_eq!(tagged[1].entities, vec!["x", "subagent:Explore"]);
+        assert_eq!(tagged[2].entities, vec!["subagent:Explore"]);
+    }
 
     #[test]
     fn normalizes_titles() {

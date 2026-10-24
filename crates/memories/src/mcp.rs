@@ -39,9 +39,9 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
-use crate::db::user_tx;
 use crate::memories::{current_project, forget, remember};
 use crate::work_state;
+use memvault_core::user_tx;
 
 /// Header the plugin may set to name the project of the request.
 const PROJECT_HEADER: &str = "x-memory-project";

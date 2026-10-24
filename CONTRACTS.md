@@ -63,9 +63,9 @@ serde_urlencoded.
 |---|---|
 | 0001-0099 | foundation (0099 = grants) |
 | 0100-0199 | ingest (0100 exists: `session_windows`, lease bookkeeping) |
-| 0200-0299 | recall |
+| 0200-0299 | recall (0200-0202 exist: context cache columns, invalidations) |
 | 0300-0399 | memories / mcp |
-| 0400-0499 | consolidation |
+| 0400-0499 | consolidation (0400 exists: decay and revert bookkeeping) |
 | 0500-0599 | worker |
 | 0600-0699 | evals |
 
@@ -104,6 +104,24 @@ Full DDL of spec 4.1-4.7 plus:
 - Roles `memsvc_app` (NOINHERIT LOGIN) and `memsvc_system` (NOINHERIT LOGIN BYPASSRLS).
 - `emb_hnsw` HNSW index (pgvector 0.6 is fine; `hnsw.iterative_scan` only on >= 0.8). BM25 indexes `obs_bm25`,
   `sum_bm25`, `fact_bm25`, `proc_bm25` only when pg_search exists (0011).
+
+## Module migrations (0100-0699)
+
+- **0100 ingest**: `session_windows(session_id, window_no, prompt_no, tool_uses, last_event_at, closed_at,
+  close_reason, prompt_summary_pending, ...)` (one open window per session), `sessions.session_summary_pending`,
+  `work_packets.lease_seconds`, `.heartbeats`, `.applied` (first application's counts, 9.3 idempotency).
+- **0200 recall**: `context_cache.client_id`, `.project_key` (what a re-render needs); index on queued
+  `render_context` jobs by `payload->>'cache_key'`; `memsvc_recall_invalidate(space, kind, key) RETURNS TABLE
+  (cache_key, user_id, client_id, space_id, project_key, device_id, source, rendered_at)` (SECURITY DEFINER,
+  deletes the matching blocks and returns them; NULL kind = whole space, NULL space = every space).
+- **0201 recall**: `context_invalidations(space_id, scope, at)` (pruned after 2 h), written by
+  `memsvc_recall_invalidate`; `memsvc_context_stale(space_ids, scopes, rendered_at) -> bool` (SECURITY DEFINER,
+  executable by `memsvc_app`): a cached block is served only when no matching invalidation is newer than its
+  `rendered_at`, which closes the render/NOTIFY race.
+- **0202 recall**: forced RLS on `context_invalidations` (it has `space_id`; the app role has no grants on it).
+- **0400 consolidation**: `observations.decayed_at`, `facts.decayed_at` (incremental decay),
+  `memory_audit.seq bigserial` (reverse-replay order), `memory_audit.reverts_audit_id`,
+  `procedure_hints.consumed_run_id`, index on `work_packets((inputs->>'run_id'))`.
 
 ## Conventions
 
@@ -156,6 +174,13 @@ Full DDL of spec 4.1-4.7 plus:
 - **Embed jobs**: `jobs(type='embed', payload={"owner_table": t, "owner_id": "<uuid>"})` via
   `memvault_core::jobs::enqueue_embed(&mut tx, table, id)` (re-exported as `memvault_worker::embed::enqueue_embed`;
   ingest must use the core path).
+- **Job types** (`jobs`, worker lanes): `embed` `{owner_table, owner_id, model?}` (`model` set by reindex; a job
+  for another model than `EMBED_MODEL` fails permanently); `render_context` = `memvault_recall::cache::
+  RenderContextJob {cache_key, user_id, client_id, project_key, device_id, source}`, queued by the API's cache
+  listener with `run_after = now() + CONTEXT_RERENDER_DEBOUNCE_S`, coalesced per `cache_key`, run by
+  `memvault_recall::cache::rerender(&state, &payload) -> Result<bool, ApiError>` (false: user or client gone; the
+  job is done either way); `reindex`; `retention` (`idempotency_key = retention:<UTC date>`, queued by the sweep).
+  Only the API listener deletes cache rows; the worker never does.
 - **Invalidation**: `memvault_core::invalidate::notify_invalidate(&mut tx, space_id, scope_kind, scope_key)` inside
   every write transaction that changes what context/recall shows; delivered on commit on channel
   `memory_invalidate` as `<space>:<kind>:<key>`; `parse_payload(s) -> Option<(Uuid, ScopeKind, String)>`.
@@ -176,7 +201,9 @@ that login is superuser or BYPASSRLS), `DB_POOL_MAX` (10), `TEI_EMBED_URL`, `TEI
 `WINDOW_IDLE_SECONDS` (90), `LEASE_SECONDS_DEFAULT` (600), `PREFERRED_RUNNER_SECONDS` (600),
 `WORKER_SWEEP_INTERVAL_S` (30), `EMBED_BATCH_SIZE` (64), `EMBED_CONCURRENCY` (2), `EMBED_MAX_PART_TOKENS` (512),
 `CONTEXT_RERENDER_DEBOUNCE_S` (2), `RETENTION_EVENTS_PAYLOAD_DAYS` (30), `RETENTION_PACKETS_DAYS` (90),
-`RETENTION_LOGS_DAYS` (180), `HOST`, `PORT`, `LOG_LEVEL` (EnvFilter directive), `LOG_FORMAT` (`json`|`text`).
+`RETENTION_LOGS_DAYS` (180), `HOST`, `PORT`, `LOG_LEVEL` (EnvFilter directive), `LOG_FORMAT` (`json`|`text`),
+`TEI_EMBED_BATCH_TIMEOUT_S` (60, worker embed batches), `WORKER_METRICS_ADDR` (default `HOST:PORT`).
+`serve` and `admin` refuse to start with an empty `TOKEN_PEPPER` (`Settings::require_token_pepper`).
 Durations are `std::time::Duration` fields (`tei_rerank_timeout`, ...). Handlers read `state.settings`.
 
 ## Foundation interfaces (`memvault_core`)
@@ -193,6 +220,13 @@ system_tx(&PgPool).await -> Result<Transaction<'static, Postgres>, sqlx::Error> 
 db::caps(&PgPool).await -> Result<DbCaps, sqlx::Error>   // cached per pool: superuser, bypass_rls, current_user, pg_search, pgvector_version; .hnsw_iterative_scan()
 db::tune_vector_search(&mut PgConnection, &DbCaps, ef_search: u32).await
 ```
+The futures of `user_tx`, `system_tx` and `tune_vector_search` are `Send` with borrowed arguments (bound queries,
+no `raw_sql(&format!(..))`), so handlers and spawned tasks await them directly; a core unit test pins this.
+
+Pools per process (deploy): the API gets `DATABASE_URL` = `memsvc_app` **and** `DATABASE_SYSTEM_URL` =
+`memsvc_system`, because it runs the work-packet broker (result application) and the `/v1/admin` routes in
+`system_tx` after the route has authorised the caller (spec 4.7: broker = system role). Worker, planner and
+migrate use `memsvc_system` for both. Every user-facing read and write runs in `user_tx` on the app pool.
 
 ### Auth (`memvault_core::auth`)
 ```rust
@@ -283,15 +317,18 @@ TeiError::{Timeout(String), Failed(String)}   // rerank timeout -> fall back to 
 `memvault_memories::mcp::service(state)` (nested service, 8 MB body limit), `/health` (DB `SELECT 1` with 2 s
 timeout + TEI health: `ok` / `degraded` when TEI is down / 503 `down` when the DB is), `/metrics` (Prometheus),
 JSON 404/405 fallbacks, `DefaultBodyLimit` 8 MB, request ids (`x-request-id`), tracing span, 60 s timeout.
-CLI `memvault`: `serve [--host] [--port]` (graceful shutdown on SIGINT/SIGTERM; starts
-`memvault_recall::cache::spawn_listener`), `worker`, `planner [--space-id]`, `migrate [--dsn]`,
+`serve(state, TcpListener, shutdown) -> anyhow::Result<()>`: the router plus the context-cache listener
+(`memvault_recall::cache::spawn_listener`) and recorder upkeep; `memvault serve` and the end-to-end test use it.
+CLI `memvault`: `serve [--host] [--port]` (graceful shutdown on SIGINT/SIGTERM), `worker`
+(`memvault_worker::run_worker_with(state, batch_embedder(&state), shutdown)`), `planner [--space-id]`,
+`migrate [--dsn]`,
 `admin <args...>` -> `memvault_consolidate::admin_cli::run`, `evals <args...>` -> `memvault_evals::cli::run`.
 
 ## Cross-crate signatures (fill in, keep the signatures)
 
 | Signature | Crate / module | Spec |
 |---|---|---|
-| `pub fn router() -> Router<AppState>` | every module crate | 6 |
+| `pub fn router() -> Router<AppState>` | ingest, recall, memories, consolidate | 6 |
 | `pub fn register_appliers(&mut AppliersRegistry)` | ingest, consolidate | 9.4 |
 | `windows::close_idle_windows(pool: &PgPool, settings: &Settings) -> anyhow::Result<u64>` | ingest | 9.1 |
 | `engine::recall(&AppState, &Identity, RecallRequest) -> Result<RecallResponse, ApiError>` | recall | 11 |
@@ -300,11 +337,14 @@ CLI `memvault`: `serve [--host] [--port]` (graceful shutdown on SIGINT/SIGTERM; 
 | `engine::get_memories(&AppState, &Identity, &[Uuid]) -> Result<GetResponse, ApiError>` | recall | 6.4 |
 | `engine::explain(&AppState, &Identity, Uuid) -> Result<ExplainResponse, ApiError>` | recall | 12.5 |
 | `context::render_context(&AppState, &Identity, project_key: Option<&str>, device_id: Option<&str>, source: &str) -> Result<String, ApiError>` | recall | 6.3, 11.5-11.7 |
-| `cache::spawn_listener(AppState, CancellationToken) -> JoinHandle<()>` (stub: no-op task) | recall | 11.6 |
-| `mcp::service(AppState) -> axum::Router` (stub: 501) | memories | 7 |
+| `cache::spawn_listener(AppState, CancellationToken) -> JoinHandle<()>` | recall | 11.6 |
+| `cache::rerender(&AppState, &RenderContextJob) -> Result<bool, ApiError>` | recall | 11.6 |
+| `mcp::service(AppState) -> axum::Router` (applies its own bearer auth; mount with `nest_service("/mcp", ..)`) | memories | 7 |
 | `planner::run_planner(&AppState, Option<Uuid>) -> Result<ConsolidateResponse, ApiError>` | consolidate | 12.1 |
 | `admin_cli::run(AppState, Vec<String>) -> anyhow::Result<()>` | consolidate | 5.2, 6.7 |
-| `run_worker(AppState, CancellationToken) -> anyhow::Result<()>` | worker | 14 |
+| `run_worker(AppState, CancellationToken) -> anyhow::Result<()>` (embeds via `state.tei`; tests) | worker | 14 |
+| `run_worker_with(AppState, Arc<dyn Embedder>, CancellationToken)`, `batch_embedder(&AppState) -> Arc<dyn Embedder>` | worker | 13, 14 |
+| `embed_pass(&AppState, worker: &str) -> anyhow::Result<usize>` (one batch of embed jobs) | worker | 13 |
 | `embed::enqueue_embed(&mut PgConnection, owner_table: &str, owner_id: Uuid) -> Result<(), sqlx::Error>` (re-export of `memvault_core::jobs::enqueue_embed`, working) | worker | 13 |
 | `cli::run(AppState, Vec<String>) -> anyhow::Result<()>` | evals | 16.2 |
 
@@ -338,6 +378,9 @@ admin/evals CLIs get an `AppState` whose pools connect lazily, with every applie
   the text (input order); `calls: Mutex<Vec<(&str, usize)>>` records `(method, n_texts)`; `set_down(true)` makes
   calls fail and `health` report down; `vector(text)` gives the embedding directly.
 - TEI HTTP tests use `wiremock`.
+- `crates/server/tests/e2e.rs` is the end-to-end test: `#[sqlx::test(migrations = false)]`, the `memvault` binary
+  migrates and mints tokens, `serve` runs on a random port, and the real `mem-hook` binary (built with
+  `cargo build -p mem-hook` from inside the test) plays a turn with a fake `claude` on PATH.
 
 ## Deviations from the spec (foundation)
 

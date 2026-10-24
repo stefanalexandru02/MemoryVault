@@ -12,3 +12,6 @@ build/
 # Rust
 /target/
 **/*.rs.bk
+
+# Cargo build output (any depth)
+target/

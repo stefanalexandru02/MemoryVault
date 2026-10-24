@@ -287,9 +287,32 @@ fn only_one_observer_per_machine() {
     let out = env.observe(&["--session", SESSION_ID]);
     assert_eq!(out.code, Some(0));
     assert!(fake.reqs().is_empty());
+    // The busy run left its arguments for the lock holder.
+    assert!(env.home.join("observe.again").exists());
     drop(lock);
     env.observe(&["--session", SESSION_ID]);
-    assert_eq!(leases(&fake).len(), 2); // got the packet, then asked again
+    // Own pass: the packet, then an empty lease; then the replayed request: one more empty lease.
+    assert_eq!(leases(&fake).len(), 3);
+    assert_eq!(results(&fake).len(), 1);
+    assert!(!env.home.join("observe.again").exists());
+}
+
+#[test]
+fn a_run_refused_by_the_lock_is_replayed_by_the_holder() {
+    let (fake, env) = setup();
+    fake.queue_packet(packet("pkt-1", "extract", "sonnet"));
+    env.claude_script(1, "sleep", "1");
+    std::thread::scope(|s| {
+        // The holder takes one packet only, so without the replay pkt-2 would wait for the next run.
+        let holder = s.spawn(|| env.observe(&["--session", SESSION_ID, "--max", "1"]));
+        fake.wait_for("first lease", |r| r.iter().any(|q| q.path == "/v1/work/lease"));
+        fake.queue_packet(packet("pkt-2", "summarize_prompt", "sonnet"));
+        let busy = env.observe(&["--session", SESSION_ID]);
+        assert_eq!(busy.code, Some(0));
+        holder.join().unwrap();
+    });
+    let posted: Vec<String> = results(&fake).iter().map(|r| r.path.clone()).collect();
+    assert_eq!(posted, vec!["/v1/work/pkt-1/result", "/v1/work/pkt-2/result"]);
 }
 
 #[test]

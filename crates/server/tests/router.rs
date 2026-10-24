@@ -27,9 +27,9 @@ async fn health_metrics_and_fallbacks(pool: PgPool) {
         serde_json::json!({"error": {"code": "not_found", "message": "Not Found", "retryable": false}})
     );
 
-    // /mcp is mounted (the memories stub answers 501 until the MCP server exists)
+    // /mcp is mounted and applies bearer auth itself
     let r = send(&app, Method::POST, "/mcp", None, Some(serde_json::json!({}))).await;
-    assert_ne!(r.status, StatusCode::NOT_FOUND);
+    assert_eq!(r.status, StatusCode::UNAUTHORIZED);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

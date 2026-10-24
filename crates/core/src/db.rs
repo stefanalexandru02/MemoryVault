@@ -126,19 +126,25 @@ pub async fn caps(pool: &PgPool) -> Result<DbCaps, sqlx::Error> {
 
 /// Transaction as `memsvc_app` with `app.user_id` / `app.client_id` set (spec 5.3). RLS policies
 /// read `app_user_id()`; nothing outside the caller's spaces is visible.
+///
+/// Statements here are bound queries rather than `raw_sql(&format!(..))`: rustc cannot prove the
+/// latter's future `Send` for every lifetime, and axum handlers need `Send` futures.
 pub async fn user_tx(pool: &PgPool, identity: &Identity) -> Result<Transaction<'static, Postgres>, sqlx::Error> {
     let caps = caps(pool).await?;
     let mut tx = pool.begin().await?;
-    // UUIDs are safe to interpolate; one round trip for role + settings.
-    let role = if caps.superuser { format!("SET LOCAL ROLE {APP_ROLE}; ") } else { String::new() };
-    sqlx::raw_sql(&format!(
-        "{role}SELECT set_config('app.user_id', '{}', true), set_config('app.client_id', '{}', true)",
-        identity.user_id, identity.client_id
-    ))
-    .execute(&mut *tx)
-    .await?;
+    if caps.superuser {
+        sqlx::query(SET_APP_ROLE).execute(&mut *tx).await?;
+    }
+    sqlx::query("SELECT set_config('app.user_id', $1, true), set_config('app.client_id', $2, true)")
+        .bind(identity.user_id.to_string())
+        .bind(identity.client_id.to_string())
+        .execute(&mut *tx)
+        .await?;
     Ok(tx)
 }
+
+const SET_APP_ROLE: &str = "SET LOCAL ROLE memsvc_app";
+const SET_SYSTEM_ROLE: &str = "SET LOCAL ROLE memsvc_system";
 
 /// Transaction as `memsvc_system` (RLS bypass) for the broker, worker and planner. Errors when the
 /// pool's login is neither a superuser nor able to bypass RLS (a misconfigured system URL would
@@ -152,7 +158,7 @@ pub async fn system_tx(pool: &PgPool) -> Result<Transaction<'static, Postgres>, 
     }
     let mut tx = pool.begin().await?;
     if caps.superuser {
-        sqlx::raw_sql(&format!("SET LOCAL ROLE {SYSTEM_ROLE}")).execute(&mut *tx).await?;
+        sqlx::query(SET_SYSTEM_ROLE).execute(&mut *tx).await?;
     }
     Ok(tx)
 }
@@ -160,14 +166,36 @@ pub async fn system_tx(pool: &PgPool) -> Result<Transaction<'static, Postgres>, 
 /// Per-transaction HNSW settings for a recall (spec 4.5): `hnsw.ef_search`, and
 /// `hnsw.iterative_scan = relaxed_order` when pgvector >= 0.8. Call inside a transaction.
 pub async fn tune_vector_search(conn: &mut PgConnection, caps: &DbCaps, ef_search: u32) -> Result<(), sqlx::Error> {
-    let iterative = if caps.hnsw_iterative_scan() { "; SET LOCAL hnsw.iterative_scan = relaxed_order" } else { "" };
-    sqlx::raw_sql(&format!("SET LOCAL hnsw.ef_search = {ef_search}{iterative}")).execute(conn).await?;
+    sqlx::query(
+        "SELECT set_config('hnsw.ef_search', $1, true),
+                CASE WHEN $2 THEN set_config('hnsw.iterative_scan', 'relaxed_order', true) END",
+    )
+    .bind(ef_search.to_string())
+    .bind(caps.hnsw_iterative_scan())
+    .execute(conn)
+    .await?;
     Ok(())
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn assert_send<T: Send>(_: T) {}
+
+    /// axum handlers and `tokio::spawn` need these futures to be `Send` with borrowed arguments.
+    #[allow(dead_code)]
+    fn transaction_futures_are_send(pool: &PgPool, identity: &Identity, conn: &mut PgConnection, caps: &DbCaps) {
+        assert_send(async {
+            let tx = user_tx(pool, identity).await?;
+            tx.commit().await
+        });
+        assert_send(async {
+            let tx = system_tx(pool).await?;
+            tx.commit().await
+        });
+        assert_send(tune_vector_search(conn, caps, 80));
+    }
 
     #[test]
     fn versions() {

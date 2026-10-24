@@ -1,9 +1,6 @@
 # Worker: `memvault worker` (embed jobs, lease-expiry and idle-window sweeps every 30 s, context re-render,
-# retention). One replica; it runs as the system role because the sweeps cross spaces.
-#
-# No Service, ServiceMonitor or container port here: `memvault worker` binds no HTTP listener yet, so there
-# is nothing to scrape. Once the worker serves /metrics, restore the memory-worker Service (port 8000 to
-# the named port), the memory-worker ServiceMonitor and the worker-ingress NetworkPolicy (monitoring to 8000).
+# retention). One replica; it runs as the system role because the sweeps cross spaces. It serves /metrics
+# and /health on HOST:PORT (WORKER_METRICS_ADDR overrides), scraped by the memory-worker ServiceMonitor.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -33,6 +30,9 @@ spec:
         - name: worker
           image: memvault:0.1.0
           args: ["worker"]
+          ports:
+            - name: http
+              containerPort: 8000
           envFrom:
             - configMapRef:
                 name: memory-config
@@ -46,6 +46,12 @@ spec:
               value: postgres://memsvc_system:$(DB_PASSWORD)@memory-pg-rw:5432/memsvc?sslmode=require
             - name: DATABASE_SYSTEM_URL
               value: postgres://memsvc_system:$(DB_PASSWORD)@memory-pg-rw:5432/memsvc?sslmode=require
+          readinessProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 10
+            timeoutSeconds: 3
           resources:
             requests:
               cpu: 250m
@@ -72,3 +78,17 @@ spec:
         - name: schemas
           configMap:
             name: memory-schemas
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: memory-worker
+  labels:
+    app: memory-worker
+spec:
+  selector:
+    app: memory-worker
+  ports:
+    - name: http
+      port: 8000
+      targetPort: http

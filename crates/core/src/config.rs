@@ -27,7 +27,10 @@ pub struct Settings {
     pub embed_model: String,
     pub embed_dims: usize,
     pub rerank_model: String,
+    /// Single-query embeds on the request path.
     pub tei_embed_timeout: Duration,
+    /// Worker batches of up to `EMBED_BATCH_SIZE` texts.
+    pub tei_embed_batch_timeout: Duration,
     /// Spec 11.3: 250 ms, then recall falls back to RRF.
     pub tei_rerank_timeout: Duration,
     /// `FAKE_TEI=1`: deterministic in-process [`crate::tei::FakeTei`] (tests, local dev).
@@ -51,6 +54,8 @@ pub struct Settings {
 
     // --- worker (spec 13, 14, 4.8) ---
     pub worker_sweep_interval: Duration,
+    /// Where `memvault worker` serves `/metrics` and `/health`; `None`: `HOST:PORT`.
+    pub worker_metrics_addr: Option<String>,
     pub embed_batch_size: usize,
     pub embed_concurrency: usize,
     pub embed_max_part_tokens: usize,
@@ -80,6 +85,7 @@ impl Default for Settings {
             embed_dims: 1024,
             rerank_model: "bge-reranker-v2-m3".into(),
             tei_embed_timeout: Duration::from_secs(2),
+            tei_embed_batch_timeout: Duration::from_secs(60),
             tei_rerank_timeout: Duration::from_millis(250),
             fake_tei: false,
             prompts_dir: "prompts".into(),
@@ -92,6 +98,7 @@ impl Default for Settings {
             lease_seconds_default: 600,
             preferred_runner_seconds: 600,
             worker_sweep_interval: Duration::from_secs(30),
+            worker_metrics_addr: None,
             embed_batch_size: 64,
             embed_concurrency: 2,
             embed_max_part_tokens: 512,
@@ -151,6 +158,7 @@ impl Settings {
             embed_dims: parse("EMBED_DIMS", d.embed_dims)?,
             rerank_model: var("RERANK_MODEL").unwrap_or(d.rerank_model),
             tei_embed_timeout: secs("TEI_EMBED_TIMEOUT_S", d.tei_embed_timeout)?,
+            tei_embed_batch_timeout: secs("TEI_EMBED_BATCH_TIMEOUT_S", d.tei_embed_batch_timeout)?,
             tei_rerank_timeout: secs("TEI_RERANK_TIMEOUT_S", d.tei_rerank_timeout)?,
             fake_tei: parse_bool("FAKE_TEI", d.fake_tei)?,
             prompts_dir: var("PROMPTS_DIR").map(PathBuf::from).unwrap_or(d.prompts_dir),
@@ -163,6 +171,7 @@ impl Settings {
             lease_seconds_default: parse("LEASE_SECONDS_DEFAULT", d.lease_seconds_default)?,
             preferred_runner_seconds: parse("PREFERRED_RUNNER_SECONDS", d.preferred_runner_seconds)?,
             worker_sweep_interval: secs("WORKER_SWEEP_INTERVAL_S", d.worker_sweep_interval)?,
+            worker_metrics_addr: var("WORKER_METRICS_ADDR"),
             embed_batch_size: parse("EMBED_BATCH_SIZE", d.embed_batch_size)?,
             embed_concurrency: parse("EMBED_CONCURRENCY", d.embed_concurrency)?,
             embed_max_part_tokens: parse("EMBED_MAX_PART_TOKENS", d.embed_max_part_tokens)?,
@@ -177,8 +186,29 @@ impl Settings {
         })
     }
 
+    /// Refuse to start a process that hashes or checks tokens with an empty `TOKEN_PEPPER`: the HMAC
+    /// key would be empty and every token hash guessable from the secret alone.
+    pub fn require_token_pepper(&self) -> Result<()> {
+        anyhow::ensure!(!self.token_pepper.trim().is_empty(), "TOKEN_PEPPER must be set to a non-empty secret");
+        Ok(())
+    }
+
     /// The URL for the system pool: `DATABASE_SYSTEM_URL`, else `DATABASE_URL`.
     pub fn system_database_url(&self) -> &str {
         self.database_system_url.as_deref().unwrap_or(&self.database_url)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn empty_token_pepper_is_rejected() {
+        assert!(Settings::default().require_token_pepper().is_err());
+        let blank = Settings { token_pepper: "  ".into(), ..Settings::default() };
+        assert!(blank.require_token_pepper().is_err());
+        let set = Settings { token_pepper: "pepper".into(), ..Settings::default() };
+        assert!(set.require_token_pepper().is_ok());
     }
 }

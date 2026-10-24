@@ -1,0 +1,5 @@
+{"type": "session", "external_session_id": "example-ci-cache", "project_key": "github.com/acme/app", "cwd": "~/src/app", "harness": "claude-code", "device_id": "laptop"}
+{"type": "event", "seq": 0, "kind": "user_prompt", "occurred_at": "2026-10-02T10:00:00Z", "payload": {"prompt": "Speed up the CI pipeline by caching cargo dependencies"}}
+{"type": "event", "seq": 1, "kind": "tool_use", "occurred_at": "2026-10-02T10:01:00Z", "payload": {"tool_name": "Edit", "tool_input": {"file_path": ".github/workflows/ci.yml", "new_string": "uses: Swatinem/rust-cache@v2"}, "tool_response": "edited"}}
+{"type": "event", "seq": 2, "kind": "tool_use", "occurred_at": "2026-10-02T10:02:00Z", "payload": {"tool_name": "Bash", "tool_input": {"command": "git push"}, "tool_response": "ok"}}
+{"type": "event", "seq": 3, "kind": "assistant_message", "occurred_at": "2026-10-02T10:03:00Z", "payload": {"last_assistant_message": "Added the rust-cache action to the CI workflow.", "stop_hook_active": false}}

@@ -17,8 +17,8 @@ use memvault_core::{ApiError, AppState, AppliedCounts, Identity, require_scope};
 use uuid::Uuid;
 
 use crate::builders::to_json;
-use crate::tx::{system_tx, user_tx};
 use crate::{queue, windows};
+use memvault_core::{system_tx, user_tx};
 
 pub async fn lease(
     State(state): State<AppState>,

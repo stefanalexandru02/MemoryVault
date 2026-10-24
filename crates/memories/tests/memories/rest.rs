@@ -95,10 +95,8 @@ async fn concurrent_first_writes_of_a_fact_do_not_fail(pool: PgPool) {
     for resp in futures::future::join_all(writes).await {
         assert_eq!(resp.status, StatusCode::CREATED, "{}", resp.text());
     }
-    let active: i64 = sqlx::query_scalar("SELECT count(*) FROM facts WHERE status = 'active'")
-        .fetch_one(&w.pool)
-        .await
-        .unwrap();
+    let active: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM facts WHERE status = 'active'").fetch_one(&w.pool).await.unwrap();
     assert_eq!(active, 1);
 }
 

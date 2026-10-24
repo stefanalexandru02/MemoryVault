@@ -32,9 +32,10 @@ use crate::candidates::{
     Filters, KEYWORD_LIMIT, TierRow, VECTOR_LIMIT, VECTOR_PART_FANOUT, best_part_embeddings, hydrate, keyword_leg,
     query_terms, recent_leg, vector_leg,
 };
-use crate::db::{tune_vector_search, user_tx};
 use crate::render;
 use crate::scoring::{Candidate, budget_fill, by_score, mmr_order, rrf_fuse};
+use memvault_core::db::tune_vector_search;
+use memvault_core::user_tx;
 
 /// Tier order of candidate generation and of `selected` in `retrieval_log`.
 const TIER_ORDER: [MemoryTable; 4] =

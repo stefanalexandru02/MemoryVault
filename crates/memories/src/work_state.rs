@@ -12,8 +12,8 @@ use memvault_core::schemas::work_state::{WorkStateList, WorkStateQuery, WorkStat
 use memvault_core::{ApiError, AppState, Identity, require_scope};
 use memvault_recall::engine::{default_scopes, fold_work_state, validate_scopes};
 
-use crate::db::user_tx;
 use crate::memories::write_scope;
+use memvault_core::user_tx;
 
 pub(crate) async fn get(
     State(state): State<AppState>,

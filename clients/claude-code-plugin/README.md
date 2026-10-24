@@ -14,7 +14,7 @@ detection). No Node, Python, `curl` or `jq`.
 ./install.sh
 ```
 
-It runs `cargo build --release -p mem-hook`, copies the binary to `bin/mem-hook`, and creates
+It runs `cargo build --profile release-small -p mem-hook` (size-optimised, about 1.9 MB), copies the binary to `bin/mem-hook`, and creates
 `~/.memory` (mode 0700) with a `config` template (mode 0600). Set `MEM_HOOK_BIN=/path/to/mem-hook` to
 install a prebuilt binary instead of building. Then:
 

@@ -30,7 +30,7 @@ use uuid::Uuid;
 use crate::ops::{self, RemapRequest};
 use crate::planner::run_planner;
 use crate::revert::revert_run;
-use crate::tx::system_tx;
+use memvault_core::system_tx;
 
 /// Actor recorded on audit rows written from the command line.
 const CLI_ACTOR: &str = "admin-cli";

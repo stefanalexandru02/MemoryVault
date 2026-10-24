@@ -15,9 +15,9 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::cache::{self, CacheEntry};
-use crate::db::user_tx;
 use crate::engine::{PackOptions, RetrievalRecord, build_pack, log_retrieval, record_metrics};
 use crate::render::{self, SinceRow};
+use memvault_core::user_tx;
 
 /// Small budgets for a ~1k-token block (architecture 6.2): `/v1/recall` without a query and with
 /// `expand_top_observations = 0`. The facts budget only carries pinned facts (shown in Profile).

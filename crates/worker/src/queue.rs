@@ -98,11 +98,13 @@ pub async fn enqueue_daily_retention(pool: &PgPool) -> Result<bool, sqlx::Error>
 
 /// Push the lock of running jobs `LOCK_SECONDS` into the future (heartbeat for long jobs).
 pub async fn extend_locks(pool: &PgPool, ids: &[Uuid]) -> Result<(), sqlx::Error> {
-    sqlx::query("UPDATE jobs SET locked_until = now() + make_interval(secs => $1) WHERE id = ANY($2) AND status = 'running'")
-        .bind(LOCK_SECONDS)
-        .bind(ids)
-        .execute(pool)
-        .await?;
+    sqlx::query(
+        "UPDATE jobs SET locked_until = now() + make_interval(secs => $1) WHERE id = ANY($2) AND status = 'running'",
+    )
+    .bind(LOCK_SECONDS)
+    .bind(ids)
+    .execute(pool)
+    .await?;
     Ok(())
 }
 

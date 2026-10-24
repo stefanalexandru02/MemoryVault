@@ -21,7 +21,6 @@ pub mod ops;
 pub mod planner;
 pub mod profiles;
 pub mod revert;
-mod tx;
 
 /// Routes under `/v1` (paths without the prefix): `/admin/...`.
 pub fn router() -> Router<AppState> {
