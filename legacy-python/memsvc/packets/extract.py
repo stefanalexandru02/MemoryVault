@@ -277,7 +277,11 @@ async def _confirm(
         "facts",
         active["id"],
         before={"confidence": c_old, "confirmations": active["confirmations"]},
-        after={"confidence": after["confidence"], "confirmations": after["confirmations"], "value_text": cand.value_text},
+        after={
+            "confidence": after["confidence"],
+            "confirmations": after["confirmations"],
+            "value_text": cand.value_text,
+        },
     )
 
 
@@ -392,7 +396,9 @@ async def apply_extract(conn: asyncpg.Connection, packet: PacketRecord, output: 
         counts["procedure_hints"] += 1
 
     if output.needs_escalation:
-        await audit(conn, packet, "packet.needs_escalation", "work_packets", packet.id, reason="runner asked for escalation")
+        await audit(
+            conn, packet, "packet.needs_escalation", "work_packets", packet.id, reason="runner asked for escalation"
+        )
 
     for kind, key in sorted(touched):
         await notify_invalidate(conn, packet.space_id, kind, key)

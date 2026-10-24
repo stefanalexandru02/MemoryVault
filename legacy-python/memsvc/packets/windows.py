@@ -179,7 +179,11 @@ async def maybe_create_prompt_summary(conn: asyncpg.Connection, session: asyncpg
     )
     inputs = await builders.build_summarize_prompt_inputs(conn, session, prompt_no, window_nos)
     key = f"summarize_prompt:{session['id']}:{prompt_no}"
-    return ["summarize_prompt"] if await builders.create_session_packet(conn, session, "summarize_prompt", key, inputs) else []
+    return (
+        ["summarize_prompt"]
+        if await builders.create_session_packet(conn, session, "summarize_prompt", key, inputs)
+        else []
+    )
 
 
 async def maybe_create_session_summary(conn: asyncpg.Connection, session: asyncpg.Record) -> list[str]:
@@ -200,7 +204,11 @@ async def maybe_create_session_summary(conn: asyncpg.Connection, session: asyncp
     if inputs is None:
         return []
     key = f"summarize_session:{session['id']}"
-    return ["summarize_session"] if await builders.create_session_packet(conn, session, "summarize_session", key, inputs) else []
+    return (
+        ["summarize_session"]
+        if await builders.create_session_packet(conn, session, "summarize_session", key, inputs)
+        else []
+    )
 
 
 async def end_session(conn: asyncpg.Connection, session: asyncpg.Record, reason: str | None) -> tuple[bool, list[str]]:

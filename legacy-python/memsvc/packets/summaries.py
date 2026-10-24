@@ -18,7 +18,9 @@ from memsvc.schemas.work import PacketRecord
 FIELDS = ("request", "investigated", "learned", "completed", "next_steps", "notes")
 
 
-async def _apply_summary(conn: asyncpg.Connection, packet: PacketRecord, output: BaseModel, grain: str) -> dict[str, int]:
+async def _apply_summary(
+    conn: asyncpg.Connection, packet: PacketRecord, output: BaseModel, grain: str
+) -> dict[str, int]:
     assert isinstance(output, SummaryV1)
     if packet.session_id is None:
         raise ValueError(f"{packet.kind} packet without a session")

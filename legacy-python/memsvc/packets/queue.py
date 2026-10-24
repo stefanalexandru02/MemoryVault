@@ -157,7 +157,7 @@ async def _take(conn: asyncpg.Connection, packet_id: UUID, client_id: UUID, leas
 
 
 async def lock_packet(conn: asyncpg.Connection, packet_id: UUID) -> asyncpg.Record:
-    row = await conn.fetchrow("SELECT *, lease_until < now() AS lease_expired FROM work_packets WHERE id = $1 FOR UPDATE", packet_id)
+    row = await conn.fetchrow("SELECT * FROM work_packets WHERE id = $1 FOR UPDATE", packet_id)
     if row is None:
         raise ApiError(404, "not_found", "packet not found")
     return row
@@ -185,7 +185,9 @@ async def heartbeat(conn: asyncpg.Connection, packet_id: UUID, client_id: UUID, 
     )
 
 
-async def fail(conn: asyncpg.Connection, packet_id: UUID, client_id: UUID, error: str, detail: str | None) -> asyncpg.Record:
+async def fail(
+    conn: asyncpg.Connection, packet_id: UUID, client_id: UUID, error: str, detail: str | None
+) -> asyncpg.Record:
     """Release the caller's lease after a runner failure (spec 6.6). Returns the updated row."""
     row = await lock_packet(conn, packet_id)
     require_lease(row, client_id)
