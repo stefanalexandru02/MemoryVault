@@ -19,6 +19,7 @@ resources:
   - ingress.yaml
   - networkpolicy.yaml
   - servicemonitor.yaml
+  - alerts.yaml
 
 # Prompts and schemas are the repository's own files, symlinked into this directory because kustomize
 # refuses paths outside the kustomization root. Adding a prompt or schema means adding a line here.

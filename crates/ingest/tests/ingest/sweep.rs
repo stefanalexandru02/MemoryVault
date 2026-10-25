@@ -90,3 +90,33 @@ async fn last_attempt_expiry_fails_the_packet_and_releases_the_session_summary(p
     assert!(!pending);
     assert_eq!(c.packets(s).await.len(), 1);
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_busy_session_is_left_for_the_next_tick(pool: PgPool) {
+    let c = ctx(pool.clone());
+    let alice = seed_identity(&pool, TokenKind::Device).await;
+    let busy = c.start_session(&alice, "busy").await;
+    let free = c.start_session(&alice, "free").await;
+    for s in [busy, free] {
+        c.events_ok(&alice.token, s, vec![tool(s, 1), tool(s, 2)]).await;
+    }
+    sqlx::query("UPDATE session_windows SET last_event_at = now() - interval '91 seconds'")
+        .execute(&pool)
+        .await
+        .unwrap();
+
+    // another replica (or an event post) holds one session
+    let mut other = pool.begin().await.unwrap();
+    sqlx::query("SELECT id FROM sessions WHERE id = $1 FOR UPDATE").bind(busy).fetch_one(&mut *other).await.unwrap();
+    let closed = tokio::time::timeout(std::time::Duration::from_secs(3), close_idle_windows(&pool, &c.state.settings))
+        .await
+        .expect("the sweep must not wait on a locked session")
+        .unwrap();
+    assert_eq!(closed, 1);
+    assert_eq!(c.packets(free).await.len(), 1);
+    assert!(c.packets(busy).await.is_empty());
+
+    other.commit().await.unwrap();
+    assert_eq!(close_idle_windows(&pool, &c.state.settings).await.unwrap(), 1);
+    assert_eq!(c.packets(busy).await.len(), 1);
+}

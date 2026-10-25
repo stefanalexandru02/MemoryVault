@@ -83,8 +83,12 @@ pub async fn create_session(
         .execute(&mut *tx)
         .await?;
     }
+    let next_seq: i32 = sqlx::query_scalar("SELECT coalesce(max(seq) + 1, 0) FROM events WHERE session_id = $1")
+        .bind(session_id)
+        .fetch_one(&mut *tx)
+        .await?;
     tx.commit().await?;
-    let out = SessionCreated { session_id, space_id, window_policy: window_policy(&state.settings) };
+    let out = SessionCreated { session_id, space_id, window_policy: window_policy(&state.settings), next_seq };
     Ok((status, Json(out)))
 }
 
@@ -104,7 +108,9 @@ pub async fn end_session(
     };
     let mut tx = user_tx(&state.db.app, &identity).await?;
     let session = lock_own_session(&mut tx, &identity, session_id).await?;
-    let ended = windows::end_session(&mut tx, Some(&*state.prompts), &session, body.reason.as_deref()).await?;
+    let ended =
+        windows::end_session(&mut tx, Some(&*state.prompts), &session, body.reason.as_deref(), body.occurred_at)
+            .await?;
     tx.commit().await?;
     Ok(Json(SessionEnded {
         session_id,

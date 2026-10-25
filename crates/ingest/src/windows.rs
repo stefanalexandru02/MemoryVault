@@ -301,13 +301,18 @@ pub async fn end_session(
     prompts: Option<&PromptRegistry>,
     session: &SessionRow,
     reason: Option<&str>,
+    occurred_at: Option<DateTime<Utc>>,
 ) -> Result<Ended, sqlx::Error> {
+    // A late (spooled) end reports when it happened, within the session's lifetime.
     let ended_at: DateTime<Utc> = sqlx::query_scalar(
-        "UPDATE sessions SET ended_at = now(), end_reason = $2, session_summary_pending = true WHERE id = $1
+        "UPDATE sessions SET ended_at = greatest(least(coalesce($3, now()), now()), started_at),
+                end_reason = $2, session_summary_pending = true
+          WHERE id = $1
          RETURNING ended_at",
     )
     .bind(session.id)
     .bind(reason)
+    .bind(occurred_at)
     .fetch_one(&mut *conn)
     .await?;
     let open: Option<(i32, i32)> = sqlx::query_as(
@@ -396,6 +401,14 @@ pub async fn after_packet_settled(
     Ok(created)
 }
 
+/// A system transaction for one unit of sweep work. The lock timeout turns a wait on a busy row
+/// into an error for that unit alone.
+pub(crate) async fn sweep_tx(pool: &PgPool) -> Result<sqlx::Transaction<'static, sqlx::Postgres>, sqlx::Error> {
+    let mut tx = system_tx(pool).await?;
+    sqlx::query("SET LOCAL lock_timeout = '5s'").execute(&mut *tx).await?;
+    Ok(tx)
+}
+
 /// Close every open window with content whose newest event is older than
 /// `settings.window_idle_seconds` (spec 9.1) and create its `extract` packet. Called by the worker
 /// sweep on the system pool. Windows holding only `user_prompt` / `system` events stay open.
@@ -403,7 +416,11 @@ pub async fn after_packet_settled(
 /// The same sweep fails expired leases that used their last attempt ([`crate::queue::expire_leases`])
 /// and creates summarize packets whose prerequisites settled without passing through the result
 /// route. Packets created here store an unpinned prompt ref (no registry at hand), pinned at lease.
-/// Returns the number of windows closed.
+///
+/// Every session and every packet is handled in its own short transaction that skips rows other
+/// transactions (a second worker replica, an event post, a result post) hold, so a failure or a
+/// busy row costs one unit of work until the next tick and never holds locks across units. Returns
+/// the number of windows closed.
 pub async fn close_idle_windows(pool: &PgPool, settings: &Settings) -> anyhow::Result<u64> {
     let idle = settings.window_idle_seconds as f64;
     let mut tx = system_tx(pool).await?;
@@ -411,32 +428,24 @@ pub async fn close_idle_windows(pool: &PgPool, settings: &Settings) -> anyhow::R
         "SELECT s.id FROM sessions s
           WHERE EXISTS (SELECT 1 FROM session_windows w WHERE w.session_id = s.id AND w.closed_at IS NULL
                           AND w.has_content AND w.last_event_at < now() - make_interval(secs => $1))
-          ORDER BY s.id FOR UPDATE OF s SKIP LOCKED",
+          ORDER BY s.id",
     )
     .bind(idle)
     .fetch_all(&mut *tx)
     .await?;
+    tx.commit().await?;
     let mut closed = 0;
     for session_id in sessions {
-        let Some(session) = builders::session_row(&mut tx, session_id).await? else {
-            continue;
-        };
-        let window: Option<i32> = sqlx::query_scalar(
-            "SELECT window_no FROM session_windows WHERE session_id = $1 AND closed_at IS NULL
-                AND has_content AND last_event_at < now() - make_interval(secs => $2)",
-        )
-        .bind(session_id)
-        .bind(idle)
-        .fetch_optional(&mut *tx)
-        .await?;
-        if let Some(window_no) = window {
-            close_window(&mut tx, None, &session, window_no, "idle").await?;
-            closed += 1;
+        match close_idle_window(pool, session_id, idle).await {
+            Ok(true) => closed += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(session = %session_id, error = %e, "closing an idle window failed"),
         }
     }
 
-    crate::queue::expire_leases(&mut tx, None).await?;
+    crate::queue::expire_leases(pool, None).await?;
 
+    let mut tx = system_tx(pool).await?;
     let owed: Vec<(Uuid, Option<i32>)> = sqlx::query_as(
         "SELECT DISTINCT session_id, prompt_no FROM session_windows WHERE prompt_summary_pending
          UNION ALL
@@ -444,15 +453,46 @@ pub async fn close_idle_windows(pool: &PgPool, settings: &Settings) -> anyhow::R
     )
     .fetch_all(&mut *tx)
     .await?;
-    for (session_id, prompt_no) in owed {
-        let Some(session) = builders::lock_session(&mut tx, session_id).await? else {
-            continue;
-        };
-        match prompt_no {
-            Some(n) => maybe_create_prompt_summary(&mut tx, None, &session, n).await?,
-            None => maybe_create_session_summary(&mut tx, None, &session).await?,
-        };
-    }
     tx.commit().await?;
+    for (session_id, prompt_no) in owed {
+        if let Err(e) = create_owed_summary(pool, session_id, prompt_no).await {
+            tracing::warn!(session = %session_id, error = %e, "creating an owed summary failed");
+        }
+    }
     Ok(closed)
+}
+
+/// Close the idle window of one session, unless another transaction holds the session.
+async fn close_idle_window(pool: &PgPool, session_id: Uuid, idle: f64) -> Result<bool, sqlx::Error> {
+    let mut tx = sweep_tx(pool).await?;
+    let Some(session) = builders::try_lock_session(&mut tx, session_id).await? else {
+        return Ok(false);
+    };
+    let window: Option<i32> = sqlx::query_scalar(
+        "SELECT window_no FROM session_windows WHERE session_id = $1 AND closed_at IS NULL
+            AND has_content AND last_event_at < now() - make_interval(secs => $2)",
+    )
+    .bind(session_id)
+    .bind(idle)
+    .fetch_optional(&mut *tx)
+    .await?;
+    let Some(window_no) = window else {
+        return Ok(false);
+    };
+    close_window(&mut tx, None, &session, window_no, "idle").await?;
+    tx.commit().await?;
+    Ok(true)
+}
+
+async fn create_owed_summary(pool: &PgPool, session_id: Uuid, prompt_no: Option<i32>) -> Result<(), sqlx::Error> {
+    let mut tx = sweep_tx(pool).await?;
+    let Some(session) = builders::try_lock_session(&mut tx, session_id).await? else {
+        return Ok(());
+    };
+    match prompt_no {
+        Some(n) => maybe_create_prompt_summary(&mut tx, None, &session, n).await?,
+        None => maybe_create_session_summary(&mut tx, None, &session).await?,
+    };
+    tx.commit().await?;
+    Ok(())
 }

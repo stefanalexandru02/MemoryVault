@@ -11,7 +11,7 @@
 //! memvault admin consolidate revert <run_id>
 //! memvault admin packets list --status failed | packets retry <id>
 //! memvault admin reindex [--model m] [--table facts]... [--space-id <uuid>]
-//! memvault admin project remap <from> <to> [--space-id <uuid>]
+//! memvault admin project remap --from <old> --to <new> [--space-id <uuid>]
 //! ```
 
 use std::io::Write;
@@ -202,7 +202,9 @@ enum JobsCommand {
 enum ProjectCommand {
     /// Rename a project key everywhere (audited, revertable).
     Remap {
+        #[arg(long)]
         from: String,
+        #[arg(long)]
         to: String,
         #[arg(long)]
         space_id: Option<Uuid>,

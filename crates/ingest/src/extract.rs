@@ -187,14 +187,14 @@ async fn insert_observation(
 
 /// An existing observation this one duplicates (spec 10.4 step 2): the same `content_hash` in the
 /// space within 24 h (its importance is raised to the max of both), else the same `title_norm_key`
-/// within 24 h (audited `obs.merge`).
+/// within 24 h (audited `obs.merge`). The second value names the rule that matched.
 async fn find_duplicate(
     conn: &mut PgConnection,
     packet: &PacketRecord,
     obs: &ObservedObservation,
     content_hash: &str,
     norm_key: Option<&str>,
-) -> Result<Option<Uuid>, sqlx::Error> {
+) -> Result<Option<(Uuid, &'static str)>, sqlx::Error> {
     let same_hash: Option<Uuid> = sqlx::query_scalar(&format!(
         "UPDATE observations SET importance = greatest(importance, $3)
           WHERE id = (SELECT id FROM observations WHERE space_id = $1 AND content_hash = $2
@@ -206,8 +206,8 @@ async fn find_duplicate(
     .bind(obs.importance as f32)
     .fetch_optional(&mut *conn)
     .await?;
-    if same_hash.is_some() {
-        return Ok(same_hash);
+    if let Some(id) = same_hash {
+        return Ok(Some((id, "content_hash")));
     }
     let Some(norm_key) = norm_key else {
         return Ok(None);
@@ -235,7 +235,7 @@ async fn find_duplicate(
         )
         .await?;
     }
-    Ok(same_title)
+    Ok(same_title.map(|id| (id, "title_norm")))
 }
 
 // ---------- fact candidates ----------
@@ -484,8 +484,9 @@ pub async fn apply_extract(
         let subagent = obs.entities.iter().any(|e| e.starts_with("subagent:"));
         let norm_key = title_norm_key(&obs.title, &scope, &session.harness, subagent);
         let obs_id = match find_duplicate(conn, packet, obs, &hash, norm_key.as_deref()).await? {
-            Some(id) => {
+            Some((id, reason)) => {
                 *counts.get_mut("duplicates").expect("initialised") += 1;
+                metrics::counter!("memsvc_observations_skipped_total", "reason" => reason).increment(1);
                 id
             }
             None => {
@@ -498,6 +499,8 @@ pub async fn apply_extract(
                 };
                 let id = insert_observation(conn, packet, &session, new).await?;
                 *counts.get_mut("observations").expect("initialised") += 1;
+                metrics::counter!("memsvc_observations_created_total", "mode" => "code", "type" => obs.obs_type.as_str())
+                    .increment(1);
                 first_new = first_new.or(Some(id));
                 touched.insert(scope);
                 id
@@ -549,6 +552,7 @@ pub async fn apply_extract(
                 };
                 insert_candidate(conn, packet, &session, new).await?;
                 *counts.get_mut("fact_candidates").expect("initialised") += 1;
+                metrics::counter!("memsvc_fact_candidates_total").increment(1);
             }
         }
     }

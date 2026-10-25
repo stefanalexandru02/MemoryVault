@@ -403,6 +403,13 @@ async fn search_timeline_by_file(pool: PgPool) {
     let q = SearchQuery { files: Some(vec!["deploy/nginx.conf".into()]), limit: 20, ..SearchQuery::default() };
     assert_eq!(engine::search(&w.state, &w.alice.identity, q).await.unwrap().rows[0].id, ids[3]);
     assert_eq!(engine::search(&w.state, &w.alice.identity, SearchQuery::default()).await.unwrap_err().status, 422);
+    // The candidate window is bounded: no huge or overflowing offsets.
+    for offset in [1000, 50_000_000, i64::MAX] {
+        let q = SearchQuery { q: Some("pgvector".into()), offset, limit: 20, ..SearchQuery::default() };
+        assert_eq!(engine::search(&w.state, &w.alice.identity, q).await.unwrap_err().status, 422, "{offset}");
+    }
+    let q = SearchQuery { q: Some("pgvector".into()), offset: 980, limit: 20, ..SearchQuery::default() };
+    engine::search(&w.state, &w.alice.identity, q).await.unwrap();
 
     let t = engine::timeline(&w.state, &w.alice.identity, TimelineQuery { anchor_id: ids[2], before: 1, after: 5 })
         .await
@@ -558,4 +565,65 @@ fn ef_search_covers_the_vector_leg_limit() {
     assert!(engine::ef_search_for(VECTOR_LIMIT) as i64 >= VECTOR_LIMIT * VECTOR_PART_FANOUT);
     assert_eq!(engine::ef_search_for(1), 80);
     assert_eq!(engine::ef_search_for(10_000), 1000);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn recall_and_context_write_access_log_for_returned_content(pool: PgPool) {
+    let w = world(pool).await;
+    let (hit, ..) = seed_corpus(&w).await;
+    let mut pinned = Fact::new(w.alice.space_id, "prefers.editor", "helix");
+    pinned.pinned = true;
+    let fact = insert_fact(&w, pinned).await;
+    let resp =
+        engine::recall(&w.state, &w.alice.identity, req("which pgvector hnsw index did we choose")).await.unwrap();
+    assert!(resp.slots.observations[0].expanded && resp.slots.observations[0].item.id == hit);
+    let logged: Vec<Uuid> = sqlx::query_scalar("SELECT unnest(target_ids) FROM access_log WHERE action = 'recall'")
+        .fetch_all(&w.pool)
+        .await
+        .unwrap();
+    assert!(logged.contains(&hit), "the expanded observation is a content read: {logged:?}");
+    assert!(logged.contains(&fact), "so is a returned fact: {logged:?}");
+    let index_only: Vec<Uuid> = resp.slots.observations.iter().filter(|o| !o.expanded).map(|o| o.item.id).collect();
+    assert!(index_only.iter().all(|id| !logged.contains(id)), "index lines are not content reads");
+
+    memvault_recall::context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup")
+        .await
+        .unwrap();
+    let ctx: Vec<Uuid> = sqlx::query_scalar("SELECT unnest(target_ids) FROM access_log WHERE action = 'context'")
+        .fetch_all(&w.pool)
+        .await
+        .unwrap();
+    assert!(ctx.contains(&fact), "{ctx:?}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn pinned_facts_compete_for_the_budget_by_importance_not_by_id(pool: PgPool) {
+    let w = world(pool).await;
+    let space = w.alice.space_id;
+    let mut ids = Vec::new();
+    // oldest id first, importance rising: the old ids must not win just by being old
+    for (i, importance) in [0.1_f32, 0.5, 0.9].into_iter().enumerate() {
+        let mut f = Fact::new(space, &format!("pinned.rule_{i}"), "keep this rule in mind always");
+        f.pinned = true;
+        let id = insert_fact(&w, f).await;
+        sqlx::query("UPDATE facts SET importance = $2 WHERE id = $1")
+            .bind(id)
+            .bind(importance)
+            .execute(&w.pool)
+            .await
+            .unwrap();
+        ids.push(id);
+    }
+    let all = Budgets { profile: 0, facts: 1000, procedures: 0, observations: 0, summaries: 0, work_state: 0 };
+    let full = engine::recall(&w.state, &w.alice.identity, RecallRequest { budgets: all, ..req("zzzz nothing") })
+        .await
+        .unwrap();
+    assert_eq!(full.slots.facts.len(), 3);
+    let one_and_a_half = full.tokens.by_slot["facts"] / 3 * 3 / 2;
+    let tight = Budgets { facts: one_and_a_half as u32, ..all };
+    let resp = engine::recall(&w.state, &w.alice.identity, RecallRequest { budgets: tight, ..req("zzzz nothing") })
+        .await
+        .unwrap();
+    let got: Vec<Uuid> = resp.slots.facts.iter().map(|f| f.item.id).collect();
+    assert_eq!(got, [ids[2]], "the most important pinned fact is the one that fits");
 }

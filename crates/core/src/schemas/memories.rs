@@ -53,6 +53,9 @@ pub struct SearchQuery {
     pub offset: i64,
 }
 
+/// Largest `offset + limit` a search accepts.
+pub const MAX_SEARCH_WINDOW: i64 = 1000;
+
 impl SearchQuery {
     pub fn validate(&self) -> Result<(), ApiError> {
         let has_q = self.q.as_deref().is_some_and(|q| !q.trim().is_empty());
@@ -69,6 +72,10 @@ impl SearchQuery {
         }
         if self.offset < 0 {
             return Err(ApiError::invalid("offset must be >= 0"));
+        }
+        // Every leg fetches offset + limit candidates, so the window is bounded.
+        if self.offset > MAX_SEARCH_WINDOW - self.limit {
+            return Err(ApiError::invalid(format!("offset + limit must be <= {MAX_SEARCH_WINDOW}")));
         }
         Ok(())
     }

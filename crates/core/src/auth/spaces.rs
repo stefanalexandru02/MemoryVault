@@ -12,6 +12,13 @@ use uuid::Uuid;
 use crate::auth::Identity;
 use crate::error::ApiError;
 
+/// Adds the space(s) a request works on to the current span (`space_id`, declared by the server's
+/// `http` span), so its log lines carry them.
+fn record_spaces(spaces: &[Uuid]) {
+    let text = spaces.iter().map(Uuid::to_string).collect::<Vec<_>>().join(",");
+    tracing::Span::current().record("space_id", text.as_str());
+}
+
 pub async fn readable_space_ids(conn: &mut PgConnection, user_id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
     sqlx::query_scalar("SELECT space_id FROM memberships WHERE user_id = $1 ORDER BY space_id")
         .bind(user_id)
@@ -46,9 +53,10 @@ pub async fn resolve_read_spaces(
                 out.push(*s);
             }
         }
+        record_spaces(&out);
         return Ok(out);
     }
-    Ok(sqlx::query_scalar(
+    let spaces: Vec<Uuid> = sqlx::query_scalar(
         "SELECT m.space_id FROM memberships m JOIN spaces s ON s.id = m.space_id
           WHERE m.user_id = $1 AND (s.id = $2 OR s.kind = 'shared')
           ORDER BY (s.id = $2) DESC, s.id",
@@ -56,7 +64,9 @@ pub async fn resolve_read_spaces(
     .bind(identity.user_id)
     .bind(identity.default_space_id)
     .fetch_all(conn)
-    .await?)
+    .await?;
+    record_spaces(&spaces);
+    Ok(spaces)
 }
 
 /// The space a write lands in (default: the user's default space). 403 unless owner/writer.
@@ -71,5 +81,6 @@ pub async fn resolve_write_space(
     if !writable_space_ids(conn, identity.user_id).await?.contains(&target) {
         return Err(ApiError::forbidden("space_forbidden", format!("no write access to space {target}")));
     }
+    record_spaces(&[target]);
     Ok(target)
 }

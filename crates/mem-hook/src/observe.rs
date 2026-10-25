@@ -4,7 +4,6 @@
 //! [--max N]` is the nightly runner.
 
 use std::io::{Read, Write};
-use std::os::unix::process::CommandExt;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
@@ -120,7 +119,7 @@ pub fn run(args: &[String]) {
 
 /// Appends `args` (one JSON array per line) to the request file.
 fn request_again(path: &Path, args: &[String]) {
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = util::open_append(path) {
         let _ = writeln!(f, "{}", json!(args));
     }
 }
@@ -150,7 +149,7 @@ fn pass(home: &Path, api: &Api, cfg: &Config, opts: &Opts) {
     log(home, &format!("observer start {opts:?}"));
     let mut done = 0;
     while done < opts.max {
-        let lease = json!({ "session_id": opts.session, "kinds": opts.kinds, "max": 1 });
+        let lease = json!({ "session_id": opts.session, "kinds": opts.kinds, "max": 1, "runner_kind": "claude-p" });
         let packet = match api.post("/v1/work/lease", &lease, LEASE_TIMEOUT) {
             Ok(r) if r.ok() => r.json().and_then(|v| v["packets"].get(0).cloned()),
             Ok(r) => {
@@ -176,7 +175,7 @@ fn log(home: &Path, msg: &str) {
     if std::fs::metadata(&path).is_ok_and(|m| m.len() > LOG_LIMIT) {
         let _ = std::fs::remove_file(&path);
     }
-    if let Ok(mut f) = std::fs::OpenOptions::new().create(true).append(true).open(path) {
+    if let Ok(mut f) = util::open_append(&path) {
         let _ = writeln!(f, "{} {msg}", util::now_rfc3339());
     }
 }
@@ -345,8 +344,8 @@ fn spawn_claude(
         .env("MEMORY_OBSERVER", "1")
         .stdin(if via_stdin { Stdio::piped() } else { Stdio::null() })
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .process_group(0);
+        .stderr(Stdio::piped());
+    util::own_process_group(&mut cmd);
     let mut child = cmd.spawn()?;
     let feeder = child.stdin.take().map(|mut stdin| {
         let text = user.to_string();
@@ -373,9 +372,7 @@ fn spawn_claude(
             break (Some(status), false);
         }
         if Instant::now() >= deadline {
-            // SAFETY: signals the child's own process group (set with process_group(0)).
-            unsafe { libc::kill(-(child.id() as i32), libc::SIGKILL) };
-            let _ = child.kill();
+            util::kill_tree(&mut child);
             break (child.wait().ok(), true);
         }
         std::thread::sleep(Duration::from_millis(20));

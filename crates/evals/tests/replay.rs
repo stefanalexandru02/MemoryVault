@@ -38,7 +38,7 @@ async fn fake_observer_replays_without_recorded_outputs(pool: PgPool) {
     let base = test_state(pool.clone());
     let state = state_over(&base, base.db.clone()).unwrap();
     let set = EvalSet::load(&evals_dir()).unwrap();
-    let opts = ReplayOptions { observer: Observer::Fake, rerank: false };
+    let opts = ReplayOptions { observer: Observer::Fake, ..ReplayOptions::default() };
     let report = replay(&state, &set, &opts).await.unwrap();
     assert_eq!(report.packets_failed, 0);
     // The fake observer titles an observation with the prompt, so the CI question still hits.
@@ -199,4 +199,84 @@ async fn compare_reads_claude_mem_and_this_service(pool: PgPool) {
     assert_eq!(rows[0].memvault.summaries, 1);
     assert_eq!(rows[0].memvault_facts, 1);
     assert_eq!(rows[1].claude_mem.observations + rows[1].memvault.observations, 0);
+}
+
+/// A fake `claude` that records its arguments and stdin and answers with `observer_output`.
+fn fake_claude(dir: &std::path::Path, observer_output: &serde_json::Value) -> PathBuf {
+    use std::os::unix::fs::PermissionsExt;
+    let reply = serde_json::json!({"type": "result", "is_error": false, "result": observer_output.to_string()});
+    std::fs::write(dir.join("reply"), reply.to_string()).unwrap();
+    let script = format!(
+        "#!/bin/bash\nS='{}'\nn=$(( $(cat \"$S/count\" 2>/dev/null || echo 0) + 1 ))\necho $n > \"$S/count\"\n\
+         printf '%s\\0' \"$@\" > \"$S/args.$n\"\ncat > \"$S/stdin.$n\"\ncat \"$S/reply\"\n",
+        dir.display()
+    );
+    let bin = dir.join("claude");
+    std::fs::write(&bin, script).unwrap();
+    std::fs::set_permissions(&bin, std::fs::Permissions::from_mode(0o755)).unwrap();
+    bin
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_prompt_under_test_decides_what_gets_measured(pool: PgPool) {
+    let base = test_state(pool.clone());
+    let state = state_over(&base, base.db.clone()).unwrap();
+    let set = EvalSet::load(&evals_dir()).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let output = serde_json::json!({
+        "skip": false,
+        "observations": [{
+            "type": "change", "title": "Caching cargo dependencies in CI", "narrative": "rust-cache was added.",
+            "facts": [], "concepts": ["what-changed"], "files": [], "importance": 0.5, "source_event_seqs": [1],
+        }],
+        "fact_candidates": [],
+    });
+    let claude = fake_claude(dir.path(), &output);
+
+    let opts = ReplayOptions {
+        observer: Observer::Claude,
+        prompt: Some("observer.code@v2".into()),
+        claude_bin: Some(claude.display().to_string()),
+        ..ReplayOptions::default()
+    };
+    let report = replay(&state, &set, &opts).await.unwrap();
+    assert_eq!(report.packets_failed, 0, "{report:?}");
+    // The recorded outputs are not used: the model's answer is what recall finds.
+    let by_id = |id: &str| report.per_question.iter().find(|q| q.id == id).unwrap().recall_at_5;
+    assert_eq!(by_id("ci-cache"), 1.0);
+    assert_eq!(by_id("parser-last-token"), 0.0);
+
+    let calls: usize = std::fs::read_to_string(dir.path().join("count")).unwrap().trim().parse().unwrap();
+    assert_eq!(calls, 2, "one extract packet per recorded session");
+    let args = std::fs::read(dir.path().join("args.1")).unwrap();
+    let args: Vec<String> = args.split(|b| *b == 0).map(|a| String::from_utf8_lossy(a).into_owned()).collect();
+    assert!(
+        args.windows(2).any(|w| w == ["--system-prompt", &state.prompts.get("observer.code@v2", None).unwrap().system])
+    );
+    assert!(args.contains(&"-p".to_string()) && args.contains(&"--no-session-persistence".to_string()));
+    let stdin = std::fs::read_to_string(dir.path().join("stdin.1")).unwrap();
+    assert!(stdin.contains("rust-cache") || stdin.contains("cargo"), "the rendered packet reaches the model: {stdin}");
+    let pinned: Vec<String> = sqlx::query_scalar("SELECT DISTINCT prompt_ref FROM work_packets WHERE kind = 'extract'")
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+    assert_eq!(pinned, ["observer.code@v2"]);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn prompt_and_observer_must_agree(pool: PgPool) {
+    let base = test_state(pool.clone());
+    let state = state_over(&base, base.db.clone()).unwrap();
+    let set = EvalSet::load(&evals_dir()).unwrap();
+    let recorded = ReplayOptions { prompt: Some("observer.code@v2".into()), ..ReplayOptions::default() };
+    let err = replay(&state, &set, &recorded).await.unwrap_err();
+    assert!(err.to_string().contains("needs the claude observer"), "{err}");
+    let unknown = ReplayOptions {
+        observer: Observer::Claude,
+        prompt: Some("observer.code@v99".into()),
+        ..ReplayOptions::default()
+    };
+    assert!(replay(&state, &set, &unknown).await.unwrap_err().to_string().contains("unknown prompt"));
+    let no_prompt = ReplayOptions { observer: Observer::Claude, ..ReplayOptions::default() };
+    assert!(replay(&state, &set, &no_prompt).await.unwrap_err().to_string().contains("--prompt"));
 }

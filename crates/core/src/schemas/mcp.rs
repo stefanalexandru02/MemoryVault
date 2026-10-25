@@ -30,8 +30,9 @@ pub struct MemorySearchArgs {
     pub query: String,
     #[serde(default)]
     pub types: Option<Vec<String>>,
+    /// Default: the project when the request carries the project header, else all.
     #[serde(default)]
-    pub scope: McpScope,
+    pub scope: Option<McpScope>,
     #[serde(default)]
     pub since: Option<String>,
     #[serde(default)]

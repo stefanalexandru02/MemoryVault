@@ -68,6 +68,7 @@ serde_urlencoded.
 | 0400-0499 | consolidation (0400 exists: decay and revert bookkeeping) |
 | 0500-0599 | worker |
 | 0600-0699 | evals |
+| 0900-0999 | hardening (runs last; narrows privileges granted by 0099) |
 
 Rules for module migrations:
 - New table with `space_id`: `SELECT memsvc_apply_space_rls('your_table');` (standard sel/ins/upd/del policies for
@@ -119,6 +120,11 @@ Full DDL of spec 4.1-4.7 plus:
   executable by `memsvc_app`): a cached block is served only when no matching invalidation is newer than its
   `rendered_at`, which closes the render/NOTIFY race.
 - **0202 recall**: forced RLS on `context_invalidations` (it has `space_id`; the app role has no grants on it).
+- **0500 worker**: `jobs.priority` (claim order; live jobs 0, `reindex` backfill 10).
+- **0900 hardening**: `memsvc_app` loses INSERT/UPDATE/DELETE on `users`, `spaces`, `api_tokens`, `clients`
+  (except `api_tokens.last_used_at` and `clients.last_seen_at/current_project_key/current_project_at`) and DELETE on
+  `jobs`; the SECURITY DEFINER functions are executable by `memsvc_app`/`memsvc_system` only, not PUBLIC.
+  Admin writes go through the system role, so they are unaffected.
 - **0400 consolidation**: `observations.decayed_at`, `facts.decayed_at` (incremental decay),
   `memory_audit.seq bigserial` (reverse-replay order), `memory_audit.reverts_audit_id`,
   `procedure_hints.consumed_run_id`, index on `work_packets((inputs->>'run_id'))`.
@@ -402,3 +408,39 @@ admin/evals CLIs get an `AppState` whose pools connect lazily, with every applie
   `anyhow::Result<u64>`; `render_context` returns `Result<String, ApiError>`; `enqueue_embed` lives in core
   (re-exported by the worker) because ingest cannot depend on the worker.
 - Module routers declare paths without `/v1`; the server nests them.
+
+## Deviations from the spec (modules)
+
+Choices made while implementing, with the reason; the spec text stays as written.
+
+- **Scope (owner decision)**: no Python client, no assistant observer mode, nothing whose only consumer is the
+  agentic OS; the bash hooks of section 8 are the Rust binary `mem-hook` (`observe --all` is the nightly runner).
+- **Summaries are deferred (6.1, 9.1)**: `summarize_prompt` and `summarize_session` are created once the packets
+  they summarise have settled (done/failed/cancelled), because packet inputs are immutable and carry the window
+  observations' titles; `windows::after_packet_settled` and the sweep trigger that. A Stop owes the former, `/end`
+  the latter.
+- **`attempts` counts at lease (6.6)**, not at `/fail` (see `queue.rs`): a runner that vanishes still uses an attempt.
+- **mem-hook drops, not spools, 4xx rejections (8.3)** other than 401/403/404/408/425/429: retrying a request the
+  server judged invalid can never succeed. An HTTP 500 is spooled but a replay skips it, counts the failure on the
+  line (`replays`) and drops it after 5 (a poison request must not block the spool behind it).
+- **`observe --final` leases up to 10 packets (8.5)**, not 3: the last run of a session also clears the windows of
+  the session end; `--session` without `--final` keeps 3.
+- **Same-value test of a fact candidate (10.4 step 3)** is jsonb equality or case-insensitive `value_text` equality;
+  the "cosine > 0.95 after embedding" test is not done, because appliers do not get the embedder. Paraphrased
+  confirmations land as conflict candidates and consolidation merges them.
+- **Context cache hits write no `access_log` row (5.3, 4.6)**: a cache miss logs what the pack returned
+  (`action = 'context'`), `POST /v1/recall` always logs (`'recall'`); the cached block carries no row ids to log
+  on a hit.
+- **Windows hook and static build (2, D5)**: mem-hook is `cfg(unix)`/`cfg(windows)` portable (it type-checks for
+  `x86_64-pc-windows-gnu`; it has not been run on Windows). The Linux build is a static (`crt-static`) glibc
+  binary via `install.sh`; a musl build needs `musl-tools` (see the plugin README).
+- **Session counter after a pruned cache (8.3)**: mem-hook rebuilds `next_seq` from `POST /v1/sessions` (`next_seq`).
+  If the cache is lost while the server is unreachable, a resumed session's offline events restart at the cached
+  value and can collide with stored events until the server answers.
+- **Search window**: `offset + limit` of `GET /v1/search` is capped at 1000.
+- **`runner_kind` of `packets_leased_total`** is what the lease request reports (`runner_kind` field, `unknown`
+  otherwise); the result `meta` is only known after the lease.
+- **`evals replay --prompt`**: needs `--observer claude` (implied); only `extract` packets go to `claude -p`,
+  summaries use the recorded or fake outputs.
+- **Hard delete (5.3)** blanks `work_packets` whose `inputs`/`result`/`applied` contain the row's full id; content
+  that was never tied to the id (a model's paraphrase in a result) cannot be found.

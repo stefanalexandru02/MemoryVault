@@ -99,10 +99,12 @@ async fn schema_details(pool: PgPool) {
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn grants_cover_every_table_and_later_ones(pool: PgPool) {
-    // Every table (including module migrations 0100+) is usable by both roles ...
+    // Every table (including module migrations 0100+) is usable by both roles (except the few that
+    // 0900_hardening narrows for the app role) ...
     let missing: Vec<String> = sqlx::query_scalar(
         "SELECT c.relname::text FROM pg_class c
           WHERE c.relnamespace = 'public'::regnamespace AND c.relkind = 'r' AND c.relname <> '_sqlx_migrations'
+            AND c.relname NOT IN ('users', 'spaces', 'api_tokens', 'clients', 'jobs')
             AND NOT (has_table_privilege('memsvc_app', c.oid, 'SELECT,INSERT,UPDATE,DELETE')
                  AND has_table_privilege('memsvc_system', c.oid, 'SELECT,INSERT,UPDATE,DELETE'))",
     )
@@ -124,6 +126,48 @@ async fn grants_cover_every_table_and_later_ones(pool: PgPool) {
     .await
     .unwrap();
     assert_eq!(ok, (true, true));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_app_role_cannot_rewrite_tenancy_or_tokens(pool: PgPool) {
+    let can = |privilege: &'static str, table: &'static str| {
+        let pool = pool.clone();
+        async move {
+            sqlx::query_scalar::<_, bool>("SELECT has_table_privilege('memsvc_app', $1, $2)")
+                .bind(table)
+                .bind(privilege)
+                .fetch_one(&pool)
+                .await
+                .unwrap()
+        }
+    };
+    for table in ["users", "spaces", "api_tokens", "clients"] {
+        assert!(can("SELECT", table).await, "{table} is read for authentication");
+        for privilege in ["INSERT", "DELETE"] {
+            assert!(!can(privilege, table).await, "{privilege} on {table}");
+        }
+    }
+    for table in ["users", "spaces"] {
+        assert!(!can("UPDATE", table).await, "UPDATE on {table}");
+    }
+    // only the bookkeeping columns stay writable
+    let columns: Vec<String> = sqlx::query_scalar(
+        "SELECT a.attname::text FROM pg_attribute a
+          WHERE a.attrelid = 'api_tokens'::regclass AND a.attnum > 0 AND NOT a.attisdropped
+            AND has_column_privilege('memsvc_app', a.attrelid, a.attnum, 'UPDATE')",
+    )
+    .fetch_all(&pool)
+    .await
+    .unwrap();
+    assert_eq!(columns, ["last_used_at"]);
+    // the cross-tenant functions are not callable by other roles
+    let public: bool = sqlx::query_scalar(
+        "SELECT has_function_privilege('public', 'memsvc_recall_invalidate(uuid, text, text)', 'EXECUTE')",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(!public);
 }
 
 #[sqlx::test(migrations = "../../migrations")]

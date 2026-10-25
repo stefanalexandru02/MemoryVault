@@ -17,6 +17,7 @@ use memvault_core::{ApiError, AppState, AppliedCounts, Identity, require_scope};
 use uuid::Uuid;
 
 use crate::builders::to_json;
+use crate::events::strip_nul;
 use crate::{queue, windows};
 use memvault_core::{system_tx, user_tx};
 
@@ -56,7 +57,9 @@ pub async fn post_result(
         return Ok(Json(ResultResponse { applied, duplicate: true }));
     }
     queue::require_lease(&packet, identity.client_id)?;
-    let output = match state.schemas.validate(packet.output_schema, &body.output) {
+    // NUL in model output would fail the jsonb/text inserts of the appliers with a 500.
+    let output = strip_nul(&body.output);
+    let output = match state.schemas.validate(packet.output_schema, &output) {
         Ok(output) => output,
         Err(e @ OutputError::Invalid(_)) => {
             sqlx::query("UPDATE work_packets SET last_error = $2 WHERE id = $1")
@@ -70,7 +73,7 @@ pub async fn post_result(
         }
         Err(e) => return Err(e.into()),
     };
-    let meta = to_json(&body.meta);
+    let meta = strip_nul(&to_json(&body.meta));
     packet.result_meta = Some(meta.clone());
     let counts = state.appliers.apply(&mut tx, &packet, &output).await?;
     sqlx::query(
@@ -88,6 +91,8 @@ pub async fn post_result(
         .await?;
     tx.commit().await?;
     metrics::counter!("memsvc_packets_done_total", "kind" => packet.kind.as_str()).increment(1);
+    let age = (chrono::Utc::now() - packet.created_at).to_std().unwrap_or_default();
+    metrics::histogram!("memsvc_packet_age_seconds", "kind" => packet.kind.as_str()).record(age.as_secs_f64());
     Ok(Json(ResultResponse { applied: counts, duplicate: false }))
 }
 
@@ -98,9 +103,10 @@ pub async fn post_fail(
     Json(body): Json<FailRequest>,
 ) -> Result<Json<FailResponse>, ApiError> {
     require_scope(&state, &identity, auth::WORK_LEASE).await?;
+    let detail = body.detail.as_deref().map(|d| d.replace('\0', ""));
     let mut tx = user_tx(&state.db.app, &identity).await?;
     let row =
-        queue::fail(&mut tx, &state.prompts, packet_id, identity.client_id, body.error, body.detail.as_deref()).await?;
+        queue::fail(&mut tx, &state.prompts, packet_id, identity.client_id, body.error, detail.as_deref()).await?;
     tx.commit().await?;
     Ok(Json(FailResponse {
         id: row.id,

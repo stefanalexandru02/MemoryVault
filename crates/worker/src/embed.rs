@@ -6,6 +6,7 @@ use std::str::FromStr;
 
 use anyhow::Context;
 use memvault_core::AppState;
+use memvault_core::ids::new_id;
 use memvault_core::schemas::common::EmbeddingOwnerTable;
 use memvault_core::tei::Embedder;
 use pgvector::Vector;
@@ -146,24 +147,43 @@ pub async fn embed_targets_with(
     Ok(texts.len())
 }
 
-/// Queue embed jobs for every row lacking a vector for `model` (spec 13 backfill). Rows that
-/// already have a queued or running embed job are skipped. Returns the number of jobs queued.
+/// Queue embed jobs for every row lacking a vector for `model` (spec 13 backfill), at backfill
+/// priority so live embed jobs are not delayed behind them. Rows that already have a queued or
+/// running embed job are skipped. Returns the number of jobs queued.
 pub async fn reindex(pool: &PgPool, model: &str) -> Result<u64, sqlx::Error> {
     let mut queued = 0;
     for table in EmbeddingOwnerTable::ALL.iter() {
-        let sql = format!(
-            "INSERT INTO jobs (id, type, payload)
-             SELECT gen_random_uuid(), 'embed',
-                    jsonb_build_object('owner_table', $1::text, 'owner_id', t.id, 'model', $2::text)
-               FROM {} t
+        let owners: Vec<Uuid> = sqlx::query_scalar(&format!(
+            "SELECT t.id FROM {} t
               WHERE NOT EXISTS (SELECT 1 FROM embeddings e
                                  WHERE e.owner_table = $1 AND e.owner_id = t.id AND e.model = $2)
                 AND NOT EXISTS (SELECT 1 FROM jobs j
                                  WHERE j.type = 'embed' AND j.status IN ('queued', 'running')
-                                   AND j.payload->>'owner_table' = $1 AND j.payload->>'owner_id' = t.id::text)",
+                                   AND j.payload->>'owner_table' = $1 AND j.payload->>'owner_id' = t.id::text)
+              ORDER BY t.id",
             table.as_str()
-        );
-        queued += sqlx::query(&sql).bind(table.as_str()).bind(model).execute(pool).await?.rows_affected();
+        ))
+        .bind(table.as_str())
+        .bind(model)
+        .fetch_all(pool)
+        .await?;
+        for chunk in owners.chunks(1000) {
+            let job_ids: Vec<Uuid> = chunk.iter().map(|_| new_id()).collect();
+            queued += sqlx::query(
+                "INSERT INTO jobs (id, type, payload, priority)
+                 SELECT j.id, 'embed',
+                        jsonb_build_object('owner_table', $1::text, 'owner_id', j.owner_id, 'model', $2::text), $5
+                   FROM unnest($3::uuid[], $4::uuid[]) AS j(id, owner_id)",
+            )
+            .bind(table.as_str())
+            .bind(model)
+            .bind(&job_ids)
+            .bind(chunk)
+            .bind(crate::queue::BACKFILL_PRIORITY)
+            .execute(pool)
+            .await?
+            .rows_affected();
+        }
     }
     Ok(queued)
 }

@@ -353,3 +353,62 @@ async fn hard_delete_of_an_observation_clears_references(pool: PgPool) {
         .unwrap();
     assert!(evidence.is_empty());
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn forgetting_a_fact_drops_the_cached_profile_of_its_scope(pool: PgPool) {
+    let w = world(pool).await;
+    let admin = seed_identity_with(&w.pool, TokenKind::Admin, SeedOptions::default()).await;
+    let fact = uuid_of(&ok(&w.post(&admin.token, "/memories", fact_body("wifi", "hunter2")).await), "/id");
+    let put_profile = || async {
+        sqlx::query(
+            "INSERT INTO profiles (space_id, scope_kind, scope_key, body_md, token_estimate, facts_version)
+             VALUES ($1, 'global', '', '- alex: wifi = hunter2', 5, 0)
+             ON CONFLICT DO NOTHING",
+        )
+        .bind(admin.space_id)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    };
+    let profiles = || async {
+        sqlx::query_scalar::<_, i64>("SELECT count(*) FROM profiles WHERE space_id = $1")
+            .bind(admin.space_id)
+            .fetch_one(&w.pool)
+            .await
+            .unwrap()
+    };
+
+    put_profile().await;
+    ok(&w.delete(&admin.token, &format!("/memories/{fact}")).await);
+    assert_eq!(profiles().await, 0, "soft delete drops the profile that rendered the value");
+
+    put_profile().await;
+    // work packets that carry the fact keep its content too
+    sqlx::query(
+        "INSERT INTO work_packets (id, space_id, kind, prompt_ref, model_hint, inputs, output_schema, status,
+                                   idempotency_key, result)
+         VALUES ($1, $2, 'consolidate_facts', 'consolidate.facts@v1', 'sonnet', $3, 'consolidate.facts.v1', 'done',
+                 'k1', $3)",
+    )
+    .bind(Uuid::now_v7())
+    .bind(admin.space_id)
+    .bind(json!({"facts": [{"id": fact, "value_text": "hunter2"}]}))
+    .execute(&w.pool)
+    .await
+    .unwrap();
+    ok(&w.delete(&admin.token, &format!("/memories/{fact}?hard=true")).await);
+    assert_eq!(profiles().await, 0);
+    let packet: (Value, Option<Value>) =
+        sqlx::query_as("SELECT inputs, result FROM work_packets WHERE idempotency_key = 'k1'")
+            .fetch_one(&w.pool)
+            .await
+            .unwrap();
+    assert_eq!(packet, (json!({}), None));
+
+    // forgetting an unrelated kind of memory leaves profiles alone
+    put_profile().await;
+    let obs =
+        uuid_of(&ok(&w.post(&admin.token, "/memories", json!({"kind": "observation", "title": "t"})).await), "/id");
+    ok(&w.delete(&admin.token, &format!("/memories/{obs}")).await);
+    assert_eq!(profiles().await, 1);
+}

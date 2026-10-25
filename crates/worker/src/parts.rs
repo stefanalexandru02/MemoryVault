@@ -54,12 +54,12 @@ pub fn parts_for(table: EmbeddingOwnerTable, row: &Value, max_tokens: usize) -> 
         }
         EmbeddingOwnerTable::Entities => add("name", "canonical_name"),
     }
-    if table == EmbeddingOwnerTable::Observations {
-        if let Some(facts) = row.get("facts").and_then(Value::as_array) {
-            for (i, f) in facts.iter().enumerate() {
-                if let Some(t) = f.as_str() {
-                    raw.push((format!("fact:{i}"), t));
-                }
+    if table == EmbeddingOwnerTable::Observations
+        && let Some(facts) = row.get("facts").and_then(Value::as_array)
+    {
+        for (i, f) in facts.iter().enumerate() {
+            if let Some(t) = f.as_str() {
+                raw.push((format!("fact:{i}"), t));
             }
         }
     }

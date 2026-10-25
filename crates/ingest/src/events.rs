@@ -28,6 +28,9 @@ const MIN_HEAD_CHARS: usize = 64;
 const EXCERPT_CHARS: usize = 8000;
 /// Top-level strings at most this long survive the excerpt fallback.
 const KEEP_SCALAR_CHARS: usize = 256;
+/// Serialized size the kept top-level scalars may add up to; with the excerpt (at most 6 bytes per
+/// char once escaped) the fallback stays under the cap whatever the payload holds.
+const KEEP_SCALAR_BYTES: usize = 8 * 1024;
 
 /// A string longer than `head + tail` chars becomes `head…[clamped N chars]…tail`.
 pub fn clamp_str(s: &str, head: usize, tail: usize) -> Option<String> {
@@ -39,6 +42,17 @@ pub fn clamp_str(s: &str, head: usize, tail: usize) -> Option<String> {
     let head_end = s.char_indices().nth(head).map_or(s.len(), |(i, _)| i);
     let tail_start = s.char_indices().nth(len - tail).map_or(s.len(), |(i, _)| i);
     Some(format!("{}…[clamped {cut} chars]…{}", &s[..head_end], &s[tail_start..]))
+}
+
+/// Postgres `jsonb` and `text` reject NUL (`\u0000`), which tool output (binary files, `cat`, `grep`)
+/// and model output can carry: drop it from every string and object key, recursively.
+pub fn strip_nul(value: &Value) -> Value {
+    match value {
+        Value::String(s) if s.contains('\0') => Value::String(s.replace('\0', "")),
+        Value::Array(items) => Value::Array(items.iter().map(strip_nul).collect()),
+        Value::Object(map) => Value::Object(map.iter().map(|(k, v)| (k.replace('\0', ""), strip_nul(v))).collect()),
+        other => other.clone(),
+    }
 }
 
 /// Clamp every string in `value`, recursively (object keys are kept).
@@ -53,11 +67,13 @@ pub fn clamp_strings(value: &Value, head: usize, tail: usize) -> Value {
     }
 }
 
-/// Spec 6.2 clamp: per-string head/tail, then a 64 KB cap on the whole payload. Returns the payload
-/// and its JSON text. Over the cap the per-string limits are halved until it fits; a payload that
-/// still does not fit (huge arrays, many keys) keeps its short top-level scalars plus a JSON excerpt.
-pub fn clamp_payload(payload: &Map<String, Value>) -> (Value, String) {
-    let original = Value::Object(payload.clone());
+/// Spec 6.2 clamp: NUL removal, per-string head/tail, then a 64 KB cap on the whole payload. Returns
+/// the payload and its JSON text. Over the cap the per-string limits are halved until it fits; a
+/// payload that still does not fit (huge arrays, many keys) keeps a bounded set of short top-level
+/// scalars plus a JSON excerpt. The flag tells whether anything was clamped (NUL removal alone does
+/// not count).
+pub fn clamp_payload(payload: &Map<String, Value>) -> (Value, String, bool) {
+    let original = strip_nul(&Value::Object(payload.clone()));
     let (mut head, mut tail) = (FIELD_HEAD_CHARS, FIELD_TAIL_CHARS);
     let mut out = clamp_strings(&original, head, tail);
     let mut text = out.to_string();
@@ -68,21 +84,27 @@ pub fn clamp_payload(payload: &Map<String, Value>) -> (Value, String) {
         text = out.to_string();
     }
     if text.len() > PAYLOAD_CAP_BYTES {
-        let mut kept: Map<String, Value> = payload
-            .iter()
-            .filter(|(_, v)| match v {
+        let mut kept = Map::new();
+        let mut kept_bytes = 0;
+        for (k, v) in original.as_object().into_iter().flatten() {
+            let short = match v {
                 Value::String(s) => s.chars().count() <= KEEP_SCALAR_CHARS,
                 Value::Null | Value::Bool(_) | Value::Number(_) => true,
                 _ => false,
-            })
-            .map(|(k, v)| (k.clone(), v.clone()))
-            .collect();
+            };
+            let cost = k.len() + v.to_string().len() + 4;
+            if short && kept_bytes + cost <= KEEP_SCALAR_BYTES {
+                kept_bytes += cost;
+                kept.insert(k.clone(), v.clone());
+            }
+        }
         kept.insert("payload_clamped".into(), Value::Bool(true));
         kept.insert("excerpt".into(), Value::String(text.chars().take(EXCERPT_CHARS).collect()));
         out = Value::Object(kept);
         text = out.to_string();
     }
-    (out, text)
+    let clamped = out != original;
+    (out, text, clamped)
 }
 
 pub async fn post_events(
@@ -104,8 +126,10 @@ pub async fn post_events(
         Vec::<DateTime<Utc>>::with_capacity(n),
         Vec::with_capacity(n),
     );
+    let mut clamped = 0;
     for ev in &batch.events {
-        let (payload, text) = clamp_payload(&ev.payload);
+        let (payload, text, was_clamped) = clamp_payload(&ev.payload);
+        clamped += usize::from(was_clamped);
         ids.push(new_id());
         seqs.push(ev.seq);
         kinds.push(ev.kind);
@@ -151,7 +175,9 @@ pub async fn post_events(
     tx.commit().await?;
 
     let accepted = inserted.len() as i64;
-    metrics::counter!("memsvc_events_ingested_total").increment(inserted.len() as u64);
+    metrics::counter!("memsvc_events_ingested_total", "harness" => session.harness.clone())
+        .increment(inserted.len() as u64);
+    metrics::counter!("memsvc_events_clamped_total").increment(clamped as u64);
     metrics::counter!("memsvc_events_duplicate_total").increment((n - inserted.len()) as u64);
     let out = EventsAccepted {
         accepted,
@@ -184,7 +210,8 @@ mod tests {
     fn payload_cap_and_excerpt() {
         let big = "x".repeat(20_000);
         let payload = json!({"tool_name": "Edit", "tool_input": {"a": big, "b": [big, big]}, "n": 3});
-        let (out, text) = clamp_payload(payload.as_object().unwrap());
+        let (out, text, clamped) = clamp_payload(payload.as_object().unwrap());
+        assert!(clamped);
         assert!(text.len() <= PAYLOAD_CAP_BYTES);
         assert_eq!(out["tool_name"], "Edit");
         assert!(out["tool_input"]["a"].as_str().unwrap().contains("[clamped"));
@@ -192,11 +219,25 @@ mod tests {
         // too many strings to fit even after halving: excerpt fallback keeps short scalars
         let many: Vec<String> = (0..3000).map(|i| format!("{i:0>64}")).collect();
         let payload = json!({"tool_name": "Bash", "items": many, "flag": true});
-        let (out, text) = clamp_payload(payload.as_object().unwrap());
+        let (out, text, _) = clamp_payload(payload.as_object().unwrap());
         assert!(text.len() <= PAYLOAD_CAP_BYTES);
         assert_eq!(out["payload_clamped"], true);
         assert_eq!(out["tool_name"], "Bash");
         assert_eq!(out["flag"], true);
         assert!(out.get("items").is_none());
+
+        // tens of thousands of short keys cannot slip past the cap either
+        let keys: Map<String, Value> = (0..30_000).map(|i| (format!("k{i}"), json!(i))).collect();
+        let (out, text, _) = clamp_payload(&keys);
+        assert!(text.len() <= PAYLOAD_CAP_BYTES, "{}", text.len());
+        assert_eq!(out["payload_clamped"], true);
+    }
+
+    #[test]
+    fn nul_is_stripped_from_strings_and_keys() {
+        let payload = json!({"tool_output": "a\u{0}b", "n\u{0}ested": {"k": ["x\u{0}", 1]}});
+        let (out, text, _) = clamp_payload(payload.as_object().unwrap());
+        assert_eq!(out, json!({"tool_output": "ab", "nested": {"k": ["x", 1]}}));
+        assert!(!text.contains("\\u0000"));
     }
 }

@@ -20,14 +20,17 @@ pub struct Job {
     pub attempts: i32,
 }
 
-/// Claim up to `limit` due jobs of the given types, oldest first.
+/// Jobs of a backfill (`reindex`); live jobs have priority 0 and are claimed first.
+pub const BACKFILL_PRIORITY: i16 = 10;
+
+/// Claim up to `limit` due jobs of the given types: by priority, then oldest first.
 pub async fn claim(pool: &PgPool, worker: &str, types: &[&str], limit: i64) -> Result<Vec<Job>, sqlx::Error> {
     let types: Vec<String> = types.iter().map(|t| t.to_string()).collect();
     sqlx::query_as(
         "UPDATE jobs SET status = 'running', locked_by = $1, attempts = attempts + 1,
                          locked_until = now() + make_interval(secs => $2)
           WHERE id IN (SELECT id FROM jobs WHERE status = 'queued' AND run_after <= now() AND type = ANY($3)
-                        ORDER BY run_after, created_at LIMIT $4 FOR UPDATE SKIP LOCKED)
+                        ORDER BY priority, run_after, created_at LIMIT $4 FOR UPDATE SKIP LOCKED)
           RETURNING id, type, payload, attempts",
     )
     .bind(worker)

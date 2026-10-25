@@ -57,9 +57,21 @@ fn prune(dir: &Path, max_age: Duration, max_bytes: u64) {
                     skip
                 })
                 .collect();
-            let _ = std::fs::write(p, rest);
+            let _ = util::write_private(p, rest);
         }
     }
+}
+
+/// False when the file's last byte is not a newline (an empty or unreadable file counts as fine).
+fn ends_with_newline(path: &Path) -> bool {
+    use std::io::{Read, Seek, SeekFrom};
+    let last = std::fs::File::open(path).and_then(|mut f| {
+        f.seek(SeekFrom::End(-1))?;
+        let mut b = [0u8];
+        f.read_exact(&mut b)?;
+        Ok(b[0])
+    });
+    last.map_or(true, |b| b == b'\n')
 }
 
 /// Appends one line to today's spool file. Never fails loudly.
@@ -75,11 +87,11 @@ pub fn append(home: &Path, entry: &Entry) {
         util::lock_wait(l, Duration::from_millis(500));
     }
     let path = dir.join(format!("{}.jsonl", util::yyyymmdd(util::unix_now().0)));
-    let file = {
-        use std::os::unix::fs::OpenOptionsExt;
-        std::fs::OpenOptions::new().create(true).append(true).mode(0o600).open(path)
-    };
-    if let Ok(mut f) = file {
+    if let Ok(mut f) = util::open_append(&path) {
+        // A hook killed mid-write leaves an unterminated line: end it so it cannot swallow this one.
+        if !ends_with_newline(&path) {
+            line.insert(0, '\n');
+        }
         let _ = f.write_all(line.as_bytes());
     }
     prune(&dir, MAX_AGE, MAX_BYTES);
@@ -104,54 +116,107 @@ pub fn drain(app: &App, budget: Duration) {
     drop(drain_lock);
 }
 
+/// A request the server answered 500 this many times (while it accepted other requests) is
+/// considered poison and dropped, so it cannot block the spool for good.
+const MAX_REPLAYS: u32 = 5;
+/// After this many 500s in a row without a single delivery the server itself is assumed broken:
+/// the replay stops and the failures are not held against the lines.
+const SERVER_ERROR_PATIENCE: usize = 5;
+/// An unterminated last line younger than this may still be written by a running hook.
+const PARTIAL_LINE_GRACE: Duration = Duration::from_secs(10);
+
 /// True when the whole file was consumed and the next one may be tried.
+///
+/// Walks the file oldest first. A delivered, rejected or unreadable line goes. A transport error or
+/// a retryable status stops the replay, keeping that line and everything after it. An HTTP 500 is
+/// kept but skipped, so one poison line does not block the lines behind it; once other lines were
+/// counted as a failed replay of the line (unless the server fails everything in a row, which says
+/// nothing about the line), and at [`MAX_REPLAYS`] it is dropped.
 fn drain_file(app: &App, file: &Path, deadline: Instant) -> bool {
     let Ok(content) = std::fs::read_to_string(file) else { return true };
-    let mut consumed = 0usize;
-    let mut stopped = false;
+    let partial_in_progress = std::fs::metadata(file)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_none_or(|age| age < PARTIAL_LINE_GRACE);
+    // One slot per processed line, in order: None = remove, Some(text) = keep as the file has it.
+    let mut kept: Vec<Option<String>> = Vec::new();
+    let mut failing: Vec<(usize, Entry)> = Vec::new();
+    let (mut delivered, mut stopped, mut server_broken) = (0usize, false, false);
     for line in content.split_inclusive('\n') {
         if !line.ends_with('\n') {
-            stopped = true; // a line still being written
-            break;
+            if partial_in_progress {
+                stopped = true; // a line still being written
+                break;
+            }
+            kept.push(None); // a writer died mid-line: nothing will complete it
+            continue;
         }
         let left = deadline.saturating_duration_since(Instant::now());
         if left < Duration::from_millis(50) {
             stopped = true;
             break;
         }
-        match serde_json::from_str::<Entry>(line) {
-            Err(_) => {} // garbage: discard
-            Ok(entry) => match deliver::send(app, &entry, left) {
-                Ok(_) => {}
-                Err(Fail::Drop(msg)) => eprintln!("memory: dropping spooled request: {msg}"),
-                Err(Fail::Retry(why)) => {
-                    util::debug(&format!("replay stopped: {why}"));
-                    stopped = true;
+        let Ok(entry) = serde_json::from_str::<Entry>(line) else {
+            kept.push(None); // garbage: discard
+            continue;
+        };
+        match deliver::send(app, &entry, left) {
+            Ok(_) => {
+                delivered += 1;
+                kept.push(None);
+            }
+            Err(Fail::Drop(msg)) => {
+                eprintln!("memory: dropping spooled request: {msg}");
+                kept.push(None);
+            }
+            Err(Fail::Server(why)) => {
+                util::debug(&format!("replay skipped a line: {why}"));
+                failing.push((kept.len(), entry));
+                kept.push(Some(line.to_string()));
+                if delivered == 0 && failing.len() >= SERVER_ERROR_PATIENCE {
+                    (stopped, server_broken) = (true, true);
                     break;
                 }
-            },
+            }
+            Err(Fail::Retry(why)) => {
+                util::debug(&format!("replay stopped: {why}"));
+                stopped = true;
+                break;
+            }
         }
-        consumed += 1;
     }
-    if consumed > 0 {
-        remove_lines(file, consumed);
+    if !server_broken {
+        for (slot, mut entry) in failing {
+            entry.replays += 1;
+            if entry.replays >= MAX_REPLAYS {
+                eprintln!("memory: dropping a spooled request the server keeps failing on");
+                kept[slot] = None;
+            } else if let Ok(text) = serde_json::to_string(&entry) {
+                kept[slot] = Some(format!("{text}\n"));
+            }
+        }
+    }
+    if !kept.is_empty() {
+        replace_prefix(file, kept.len(), kept.into_iter().flatten().collect());
     }
     !stopped
 }
 
-/// Removes the first `n` lines, keeping anything appended meanwhile.
-fn remove_lines(file: &Path, n: usize) {
+/// Replaces the first `n` lines with `keep`, retaining anything appended meanwhile.
+fn replace_prefix(file: &Path, n: usize, keep: Vec<String>) {
     let lock = file.parent().and_then(|d| util::open_lock(&d.join(".append.lock")));
     if let Some(l) = &lock {
         util::lock_wait(l, Duration::from_secs(1));
     }
     let Ok(content) = std::fs::read_to_string(file) else { return };
-    let rest: String = content.split_inclusive('\n').skip(n).collect();
+    let mut rest: String = keep.concat();
+    rest.extend(content.split_inclusive('\n').skip(n));
     if rest.is_empty() {
         let _ = std::fs::remove_file(file);
     } else {
         let tmp = file.with_extension("tmp");
-        if std::fs::write(&tmp, rest).is_ok() {
+        if util::write_private(&tmp, rest).is_ok() {
             let _ = std::fs::rename(&tmp, file);
         }
     }

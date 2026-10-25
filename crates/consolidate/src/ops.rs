@@ -25,6 +25,8 @@ use crate::profiles;
 
 const USER_COLUMNS: &str = "id, handle, display_name, default_space_id, created_at, disabled_at";
 const REINDEX_CHUNK: usize = 1000;
+/// `jobs.priority` of backfill embed jobs; live ones have 0 and are claimed first (migration 0500).
+const REINDEX_PRIORITY: i16 = 10;
 
 // ---------- users, spaces, memberships ----------
 
@@ -262,14 +264,16 @@ pub async fn reindex(
         for chunk in owners.chunks(REINDEX_CHUNK) {
             let job_ids: Vec<Uuid> = chunk.iter().map(|_| new_id()).collect();
             sqlx::query(
-                "INSERT INTO jobs (id, type, payload)
-                 SELECT j.id, 'embed', jsonb_build_object('owner_table', $1::text, 'owner_id', j.owner_id, 'model', $2::text)
+                "INSERT INTO jobs (id, type, payload, priority)
+                 SELECT j.id, 'embed', jsonb_build_object('owner_table', $1::text, 'owner_id', j.owner_id, 'model', $2::text),
+                        $5
                    FROM unnest($3::uuid[], $4::uuid[]) AS j(id, owner_id)",
             )
             .bind(table.as_str())
             .bind(model)
             .bind(&job_ids)
             .bind(chunk)
+            .bind(REINDEX_PRIORITY)
             .execute(&mut *conn)
             .await?;
             enqueued += i64::try_from(chunk.len()).unwrap_or(i64::MAX);

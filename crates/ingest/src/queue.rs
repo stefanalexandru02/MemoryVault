@@ -16,7 +16,7 @@ use memvault_core::prompts::PromptRegistry;
 use memvault_core::schemas::common::{OutputSchemaName, PacketKind, PacketStatus};
 use memvault_core::schemas::work::{FailReason, LeaseRequest, LeasedPacket, PacketPrompt, PacketRecord};
 use serde_json::Value;
-use sqlx::PgConnection;
+use sqlx::{PgConnection, PgPool};
 use uuid::Uuid;
 
 use crate::windows;
@@ -146,7 +146,7 @@ pub async fn lease(
             break;
         }
         for id in ids {
-            if let Some(packet) = take(conn, prompts, id, client_id, req.lease_seconds).await? {
+            if let Some(packet) = take(conn, prompts, id, client_id, req).await? {
                 leased.push(packet);
             }
         }
@@ -154,13 +154,26 @@ pub async fn lease(
     Ok(leased)
 }
 
+/// Label value for the runner kind a lease request reports: a short slug, else `unknown`/`other`
+/// (the label must not take arbitrary client strings).
+fn runner_kind(req: &LeaseRequest) -> String {
+    match req.runner_kind.as_deref().map(str::trim) {
+        None | Some("") => "unknown".into(),
+        Some(k) if k.len() <= 24 && k.chars().all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_') => {
+            k.to_string()
+        }
+        Some(_) => "other".into(),
+    }
+}
+
 async fn take(
     conn: &mut PgConnection,
     prompts: &PromptRegistry,
     packet_id: Uuid,
     client_id: Uuid,
-    lease_seconds: i64,
+    req: &LeaseRequest,
 ) -> Result<Option<LeasedPacket>, ApiError> {
+    let lease_seconds = req.lease_seconds;
     let row: PacketRecord = sqlx::query_as(
         "UPDATE work_packets SET status = 'leased', leased_by = $2, lease_until = now() + make_interval(secs => $3),
                 lease_seconds = $4, heartbeats = 0, attempts = attempts + 1
@@ -191,7 +204,8 @@ async fn take(
             .execute(&mut *conn)
             .await?;
     }
-    metrics::counter!("memsvc_packets_leased_total", "kind" => row.kind.as_str()).increment(1);
+    metrics::counter!("memsvc_packets_leased_total", "kind" => row.kind.as_str(), "runner_kind" => runner_kind(req))
+        .increment(1);
     Ok(Some(LeasedPacket {
         id: row.id,
         kind: row.kind,
@@ -314,17 +328,43 @@ pub async fn settle_failed(
     Ok(row)
 }
 
-/// Fail packets whose lease expired on their last attempt (worker sweep). Returns how many.
-pub async fn expire_leases(conn: &mut PgConnection, prompts: Option<&PromptRegistry>) -> Result<u64, sqlx::Error> {
+/// Fail packets whose lease expired on their last attempt (worker sweep). Each packet settles in
+/// its own short transaction, so one failure cannot undo the others. Returns how many failed.
+pub async fn expire_leases(pool: &PgPool, prompts: Option<&PromptRegistry>) -> Result<u64, sqlx::Error> {
+    let mut tx = windows::sweep_tx(pool).await?;
     let ids: Vec<Uuid> = sqlx::query_scalar(
+        "SELECT id FROM work_packets WHERE status = 'leased' AND lease_until < now() AND attempts >= max_attempts",
+    )
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let mut failed = 0;
+    for id in ids {
+        match expire_one(pool, prompts, id).await {
+            Ok(true) => failed += 1,
+            Ok(false) => {}
+            Err(e) => tracing::warn!(packet = %id, error = %e, "expiring a packet lease failed"),
+        }
+    }
+    Ok(failed)
+}
+
+/// Lock the packet (skipping one a runner is posting to, and re-checking that it is still expired)
+/// and fail it.
+async fn expire_one(pool: &PgPool, prompts: Option<&PromptRegistry>, id: Uuid) -> Result<bool, sqlx::Error> {
+    let mut tx = windows::sweep_tx(pool).await?;
+    let locked: Option<Uuid> = sqlx::query_scalar(
         "SELECT id FROM work_packets
-          WHERE status = 'leased' AND lease_until < now() AND attempts >= max_attempts
+          WHERE id = $1 AND status = 'leased' AND lease_until < now() AND attempts >= max_attempts
           FOR UPDATE SKIP LOCKED",
     )
-    .fetch_all(&mut *conn)
+    .bind(id)
+    .fetch_optional(&mut *tx)
     .await?;
-    for id in &ids {
-        settle_failed(conn, prompts, *id, "lease expired on the last attempt").await?;
+    if locked.is_none() {
+        return Ok(false);
     }
-    Ok(ids.len() as u64)
+    settle_failed(&mut tx, prompts, id, "lease expired on the last attempt").await?;
+    tx.commit().await?;
+    Ok(true)
 }

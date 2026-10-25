@@ -16,7 +16,17 @@ detection). No Node, Python, `curl` or `jq`.
 
 It runs `cargo build --profile release-small -p mem-hook` (size-optimised, about 1.9 MB), copies the binary to `bin/mem-hook`, and creates
 `~/.memory` (mode 0700) with a `config` template (mode 0600). Set `MEM_HOOK_BIN=/path/to/mem-hook` to
-install a prebuilt binary instead of building. Then:
+install a prebuilt binary instead of building. On Linux the build is statically linked
+(`-C target-feature=+crt-static`, so the one binary runs on any distribution); `MEM_HOOK_STATIC=0`
+builds a dynamic one. For a musl build instead, install `musl-tools` and run
+`CC_x86_64_unknown_linux_musl=musl-gcc cargo build --profile release-small -p mem-hook --target x86_64-unknown-linux-musl`.
+
+Windows: the hook code is portable (`cfg(unix)` / `cfg(windows)` for file modes, locking, detaching and
+process-group kills; it type-checks for `x86_64-pc-windows-gnu`, but nobody has run it there yet). Build
+`cargo build --profile release-small -p mem-hook --target x86_64-pc-windows-msvc`, copy the result to
+`bin/mem-hook.exe`, and keep the config in `%USERPROFILE%\.memory`. `install.sh` itself is a bash script.
+
+Then:
 
 1. Fill in `~/.memory/config`:
 

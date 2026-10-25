@@ -329,3 +329,14 @@ async fn end_without_stop_still_summarises_the_last_prompt(pool: PgPool) {
     let kinds: Vec<String> = c.packets(s).await.into_iter().map(|p| p.0).collect();
     assert_eq!(kinds, ["extract", "summarize_prompt", "summarize_session"]);
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn nul_in_model_output_is_stripped_not_a_500(pool: PgPool) {
+    let c = ctx(pool.clone());
+    let alice = seed_identity(&pool, TokenKind::Device).await;
+    let (_, id) = leased_extract(&c, &alice).await;
+    let resp = c.result(&alice.token, &id, observer_output("Parser drops\u{0} the last token", &[1, 2])).await;
+    assert_eq!(resp.status, StatusCode::OK, "{}", resp.text());
+    let title: String = sqlx::query_scalar("SELECT title FROM observations").fetch_one(&pool).await.unwrap();
+    assert_eq!(title, "Parser drops the last token");
+}

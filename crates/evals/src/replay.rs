@@ -4,7 +4,8 @@
 //! The sessions go through the real ingest routes (sessions, events, work lease and result) of an
 //! in-process router, so windows, packets, appliers and embedding jobs behave as in production.
 //! Packet outputs come from the recording, or from a deterministic fake observer when the recording
-//! has none (or `--observer fake`).
+//! has none (or `--observer fake`). With `--prompt name@version` the extract packets are pinned to
+//! that prompt and answered by `claude -p`, so a new prompt version can be measured.
 
 use std::path::Path;
 use std::str::FromStr;
@@ -19,6 +20,8 @@ use memvault_core::auth::scopes::TokenKind;
 use memvault_core::auth::tokens::{MintOptions, mint_token};
 use memvault_core::db::MIGRATOR;
 use memvault_core::http::api_router;
+use memvault_core::schemas::common::OutputSchemaName;
+use memvault_core::schemas::prompts::PromptSpec;
 use memvault_core::schemas::recall::RecallResponse;
 use memvault_core::{AppState, AppliersRegistry, Db, system_tx};
 use serde::{Deserialize, Serialize};
@@ -123,12 +126,20 @@ pub enum Observer {
     Recorded,
     /// Ignore recorded outputs.
     Fake,
+    /// Run the extract packets through `claude -p` (implied by `--prompt`); summaries keep using the
+    /// recorded or fake outputs.
+    Claude,
 }
 
 #[derive(Debug, Clone, Default)]
 pub struct ReplayOptions {
     pub observer: Observer,
     pub rerank: bool,
+    /// Pin the extract packets to this prompt (`observer.code@v4`) instead of the newest loaded one.
+    /// Needs `Observer::Claude`: the recorded outputs belong to another prompt.
+    pub prompt: Option<String>,
+    /// The `claude` executable for `Observer::Claude` (default: `claude` from PATH).
+    pub claude_bin: Option<String>,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -238,12 +249,13 @@ pub fn state_over(state: &AppState, db: Db) -> Result<AppState> {
 /// Replay into the database behind `state`, which must run the ingest appliers (see
 /// [`state_over`]). A fresh user and private space keep the replay apart from other data in it.
 pub async fn replay(state: &AppState, set: &EvalSet, options: &ReplayOptions) -> Result<Report> {
+    let pinned = check_prompt(state, options)?;
     let (space_id, token) = scratch_user(state).await?;
     let api = Api { app: api_router(v1()).with_state(state.clone()), token };
 
     let mut packets_failed = 0;
     for s in &set.sessions {
-        packets_failed += replay_session(&api, s, options.observer).await?;
+        packets_failed += replay_session(state, &api, s, options, pinned.as_ref()).await?;
     }
     for _ in 0..200 {
         if memvault_worker::embed_pass(state, "evals").await? == 0 {
@@ -271,6 +283,25 @@ pub async fn replay(state: &AppState, set: &EvalSet, options: &ReplayOptions) ->
     })
 }
 
+/// The prompt `--prompt` names, if it is loaded, produces observer output and runs with `claude`.
+fn check_prompt(state: &AppState, options: &ReplayOptions) -> Result<Option<PromptSpec>> {
+    let spec = match &options.prompt {
+        Some(prompt_ref) => {
+            if options.observer != Observer::Claude {
+                bail!("--prompt {prompt_ref} needs the claude observer (recorded outputs belong to another prompt)");
+            }
+            let spec = state.prompts.get(prompt_ref, None).map_err(|e| anyhow::anyhow!("{e}"))?;
+            if spec.output_schema != OutputSchemaName::ObserverV1 {
+                bail!("{prompt_ref} produces {}, not observer.v1", spec.output_schema.as_str());
+            }
+            Some(spec.clone())
+        }
+        None if options.observer == Observer::Claude => bail!("--observer claude needs --prompt <name@version>"),
+        None => None,
+    };
+    Ok(spec)
+}
+
 async fn scratch_user(state: &AppState) -> Result<(Uuid, String)> {
     let handle = format!("eval-{}", Uuid::now_v7().simple());
     let mut tx = system_tx(&state.db.system).await?;
@@ -284,7 +315,13 @@ async fn scratch_user(state: &AppState) -> Result<(Uuid, String)> {
 }
 
 /// Post one recorded session and settle its packets. Returns the number of packets that failed.
-async fn replay_session(api: &Api, s: &RecordedSession, observer: Observer) -> Result<usize> {
+async fn replay_session(
+    state: &AppState,
+    api: &Api,
+    s: &RecordedSession,
+    options: &ReplayOptions,
+    pinned: Option<&PromptSpec>,
+) -> Result<usize> {
     let (status, created) = api
         .post(
             "/v1/sessions",
@@ -320,6 +357,21 @@ async fn replay_session(api: &Api, s: &RecordedSession, observer: Observer) -> R
     if !status.is_success() {
         bail!("ending session {}: {status} {body}", s.external_session_id);
     }
+    if let Some(spec) = pinned {
+        // Every extract packet exists once the session has ended; lease renders the prompt it is pinned to.
+        let mut tx = system_tx(&state.db.system).await?;
+        sqlx::query(
+            "UPDATE work_packets SET prompt_ref = $2, model_hint = $3, output_schema = $4
+              WHERE session_id = $1 AND kind = 'extract' AND status = 'pending'",
+        )
+        .bind(Uuid::parse_str(&session_id)?)
+        .bind(spec.prompt_ref())
+        .bind(&spec.model_hint)
+        .bind(spec.output_schema.as_str())
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+    }
 
     let mut failed = 0;
     // Summaries are created as the packets they summarise settle, so lease until nothing is left.
@@ -334,9 +386,20 @@ async fn replay_session(api: &Api, s: &RecordedSession, observer: Observer) -> R
         }
         for p in packets {
             let id = p["id"].as_str().context("packet id")?;
-            let output = match observer {
+            let output = match options.observer {
                 Observer::Recorded => recorded_output(s, &p),
                 Observer::Fake => None,
+                Observer::Claude if p["kind"] == "extract" => match model_output(options, &p).await {
+                    Ok(output) => Some(output),
+                    Err(e) => {
+                        tracing::warn!(packet = id, error = %e, "claude run failed");
+                        failed += 1;
+                        api.post(&format!("/v1/work/{id}/fail"), json!({"error": "other", "detail": e.to_string()}))
+                            .await?;
+                        continue;
+                    }
+                },
+                Observer::Claude => recorded_output(s, &p),
             }
             .unwrap_or_else(|| fake_output(&p));
             let (status, body) = api.post(&format!("/v1/work/{id}/result"), json!({"output": output})).await?;
@@ -349,6 +412,20 @@ async fn replay_session(api: &Api, s: &RecordedSession, observer: Observer) -> R
         }
     }
     bail!("session {} still has packets after 200 rounds", s.external_session_id)
+}
+
+/// What the model answers for a leased packet: its JSON object, or the raw text for the server to
+/// unwrap (a code fence) or reject.
+async fn model_output(options: &ReplayOptions, packet: &Value) -> Result<Value> {
+    let bin = options.claude_bin.as_deref().unwrap_or("claude");
+    let model = packet["model_hint"].as_str().filter(|m| !m.is_empty()).unwrap_or("sonnet");
+    let system = packet["prompt"]["system"].as_str().unwrap_or_default();
+    let user = packet["prompt"]["user"].as_str().unwrap_or_default();
+    let text = crate::claude::run(bin, model, system, user).await?;
+    Ok(match serde_json::from_str::<Value>(text.trim()) {
+        Ok(v) if v.is_object() => v,
+        _ => Value::String(text),
+    })
 }
 
 fn recorded_output(s: &RecordedSession, packet: &Value) -> Option<Value> {

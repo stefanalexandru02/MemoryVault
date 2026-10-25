@@ -15,7 +15,7 @@ use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::cache::{self, CacheEntry};
-use crate::engine::{PackOptions, RetrievalRecord, build_pack, log_retrieval, record_metrics};
+use crate::engine::{PackOptions, RetrievalRecord, build_pack, log_pack_access, log_retrieval, record_metrics};
 use crate::render::{self, SinceRow};
 use memvault_core::user_tx;
 
@@ -104,6 +104,7 @@ pub async fn render_context(
                 latency_ms,
             };
             log_retrieval(&mut tx, identity, rec, &pack).await?;
+            log_pack_access(&mut tx, identity, "context", &pack.slots).await?;
             record_metrics("context", &pack, started.elapsed().as_secs_f64());
             body
         }

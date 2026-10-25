@@ -115,3 +115,52 @@ async fn prompts_route(pool: PgPool) {
         assert_eq!(resp.error_code().as_deref(), Some("not_found"));
     }
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn create_reports_next_seq_for_a_client_that_lost_its_counter(pool: PgPool) {
+    let c = ctx(pool.clone());
+    let alice = seed_identity(&pool, TokenKind::Device).await;
+    let body = json!({"external_session_id": "cc-resume", "project_key": PROJECT});
+    let first = c.post("/v1/sessions", &alice.token, body.clone()).await;
+    assert_eq!(first.json()["next_seq"], 0);
+    let s: Uuid = first.json()["session_id"].as_str().unwrap().parse().unwrap();
+    c.events_ok(&alice.token, s, vec![prompt(s, 0, "hi"), tool(s, 1), tool(s, 7)]).await;
+    let again = c.post("/v1/sessions", &alice.token, body).await;
+    assert_eq!(again.json()["next_seq"], 8);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_late_end_keeps_its_own_time_within_the_session(pool: PgPool) {
+    let c = ctx(pool.clone());
+    let alice = seed_identity(&pool, TokenKind::Device).await;
+    let s = c.start_session(&alice, "cc-late").await;
+    sqlx::query("UPDATE sessions SET started_at = now() - interval '3 days' WHERE id = $1")
+        .bind(s)
+        .execute(&pool)
+        .await
+        .unwrap();
+    let when = chrono::Utc::now() - chrono::Duration::days(2);
+    let resp = c.post(&format!("/v1/sessions/{s}/end"), &alice.token, json!({"occurred_at": when})).await;
+    assert_eq!(resp.status, StatusCode::OK, "{}", resp.text());
+    let ended: chrono::DateTime<chrono::Utc> =
+        sqlx::query_scalar("SELECT ended_at FROM sessions WHERE id = $1").bind(s).fetch_one(&pool).await.unwrap();
+    assert!((ended - when).num_milliseconds().abs() < 5, "{ended} vs {when}");
+
+    // never before the start, never in the future
+    let s2 = c.start_session(&alice, "cc-bounds").await;
+    let resp = c
+        .post(
+            &format!("/v1/sessions/{s2}/end"),
+            &alice.token,
+            json!({"occurred_at": chrono::Utc::now() + chrono::Duration::days(5)}),
+        )
+        .await;
+    assert_eq!(resp.status, StatusCode::OK);
+    let secs: f64 =
+        sqlx::query_scalar("SELECT extract(epoch FROM now() - ended_at)::float8 FROM sessions WHERE id = $1")
+            .bind(s2)
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert!((0.0..60.0).contains(&secs), "{secs}");
+}

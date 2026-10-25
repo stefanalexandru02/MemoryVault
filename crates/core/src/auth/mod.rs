@@ -78,7 +78,12 @@ pub async fn authenticate_header(state: &AppState, authorization: Option<&str>) 
         .and_then(|h| h.get(..7).filter(|p| p.eq_ignore_ascii_case("bearer ")).map(|_| h[7..].trim()))
         .ok_or_else(|| ApiError::unauthorized("unauthorized", "missing bearer token"))?;
     let mut conn = state.db.app.acquire().await?;
-    verify_token(&mut conn, token, &state.settings.token_pepper).await
+    let identity = verify_token(&mut conn, token, &state.settings.token_pepper).await?;
+    // Log lines of this request carry who made it (the server's `http` span declares the fields).
+    let span = tracing::Span::current();
+    span.record("user_id", tracing::field::display(identity.user_id));
+    span.record("client_id", tracing::field::display(identity.client_id));
+    Ok(identity)
 }
 
 impl<S> FromRequestParts<S> for Identity

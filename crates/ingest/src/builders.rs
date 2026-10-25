@@ -48,6 +48,12 @@ pub async fn lock_session(conn: &mut PgConnection, session_id: Uuid) -> Result<O
     sqlx::query_as(&format!("{SESSION_SQL} FOR UPDATE OF s")).bind(session_id).fetch_optional(conn).await
 }
 
+/// [`lock_session`] that skips a row another transaction holds (`None` for that and for a missing
+/// session alike): the sweep leaves a busy session to the next tick instead of waiting on it.
+pub async fn try_lock_session(conn: &mut PgConnection, session_id: Uuid) -> Result<Option<SessionRow>, sqlx::Error> {
+    sqlx::query_as(&format!("{SESSION_SQL} FOR UPDATE OF s SKIP LOCKED")).bind(session_id).fetch_optional(conn).await
+}
+
 pub(crate) fn to_json<T: Serialize>(value: &T) -> Value {
     serde_json::to_value(value).expect("plain data serializes to JSON")
 }

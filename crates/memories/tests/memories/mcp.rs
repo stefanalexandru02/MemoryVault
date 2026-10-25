@@ -295,6 +295,14 @@ async fn project_scope_is_inferred(pool: PgPool) {
     .await;
     assert_eq!(scope_of(id_in(&other)).await, "project:github.com/alex/other");
 
+    // Searching with the header and no explicit scope stays in that project; "all" opts out.
+    let headers = [("x-memory-project", PROJECT)];
+    let (_, narrowed) = call_with(&app, alice, &headers, "memory_search", json!({"query": "staging cluster"})).await;
+    assert!(narrowed.contains(&project_id) && !narrowed.contains(&global_id), "{narrowed}");
+    let args = json!({"query": "staging cluster", "scope": "all"});
+    let (_, everything) = call_with(&app, alice, &headers, "memory_search", args).await;
+    assert!(everything.contains(&project_id) && everything.contains(&global_id), "{everything}");
+
     // Work state follows the same project.
     let (err, wrote) =
         call(&app, alice, "work_state_write", json!({"list": "todo", "fields": {"item-1": "open"}})).await;

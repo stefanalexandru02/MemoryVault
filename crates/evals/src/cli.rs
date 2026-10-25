@@ -37,8 +37,16 @@ enum Command {
         /// Directory with sessions/, questions.yaml, facts_gold.yaml and baseline.json.
         #[arg(long, default_value = "evals")]
         dir: PathBuf,
-        #[arg(long, value_enum, default_value_t = Observer::Recorded)]
-        observer: Observer,
+        /// Where packet outputs come from (default: recorded; claude when --prompt is given).
+        #[arg(long, value_enum)]
+        observer: Option<Observer>,
+        /// Evaluate this observer prompt (`observer.code@v4`): the extract packets are pinned to it
+        /// and run through `claude -p`.
+        #[arg(long, value_name = "NAME@VERSION")]
+        prompt: Option<String>,
+        /// The `claude` executable for --prompt.
+        #[arg(long, env = "CLAUDE_BIN")]
+        claude_bin: Option<String>,
         /// Rerank the recall candidates (needs the reranker).
         #[arg(long)]
         rerank: bool,
@@ -86,10 +94,12 @@ pub async fn run(state: AppState, args: Vec<String>) -> Result<()> {
                 println!("{}: {changed} lines changed", f.display());
             }
         }
-        Command::Replay { dir, observer, rerank, json, update_baseline, keep_scratch } => {
+        Command::Replay { dir, observer, prompt, claude_bin, rerank, json, update_baseline, keep_scratch } => {
+            let observer = observer.unwrap_or(if prompt.is_some() { Observer::Claude } else { Observer::Recorded });
             let set = EvalSet::load(&dir)?;
             let scratch = Scratch::create(&state).await?;
-            let result = replay::replay(&scratch.state, &set, &ReplayOptions { observer, rerank }).await;
+            let result =
+                replay::replay(&scratch.state, &set, &ReplayOptions { observer, rerank, prompt, claude_bin }).await;
             if keep_scratch {
                 eprintln!("kept scratch database {}", scratch.name());
             } else {

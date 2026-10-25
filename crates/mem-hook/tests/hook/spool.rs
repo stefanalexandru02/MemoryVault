@@ -1,5 +1,7 @@
 //! Spooling on failure and ordered replay at session start.
 
+use std::time::Duration;
+
 use serde_json::json;
 
 use crate::env::{SESSION, TestEnv};
@@ -135,5 +137,188 @@ fn session_end_spooled_when_the_server_is_down_replays_later() {
     fake.state().down = false;
     env.hook("session-start", &env.input("SessionStart", json!({"source": "resume"})));
     let ends = fake.matching("POST", &format!("/v1/sessions/{SESSION_ID}/end"));
-    assert_eq!(ends[0].body, json!({"reason": "logout"}));
+    assert_eq!(ends[0].body["reason"], "logout");
+}
+
+fn seqs(fake: &crate::fake_server::Fake) -> Vec<i64> {
+    fake.events().iter().map(|e| e["seq"].as_i64().unwrap()).collect()
+}
+
+#[test]
+fn a_request_the_server_chokes_on_does_not_block_the_spool_and_is_eventually_dropped() {
+    let (fake, env) = TestEnv::with_fake();
+    fake.state().down = true;
+    for n in 0..3 {
+        tool(&env, n);
+    }
+    {
+        let mut s = fake.state();
+        s.down = false;
+        s.poison = Some("cmd 1".into());
+        s.reqs.clear();
+    }
+    // The lines around the poison line are delivered, in order; it stays and counts a replay.
+    env.hook("session-start", &env.input("SessionStart", json!({"source": "resume"})));
+    assert_eq!(seqs(&fake), [0, 1, 2, 3], "seq 1 was attempted");
+    let left = env.spool_lines();
+    assert_eq!(left.len(), 1);
+    assert_eq!((left[0]["seq"].as_i64(), left[0]["replays"].as_u64()), (Some(1), Some(1)));
+
+    for round in 2..5 {
+        env.hook("session-start", &env.input("SessionStart", json!({"source": "resume"})));
+        assert_eq!(env.spool_lines()[0]["replays"], round, "round {round}");
+    }
+    env.hook("session-start", &env.input("SessionStart", json!({"source": "resume"})));
+    assert!(env.spool_lines().is_empty(), "dropped after five failed replays");
+}
+
+#[test]
+fn a_server_that_fails_everything_does_not_use_up_the_replays() {
+    let (fake, env) = TestEnv::with_fake();
+    fake.state().down = true;
+    for n in 0..6 {
+        tool(&env, n);
+    }
+    {
+        let mut s = fake.state();
+        s.down = false;
+        s.events_status = 500;
+    }
+    for _ in 0..6 {
+        env.hook("session-start", &env.input("SessionStart", json!({"source": "resume"})));
+    }
+    let left = env.spool_lines();
+    assert_eq!(left.len(), 12, "6 spooled + one new event per session start");
+    assert!(left.iter().all(|l| l.get("replays").is_none()), "{left:?}");
+}
+
+#[test]
+fn nul_characters_never_leave_the_machine() {
+    let (fake, env) = TestEnv::with_fake();
+    env.hook(
+        "tool",
+        &env.input(
+            "PostToolUse",
+            json!({"tool_name": "Bash", "tool_input": {"command": "cat blob"}, "tool_response": {"stdout": "a\u{0}b"}}),
+        ),
+    );
+    let events = fake.events();
+    assert_eq!(events[0]["payload"]["tool_response"]["stdout"], "ab");
+    assert!(!fake.reqs().iter().any(|r| r.body.to_string().contains("\\u0000")));
+}
+
+#[test]
+fn old_spooled_lines_with_nul_are_cleaned_on_replay() {
+    let (fake, env) = TestEnv::with_fake();
+    fake.state().down = true;
+    tool(&env, 0);
+    let file = std::fs::read_dir(env.home.join("spool"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .unwrap();
+    let text = std::fs::read_to_string(&file).unwrap().replace("cmd 0", "cmd\\u0000 0");
+    std::fs::write(&file, text).unwrap();
+    {
+        let mut s = fake.state();
+        s.down = false;
+        s.reqs.clear();
+    }
+    env.hook("session-start", &env.input("SessionStart", json!({"source": "resume"})));
+    assert_eq!(fake.events()[0]["payload"]["tool_input"]["command"], "cmd 0");
+    assert!(env.spool_lines().is_empty());
+}
+
+#[test]
+fn a_dead_writers_partial_line_does_not_block_later_files() {
+    let (fake, env) = TestEnv::with_fake();
+    fake.state().down = true;
+    tool(&env, 0);
+    fake.state().down = false;
+    // yesterday's file ends in a line nobody will ever finish
+    let spool = env.home.join("spool");
+    let stale = spool.join("20200101.jsonl");
+    std::fs::write(&stale, r#"{"claude_session_id":"sess-1","op":"ev"#).unwrap();
+    let old = std::time::SystemTime::now() - Duration::from_secs(3600);
+    std::fs::File::options().write(true).open(&stale).unwrap().set_modified(old).unwrap();
+    env.hook("session-start", &env.input("SessionStart", json!({"source": "resume"})));
+    assert!(!stale.exists(), "the unterminated line is discarded");
+    assert!(env.spool_lines().is_empty());
+    assert_eq!(seqs(&fake), [0, 1]);
+}
+
+#[test]
+fn an_append_after_a_partial_line_starts_on_a_new_line() {
+    let (fake, env) = TestEnv::with_fake();
+    fake.state().down = true;
+    tool(&env, 0);
+    let file = std::fs::read_dir(env.home.join("spool"))
+        .unwrap()
+        .flatten()
+        .map(|e| e.path())
+        .find(|p| p.extension().is_some_and(|x| x == "jsonl"))
+        .unwrap();
+    let mut text = std::fs::read_to_string(&file).unwrap();
+    text.pop(); // the writer died before the newline
+    std::fs::write(&file, text).unwrap();
+    tool(&env, 1);
+    let content = std::fs::read_to_string(&file).unwrap();
+    let valid = content.lines().filter(|l| serde_json::from_str::<serde_json::Value>(l).is_ok()).count();
+    assert_eq!(content.lines().count(), 2);
+    assert_eq!(valid, 2, "{content}");
+}
+
+#[cfg(unix)]
+#[test]
+fn files_under_the_memory_home_are_owner_only() {
+    use std::os::unix::fs::PermissionsExt;
+    let mode = |p: &std::path::Path| std::fs::metadata(p).unwrap().permissions().mode() & 0o777;
+    let (fake, env) = TestEnv::with_fake();
+    // a home the user created by hand, with lax modes
+    std::fs::set_permissions(&env.home, std::fs::Permissions::from_mode(0o755)).unwrap();
+    fake.state().down = true;
+    for n in 0..2 {
+        tool(&env, n);
+    }
+    fake.state().down = false;
+    fake.state().events_ok = Some(1);
+    fake.state().context = Some("ctx".into());
+    env.hook("session-start", &env.input("SessionStart", json!({"source": "startup"})));
+    assert_eq!(mode(&env.home), 0o700);
+    // a partly replayed spool file is rewritten, and must stay owner-only
+    for entry in std::fs::read_dir(env.home.join("spool")).unwrap().flatten() {
+        assert_eq!(mode(&entry.path()), 0o600, "{:?}", entry.path());
+    }
+    for dir in ["sessions", "cache/local"] {
+        for entry in std::fs::read_dir(env.home.join(dir)).unwrap().flatten() {
+            assert_eq!(mode(&entry.path()), 0o600, "{:?}", entry.path());
+        }
+    }
+}
+
+#[test]
+fn a_lost_session_cache_continues_the_sequence_from_the_server() {
+    let (fake, env) = TestEnv::with_fake();
+    tool(&env, 0);
+    tool(&env, 1);
+    assert_eq!(seqs(&fake), [0, 1]);
+    // the cache was pruned (30 days) and the same Claude session id comes back with --resume
+    std::fs::remove_dir_all(env.home.join("sessions")).unwrap();
+    fake.state().next_seq = 2;
+    tool(&env, 2);
+    tool(&env, 3);
+    assert_eq!(seqs(&fake), [0, 1, 2, 3]);
+}
+
+#[test]
+fn a_late_session_end_carries_its_own_time() {
+    let (fake, env) = TestEnv::with_fake();
+    fake.state().down = true;
+    env.hook("session-end", &env.input("SessionEnd", json!({"reason": "logout"})));
+    let spooled = env.spool_lines();
+    fake.state().down = false;
+    env.hook("session-start", &env.input("SessionStart", json!({"source": "resume"})));
+    let ends = fake.matching("POST", &format!("/v1/sessions/{SESSION_ID}/end"));
+    assert_eq!(ends[0].body, json!({"reason": "logout", "occurred_at": spooled[0]["occurred_at"]}));
 }

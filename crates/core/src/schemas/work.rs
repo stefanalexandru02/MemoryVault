@@ -35,11 +35,20 @@ pub struct LeaseRequest {
     pub max: i64,
     #[serde(default = "default_lease_seconds")]
     pub lease_seconds: i64,
+    /// How the runner calls the model (`claude-p`, `api`, ...); only labels the leased metric.
+    #[serde(default)]
+    pub runner_kind: Option<String>,
 }
 
 impl Default for LeaseRequest {
     fn default() -> Self {
-        Self { session_id: None, kinds: default_kinds(), max: 1, lease_seconds: default_lease_seconds() }
+        Self {
+            session_id: None,
+            kinds: default_kinds(),
+            max: 1,
+            lease_seconds: default_lease_seconds(),
+            runner_kind: None,
+        }
     }
 }
 

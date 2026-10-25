@@ -99,7 +99,8 @@ fn session_end_posts_end_with_reason() {
     assert_eq!(out.code, Some(0));
     let ends = fake.matching("POST", &format!("/v1/sessions/{SESSION_ID}/end"));
     assert_eq!(ends.len(), 1);
-    assert_eq!(ends[0].body, json!({"reason": "prompt_input_exit"}));
+    assert_eq!(ends[0].body["reason"], "prompt_input_exit");
+    assert!(ends[0].body["occurred_at"].as_str().is_some_and(|t| t.ends_with('Z')), "{}", ends[0].body);
 }
 
 #[test]

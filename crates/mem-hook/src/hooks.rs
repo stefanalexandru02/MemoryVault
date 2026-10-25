@@ -1,7 +1,7 @@
 //! The hook subcommands (spec 8.3): one per Claude Code hook event.
 
 use std::io::Read;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use serde_json::{Value, json};
 
@@ -41,6 +41,7 @@ pub fn run(event: &str) {
         }
         return;
     };
+    let _ = util::mkdir_private(&home); // also narrows a home created with looser permissions
     let mut raw = String::new();
     let _ = std::io::stdin().read_to_string(&mut raw);
     let Ok(input) = serde_json::from_str::<Value>(&raw) else { return };
@@ -114,15 +115,17 @@ pub fn run(event: &str) {
 /// Posts one event; on a retryable failure the request goes to the spool.
 fn record(hook: &Hook, kind: &str, payload: Value, new_prompt: bool) -> Option<Delivered> {
     let home = hook.app.home();
+    let started = Instant::now();
+    deliver::prepare(&hook.app, &hook.target, LIVE_BUDGET);
     let seq = store::alloc_seq(home, &hook.target.claude_session_id, new_prompt);
     let entry = Entry::event(&hook.target, seq, kind, payload);
-    settle(hook, &entry, LIVE_BUDGET)
+    settle(hook, &entry, LIVE_BUDGET.saturating_sub(started.elapsed()))
 }
 
 fn settle(hook: &Hook, entry: &Entry, budget: Duration) -> Option<Delivered> {
     match deliver::send(&hook.app, entry, budget) {
         Ok(d) => Some(d),
-        Err(Fail::Retry(why)) => {
+        Err(Fail::Retry(why) | Fail::Server(why)) => {
             util::debug(&format!("spooling {:?}: {why}", entry.kind));
             spool::append(hook.app.home(), entry);
             None

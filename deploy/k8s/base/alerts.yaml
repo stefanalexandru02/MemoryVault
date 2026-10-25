@@ -1,0 +1,62 @@
+# Prometheus Operator alert rules (spec 15). Metrics carry the memsvc_ prefix; the Prometheus exporter
+# renders histograms as summaries, so a latency percentile is the `quantile` label. The CNPG and PVC
+# alerts use the metrics of the CloudNativePG operator and the kubelet.
+apiVersion: monitoring.coreos.com/v1
+kind: PrometheusRule
+metadata:
+  name: memory-alerts
+  labels:
+    app: memory-api
+spec:
+  groups:
+    - name: memory.pipeline
+      rules:
+        - alert: MemoryNothingExtractedForADay
+          expr: max(memsvc_oldest_pending_packet_seconds) > 86400
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: A work packet has waited more than a day
+            description: No runner has taken the oldest pending packet for over 24 h. Run `mem-hook observe --all` on a machine with a runner token, or check the nightly runner.
+        - alert: MemoryPacketsFailing
+          expr: sum(rate(memsvc_packets_failed_total[1h])) * 3600 > 5
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: More than 5 work packets per hour are failing
+            description: Runners report failed packets faster than 5/h (see the `error` label of memsvc_packets_failed_total).
+    - name: memory.api
+      rules:
+        - alert: MemoryRecallSlow
+          expr: max by (mode) (memsvc_recall_latency_seconds{quantile="0.95"}) > 0.5
+          for: 10m
+          labels:
+            severity: warning
+          annotations:
+            summary: Recall p95 latency is above 0.5 s
+            description: The p95 of memsvc_recall_latency_seconds has stayed above 500 ms for 10 minutes.
+    - name: memory.storage
+      rules:
+        - alert: MemoryBackupFailed
+          expr: |
+            cnpg_collector_last_failed_backup_timestamp{namespace="memory"}
+              > cnpg_collector_last_available_backup_timestamp{namespace="memory"}
+          for: 5m
+          labels:
+            severity: critical
+          annotations:
+            summary: The latest CloudNativePG backup failed
+            description: The last failed backup of the memory database is newer than the last good one.
+        - alert: MemoryVolumeAlmostFull
+          expr: |
+            max by (persistentvolumeclaim) (
+              kubelet_volume_stats_used_bytes{namespace="memory"} / kubelet_volume_stats_capacity_bytes{namespace="memory"}
+            ) > 0.8
+          for: 15m
+          labels:
+            severity: warning
+          annotations:
+            summary: A memory PVC is more than 80% full
+            description: Volume {{ $labels.persistentvolumeclaim }} is above 80% of its capacity.

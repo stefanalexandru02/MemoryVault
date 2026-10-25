@@ -40,18 +40,18 @@ pub fn parse(text: &str) -> HashMap<String, String> {
 }
 
 fn hostname() -> String {
-    for var in ["HOSTNAME", "HOST"] {
-        if let Ok(h) = std::env::var(var) {
-            if !h.trim().is_empty() {
-                return h.trim().to_string();
-            }
+    for var in ["HOSTNAME", "HOST", "COMPUTERNAME"] {
+        if let Ok(h) = std::env::var(var)
+            && !h.trim().is_empty()
+        {
+            return h.trim().to_string();
         }
     }
     for path in ["/etc/hostname", "/proc/sys/kernel/hostname"] {
-        if let Ok(h) = std::fs::read_to_string(path) {
-            if !h.trim().is_empty() {
-                return h.trim().to_string();
-            }
+        if let Ok(h) = std::fs::read_to_string(path)
+            && !h.trim().is_empty()
+        {
+            return h.trim().to_string();
         }
     }
     std::process::Command::new("hostname")

@@ -510,6 +510,30 @@ async fn recurring_hints_become_a_procedures_packet(pool: PgPool) {
 // ---------- profiles and denormalization ----------
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn secret_facts_stay_out_of_profiles(pool: PgPool) {
+    let w = world(pool.clone()).await;
+    w.fact(FactSpec { status: "active", predicate: "prefers.editor", value_text: "vim", ..Default::default() }).await;
+    let secret = w
+        .fact(FactSpec { status: "active", predicate: "wifi.password", value_text: "hunter2", ..Default::default() })
+        .await;
+    sqlx::query("UPDATE facts SET sensitivity = 'secret' WHERE id = $1").bind(secret).execute(&pool).await.unwrap();
+
+    run_planner(&w.c.state, Some(w.space)).await.unwrap();
+    let first: String =
+        sqlx::query_scalar("SELECT body_md FROM profiles WHERE scope_key = 'acme'").fetch_one(&pool).await.unwrap();
+    assert!(first.contains("vim") && !first.contains("hunter2"), "{first}");
+
+    // a fact that turns secret later leaves the profile at the next render
+    let editor: Uuid =
+        sqlx::query_scalar("SELECT id FROM facts WHERE predicate = 'prefers.editor'").fetch_one(&pool).await.unwrap();
+    sqlx::query("UPDATE facts SET sensitivity = 'secret' WHERE id = $1").bind(editor).execute(&pool).await.unwrap();
+    run_planner(&w.c.state, Some(w.space)).await.unwrap();
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(*) FROM profiles WHERE scope_key = 'acme'").fetch_one(&pool).await.unwrap();
+    assert_eq!(rows, 0, "no non-secret fact is left, so the profile is dropped");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn profiles_follow_the_active_facts(pool: PgPool) {
     let w = world(pool.clone()).await;
     let pinned = w

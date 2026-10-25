@@ -129,7 +129,7 @@ async fn consolidation_and_maintenance_commands(pool: PgPool) {
     assert_eq!(queued["jobs_enqueued"], 1);
     assert_eq!(admin(&c, &["jobs", "list", "--type", "embed"]).await.unwrap().as_array().unwrap().len(), 1);
 
-    let remapped = admin(&c, &["project", "remap", "old", "new"]).await.unwrap();
+    let remapped = admin(&c, &["project", "remap", "--from", "old", "--to", "new"]).await.unwrap();
     assert_eq!(remapped["rows"]["observations"], 1);
     assert_eq!(text(&pool, "SELECT scope_key FROM observations WHERE id = $1", obs).await, "new");
     let undone = admin(&c, &["consolidate", "revert", remapped["run_id"].as_str().unwrap()]).await.unwrap();

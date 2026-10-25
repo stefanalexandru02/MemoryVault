@@ -488,6 +488,16 @@ async fn forget_in(
     } else {
         soft_delete(conn, identity, table, space, id, reason).await?
     };
+    if table == MemoryTable::Facts {
+        // The scope's cached profile may render this fact. Drop it so context and recall fall back to
+        // the live facts until the planner re-renders it.
+        sqlx::query("DELETE FROM profiles WHERE space_id = $1 AND scope_kind = $2 AND scope_key = $3")
+            .bind(space)
+            .bind(scope.kind)
+            .bind(&scope.key)
+            .execute(&mut *conn)
+            .await?;
+    }
     notify_invalidate(conn, space, scope.kind, &scope.key).await?;
     Ok((table, action))
 }
@@ -572,6 +582,20 @@ async fn hard_delete(
         .bind(id)
         .execute(&mut *conn)
         .await?;
+    // Work packets (consolidation inputs and results) that carry the row's id keep its content for
+    // their retention period: blank them, and cancel the ones still waiting to run.
+    sqlx::query(
+        "UPDATE work_packets
+            SET inputs = '{}'::jsonb, result = NULL, applied = NULL,
+                status = CASE WHEN status IN ('pending', 'leased') THEN 'cancelled' ELSE status END
+          WHERE space_id = $1
+            AND (strpos(inputs::text, $2) > 0 OR strpos(coalesce(result::text, ''), $2) > 0
+                 OR strpos(coalesce(applied::text, ''), $2) > 0)",
+    )
+    .bind(space)
+    .bind(id.to_string())
+    .execute(&mut *conn)
+    .await?;
     // Earlier audit rows keep who and when, not the content that is being removed.
     sqlx::query("UPDATE memory_audit SET before = NULL, after = NULL WHERE target_table = $1 AND target_id = $2")
         .bind(table)

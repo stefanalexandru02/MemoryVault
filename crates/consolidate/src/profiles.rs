@@ -50,6 +50,8 @@ fn fill(lines: impl IntoIterator<Item = String>, max_tokens: i32) -> String {
 }
 
 /// Hash of everything a profile line is rendered from; changes iff the rendering could change.
+/// Secret facts are left out of profiles (they never enter an automatic context pack), so they are
+/// left out of the hash too.
 async fn facts_version(
     conn: &mut PgConnection,
     space_id: Uuid,
@@ -60,7 +62,8 @@ async fn facts_version(
         "SELECT hashtextextended(coalesce(string_agg(
                   id::text || '|' || confidence::text || '|' || importance::text || '|' || pinned::text || '|'
                   || value_text || '|' || learned_on_client_ids::text, ';' ORDER BY id), ''), 0)
-           FROM facts WHERE space_id = $1 AND scope_kind = $2 AND scope_key = $3 AND status = 'active'",
+           FROM facts WHERE space_id = $1 AND scope_kind = $2 AND scope_key = $3 AND status = 'active'
+            AND sensitivity <> 'secret'",
     )
     .bind(space_id)
     .bind(kind)
@@ -94,6 +97,7 @@ pub async fn refresh_scope(
                             FROM clients c WHERE c.id = ANY (f.learned_on_client_ids)), '') AS devices
            FROM facts f JOIN entities e ON e.id = f.subject_id
           WHERE f.space_id = $1 AND f.scope_kind = $2 AND f.scope_key = $3 AND f.status = 'active'
+            AND f.sensitivity <> 'secret'
           ORDER BY f.pinned DESC, f.importance * f.confidence DESC, f.id
           LIMIT 200",
     )

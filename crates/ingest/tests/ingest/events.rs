@@ -209,3 +209,91 @@ async fn batch_validation_and_ownership(pool: PgPool) {
     let resp = c.events(&alice.token, s, vec![ev(s, 1, "note", json!({ "text": huge }))]).await;
     assert_eq!(resp.status, StatusCode::PAYLOAD_TOO_LARGE, "{}", resp.text());
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn nul_characters_in_payloads_are_stripped_not_a_500(pool: PgPool) {
+    let c = ctx(pool.clone());
+    let alice = seed_identity(&pool, TokenKind::Device).await;
+    let s = c.start_session(&alice, "cc").await;
+    let nul = ev(s, 1, "tool_use", json!({"tool_name": "Bash", "tool_output": "a\u{0}b", "k\u{0}ey": ["x\u{0}"]}));
+    let out = c.events_ok(&alice.token, s, vec![nul]).await;
+    assert_eq!(out["accepted"], 1);
+    let payload: Value =
+        sqlx::query_scalar("SELECT payload FROM events WHERE session_id = $1").bind(s).fetch_one(&pool).await.unwrap();
+    assert_eq!(payload, json!({"tool_name": "Bash", "tool_output": "ab", "key": ["x"]}));
+}
+
+/// Small deterministic generator (xorshift) so a failing sequence can be replayed from its seed.
+struct Rng(u64);
+
+impl Rng {
+    fn next(&mut self) -> u64 {
+        self.0 ^= self.0 << 13;
+        self.0 ^= self.0 >> 7;
+        self.0 ^= self.0 << 17;
+        self.0
+    }
+
+    fn below(&mut self, n: usize) -> usize {
+        (self.next() % n as u64) as usize
+    }
+}
+
+/// Spec 16.1: for any event sequence, in any batching, the windows are contiguous and each closed
+/// window was closed by exactly one rule and has an extract packet exactly when it holds content.
+#[sqlx::test(migrations = "../../migrations")]
+async fn windows_are_contiguous_and_closed_by_exactly_one_rule(pool: PgPool) {
+    let c = ctx(pool.clone());
+    let alice = seed_identity(&pool, TokenKind::Device).await;
+    for seed in 1..=12u64 {
+        let mut rng = Rng(seed.wrapping_mul(0x9E37_79B9_7F4A_7C15));
+        let s = c.start_session(&alice, &format!("prop-{seed}")).await;
+        let n = 1 + rng.below(40);
+        let events: Vec<Value> = (0..n as i32)
+            .map(|seq| match rng.below(10) {
+                0 => prompt(s, seq, "next task"),
+                1 | 2 => stop(s, seq, "done"),
+                3 => ev(s, seq, "system", json!({"source": "startup"})),
+                4 => ev(s, seq, "subagent_stop", json!({"agent_id": "a1", "agent_type": "Explore"})),
+                5 => ev(s, seq, "tool_failure", json!({"tool_name": "Bash", "error": "exit 1"})),
+                _ => tool(s, seq),
+            })
+            .collect();
+        let mut rest = events.as_slice();
+        while !rest.is_empty() {
+            let take = (1 + rng.below(12)).min(rest.len());
+            let (batch, tail) = rest.split_at(take);
+            c.events_ok(&alice.token, s, batch.to_vec()).await;
+            rest = tail;
+        }
+        if rng.below(2) == 0 {
+            let end = c.post(&format!("/v1/sessions/{s}/end"), &alice.token, json!({})).await;
+            assert_eq!(end.status, StatusCode::OK, "seed {seed}");
+        }
+
+        // events: window numbers never go back and never skip
+        let assigned: Vec<i32> = windows_of(&c, s).await.into_iter().filter_map(|(_, w)| w).collect();
+        assert_eq!(assigned.len(), n, "seed {seed}: every event is in a window");
+        assert_eq!(assigned[0], 1, "seed {seed}");
+        assert!(assigned.windows(2).all(|w| w[1] == w[0] || w[1] == w[0] + 1), "seed {seed}: {assigned:?}");
+
+        // windows: 1..=k with no gap, only the last may be open, closed ones have one reason
+        let windows: Vec<(i32, Option<String>, bool)> = sqlx::query_as(
+            "SELECT window_no, close_reason, has_content FROM session_windows WHERE session_id = $1 ORDER BY window_no",
+        )
+        .bind(s)
+        .fetch_all(&pool)
+        .await
+        .unwrap();
+        let numbers: Vec<i32> = windows.iter().map(|w| w.0).collect();
+        assert_eq!(numbers, (1..=windows.len() as i32).collect::<Vec<_>>(), "seed {seed}");
+        let last = windows.len() - 1;
+        for (i, (_, reason, _)) in windows.iter().enumerate() {
+            assert!(i == last || reason.is_some(), "seed {seed}: only the last window can be open: {windows:?}");
+        }
+        let closed_with_content: Vec<i32> = windows.iter().filter(|w| w.1.is_some() && w.2).map(|w| w.0).collect();
+        let keys: Vec<String> = c.packets(s).await.into_iter().filter(|p| p.0 == "extract").map(|p| p.1).collect();
+        let expected: Vec<String> = closed_with_content.iter().map(|w| format!("extract:{s}:{w}")).collect();
+        assert_eq!(keys, expected, "seed {seed}: an extract packet exactly for closed windows with content");
+    }
+}

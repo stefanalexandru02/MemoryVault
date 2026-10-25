@@ -33,6 +33,10 @@ pub struct State {
     pub events_status: u16,
     /// Accept this many more event posts, then answer 503 (None = unlimited).
     pub events_ok: Option<usize>,
+    /// `next_seq` reported by `POST /v1/sessions`.
+    pub next_seq: i64,
+    /// Event posts whose body contains this text are answered 500 (a request the server chokes on).
+    pub poison: Option<String>,
     pub context: Option<String>,
     pub packets: VecDeque<Value>,
     /// Replies for `POST /v1/work/{id}/result`; empty = 200.
@@ -55,6 +59,8 @@ impl Fake {
             window_closed: false,
             events_status: 202,
             events_ok: None,
+            next_seq: 0,
+            poison: None,
             context: None,
             packets: VecDeque::new(),
             result_replies: VecDeque::new(),
@@ -172,11 +178,15 @@ fn route(s: &mut State, req: Req) -> (u16, &'static str, Value) {
         ("POST", ["v1", "sessions"]) => (
             201,
             json,
-            json!({"session_id": SESSION_ID, "space_id": SESSION_ID, "window_policy": {"tool_uses": 8, "idle_seconds": 90}}),
+            json!({"session_id": SESSION_ID, "space_id": SESSION_ID, "window_policy": {"tool_uses": 8, "idle_seconds": 90},
+                   "next_seq": s.next_seq}),
         ),
         ("POST", ["v1", "sessions", _, "events"]) => {
             let n = body["events"].as_array().map_or(0, Vec::len);
             let status = s.events_status;
+            if s.poison.as_ref().is_some_and(|m| body.to_string().contains(m.as_str())) {
+                return (500, json, json!({"error": {"code": "internal", "message": "boom", "retryable": true}}));
+            }
             if let Some(left) = s.events_ok.as_mut() {
                 if *left == 0 {
                     return (

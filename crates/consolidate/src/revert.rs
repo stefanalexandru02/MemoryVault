@@ -154,18 +154,18 @@ pub async fn revert_run(conn: &mut PgConnection, run_id: Uuid, actor: &str) -> R
                 .bind(before)
                 .execute(&mut *conn)
                 .await?;
-                if has_embeddings(table) {
-                    if let Some((kind, key)) = scope_of(&merged) {
-                        sqlx::query(
-                            "UPDATE embeddings SET scope_kind = $3, scope_key = $4 WHERE owner_table = $1 AND owner_id = $2",
-                        )
-                        .bind(table)
-                        .bind(row.target_id)
-                        .bind(kind)
-                        .bind(key)
-                        .execute(&mut *conn)
-                        .await?;
-                    }
+                if has_embeddings(table)
+                    && let Some((kind, key)) = scope_of(&merged)
+                {
+                    sqlx::query(
+                        "UPDATE embeddings SET scope_kind = $3, scope_key = $4 WHERE owner_table = $1 AND owner_id = $2",
+                    )
+                    .bind(table)
+                    .bind(row.target_id)
+                    .bind(kind)
+                    .bind(key)
+                    .execute(&mut *conn)
+                    .await?;
                 }
                 snapshot(conn, table, row.target_id).await?
             }

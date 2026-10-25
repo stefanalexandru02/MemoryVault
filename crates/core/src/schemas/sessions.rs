@@ -54,6 +54,10 @@ pub struct SessionCreated {
     pub space_id: Uuid,
     #[serde(default)]
     pub window_policy: WindowPolicy,
+    /// One past the highest event `seq` stored for the session (0 for a new one): a client that
+    /// lost its counter continues from here instead of colliding with stored events.
+    #[serde(default)]
+    pub next_seq: i32,
 }
 
 /// `POST /v1/sessions/{id}/end` (events:write).
@@ -61,6 +65,10 @@ pub struct SessionCreated {
 pub struct SessionEnd {
     #[serde(default)]
     pub reason: Option<String>,
+    /// When the session ended, if the client delivers late (a spooled end). Clamped to
+    /// `started_at ..= now`. Default: now.
+    #[serde(default)]
+    pub occurred_at: Option<DateTime<Utc>>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

@@ -300,12 +300,14 @@ pub async fn build_pack(
     let mut by_slot = BTreeMap::from([("profile".to_string(), profile_cost)]);
 
     // Facts: pinned first, then MMR order; facts already shown in a fallback profile are skipped.
+    let pinned_pos: HashMap<Uuid, usize> = pinned_ids.iter().enumerate().map(|(i, id)| (*id, i)).collect();
     let pinned_set: HashSet<Uuid> = pinned_ids.into_iter().collect();
     let (mut pinned, rest): (Vec<Candidate>, Vec<Candidate>) = take(MemoryTable::Facts)
         .into_iter()
         .filter(|c| !profile_fact_ids.contains(&c.id))
         .partition(|c| pinned_set.contains(&c.id));
-    pinned.sort_by(by_score);
+    // Pinned facts no leg returned score 0: they keep the order of the pinned query (importance x confidence).
+    pinned.sort_by(|a, b| b.score.total_cmp(&a.score).then_with(|| pinned_pos.get(&a.id).cmp(&pinned_pos.get(&b.id))));
     let ranked = if opts.context { Vec::new() } else { mmr_order(rest.into_iter().filter(|c| c.rrf > 0.0).collect()) };
     let fact_items: Vec<FactItem> = pinned.iter().chain(&ranked).filter_map(fact_item).collect();
     let (facts, used) = budget_fill(fact_items, budgets.facts, |f| estimate_tokens(&render::fact_line(f)));
@@ -371,19 +373,19 @@ fn fill_observations(
         if max_rows.is_some_and(|m| out.len() >= m) {
             break;
         }
-        if expanded < expand {
-            if let Some(item) = observation_item(c, true) {
-                let cost = i64::from(if item.item.token_estimate > 0 {
-                    item.item.token_estimate
-                } else {
-                    estimate_tokens(&render::observation_block(&item))
-                });
-                if used + cost <= budget {
-                    used += cost;
-                    expanded += 1;
-                    out.push(item);
-                    continue;
-                }
+        if expanded < expand
+            && let Some(item) = observation_item(c, true)
+        {
+            let cost = i64::from(if item.item.token_estimate > 0 {
+                item.item.token_estimate
+            } else {
+                estimate_tokens(&render::observation_block(&item))
+            });
+            if used + cost <= budget {
+                used += cost;
+                expanded += 1;
+                out.push(item);
+                continue;
             }
         }
         if let Some(item) = observation_item(c, false) {
@@ -740,6 +742,7 @@ pub async fn recall(state: &AppState, identity: &Identity, req: RecallRequest) -
         latency_ms,
     };
     let retrieval_id = log_retrieval(&mut tx, identity, rec, &pack).await?;
+    log_pack_access(&mut tx, identity, "recall", &pack.slots).await?;
     tx.commit().await?;
     record_metrics("recall", &pack, started.elapsed().as_secs_f64());
     Ok(RecallResponse {
@@ -863,7 +866,7 @@ pub async fn search(state: &AppState, identity: &Identity, query: SearchQuery) -
     if spaces.is_empty() || tables.is_empty() {
         return Ok(empty);
     }
-    let want = query.offset + query.limit;
+    let want = query.offset.saturating_add(query.limit);
     let f = Filters {
         spaces,
         scopes,
@@ -1137,9 +1140,55 @@ pub async fn log_access(
     action: &str,
     items: &[&MemoryItem],
 ) -> Result<(), sqlx::Error> {
+    let targets: Vec<(Uuid, Uuid)> = items.iter().map(|item| (item_space(item), item.id())).collect();
+    log_access_ids(conn, identity, action, &targets).await
+}
+
+/// `access_log` for what a recall or context pack returned: fact values (also the ones rendered in
+/// the profile, found again by their `fact#` tags), procedure bodies, summaries and expanded
+/// observation narratives. Index-only observation lines (titles) are not content reads.
+pub async fn log_pack_access(
+    conn: &mut PgConnection,
+    identity: &Identity,
+    action: &str,
+    slots: &RecallSlots,
+) -> Result<(), sqlx::Error> {
+    let mut targets: Vec<(Uuid, Uuid)> = Vec::new();
+    targets.extend(slots.facts.iter().map(|f| (f.item.space_id, f.item.id)));
+    targets.extend(slots.procedures.iter().map(|p| (p.item.space_id, p.item.id)));
+    targets.extend(slots.summaries.iter().map(|s| (s.item.space_id, s.item.id)));
+    targets.extend(slots.observations.iter().filter(|o| o.expanded).map(|o| (o.item.space_id, o.item.id)));
+    if let Some(profile) = &slots.profile {
+        let tags: Vec<String> = profile
+            .body_md
+            .split("fact#")
+            .skip(1)
+            .map(|rest| rest.chars().take(6).collect::<String>())
+            .filter(|t| t.len() == 6 && t.chars().all(|c| c.is_ascii_hexdigit()))
+            .collect();
+        if !tags.is_empty() {
+            let rows: Vec<(Uuid, Uuid)> = sqlx::query_as(
+                "SELECT space_id, id FROM facts
+                  WHERE status = 'active' AND right(replace(id::text, '-', ''), 6) = ANY($1)",
+            )
+            .bind(&tags)
+            .fetch_all(&mut *conn)
+            .await?;
+            targets.extend(rows);
+        }
+    }
+    log_access_ids(conn, identity, action, &targets).await
+}
+
+async fn log_access_ids(
+    conn: &mut PgConnection,
+    identity: &Identity,
+    action: &str,
+    targets: &[(Uuid, Uuid)],
+) -> Result<(), sqlx::Error> {
     let mut per_space: BTreeMap<Uuid, Vec<Uuid>> = BTreeMap::new();
-    for item in items {
-        per_space.entry(item_space(item)).or_default().push(item.id());
+    for (space, id) in targets {
+        per_space.entry(*space).or_default().push(*id);
     }
     for (space, ids) in per_space {
         sqlx::query("INSERT INTO access_log (id, space_id, client_id, action, target_ids) VALUES ($1, $2, $3, $4, $5)")

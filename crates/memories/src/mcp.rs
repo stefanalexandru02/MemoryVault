@@ -184,7 +184,10 @@ impl MemoryServer {
     async fn search(&self, caller: &Caller, args: MemorySearchArgs) -> ToolResult {
         require_scope(&self.state, &caller.identity, MEMORIES_READ).await?;
         args.validate()?;
-        let scopes = match args.scope {
+        // The plugin sends the project header; with it, an unspecified scope means that project.
+        let scope =
+            args.scope.unwrap_or(if caller.project_header.is_some() { McpScope::Project } else { McpScope::All });
+        let scopes = match scope {
             McpScope::All => None,
             McpScope::Global => Some(vec![Scope::global()]),
             // Without a known project there is nothing to narrow to.
@@ -415,7 +418,7 @@ fn tools() -> Vec<Tool> {
             json!({
                 "query": {"type": "string", "description": "What to look for."},
                 "types": {"type": "array", "items": {"type": "string"}, "description": "Observation types, e.g. decision, bugfix."},
-                "scope": {"type": "string", "enum": ["project", "global", "all"], "description": "Default all."},
+                "scope": {"type": "string", "enum": ["project", "global", "all"], "description": "Default: the current project when the client reports one, else all."},
                 "since": {"type": "string", "description": "RFC 3339 time, a date like 2026-10-01, or a span like 7d."},
                 "files": {"type": "array", "items": {"type": "string"}, "description": "Only observations touching these paths."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 30, "description": "Default 20."}

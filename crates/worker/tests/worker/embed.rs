@@ -243,3 +243,26 @@ async fn poison_row_only_fails_its_own_job(pool: PgPool) {
     statuses.sort();
     assert_eq!(statuses, ["done", "done", "done", "done", "done", "queued"]);
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn backfill_jobs_are_claimed_after_live_ones(pool: PgPool) {
+    let e = env(pool).await;
+    let old = e.observation("old", None, &[]).await;
+    assert_eq!(embed::reindex(&e.pool, "bge-m3").await.unwrap(), 1);
+    // a fresh row is queued after the backfill, and still comes out first
+    let fresh = e.observation("fresh", None, &[]).await;
+    e.embed_job("observations", fresh).await;
+    let mut owners = Vec::new();
+    for _ in 0..2 {
+        let claimed = memvault_worker::queue::claim(&e.pool, "t", &["embed"], 1).await.unwrap();
+        owners.push(claimed[0].payload["owner_id"].as_str().unwrap().to_string());
+    }
+    assert_eq!(owners, [fresh.to_string(), old.to_string()]);
+    // backfill ids are time-ordered UUIDv7 like every other id
+    let versions: Vec<i32> =
+        sqlx::query_scalar("SELECT (get_byte(uuid_send(id), 6) >> 4)::int FROM jobs WHERE priority > 0")
+            .fetch_all(&e.pool)
+            .await
+            .unwrap();
+    assert_eq!(versions, [7]);
+}

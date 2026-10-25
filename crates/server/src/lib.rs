@@ -45,7 +45,16 @@ pub fn build_router(state: AppState) -> Router {
         .layer(TimeoutLayer::with_status_code(StatusCode::REQUEST_TIMEOUT, REQUEST_TIMEOUT))
         .layer(TraceLayer::new_for_http().make_span_with(|req: &axum::http::Request<_>| {
             let request_id = req.headers().get("x-request-id").and_then(|v| v.to_str().ok()).unwrap_or("");
-            tracing::info_span!("http", method = %req.method(), path = %req.uri().path(), request_id)
+            // user_id, client_id and space_id are recorded once the caller is authenticated (core auth).
+            tracing::info_span!(
+                "http",
+                method = %req.method(),
+                path = %req.uri().path(),
+                request_id,
+                user_id = tracing::field::Empty,
+                client_id = tracing::field::Empty,
+                space_id = tracing::field::Empty,
+            )
         }))
         .layer(PropagateRequestIdLayer::x_request_id())
         .layer(SetRequestIdLayer::x_request_id(MakeRequestUuid))

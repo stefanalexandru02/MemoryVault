@@ -40,7 +40,7 @@ fn window_closed_spawns_the_observer_which_runs_the_lease_result_flow() {
     let lease = &leases(&fake)[0];
     assert_eq!(
         lease,
-        &json!({"session_id": SESSION_ID, "kinds": ["extract", "summarize_prompt", "summarize_session"], "max": 1})
+        &json!({"session_id": SESSION_ID, "kinds": ["extract", "summarize_prompt", "summarize_session"], "max": 1, "runner_kind": "claude-p"})
     );
     let result = &results(&fake)[0];
     assert_eq!(result.body["output"], json!({"observations": []}));
@@ -256,7 +256,10 @@ fn nightly_runner_leases_without_a_session_and_honours_kinds_and_max() {
     assert_eq!(out.code, Some(0));
     let l = leases(&fake);
     assert_eq!(l.len(), 2);
-    assert_eq!(l[0], json!({"session_id": null, "kinds": ["consolidate_facts", "consolidate_summary"], "max": 1}));
+    assert_eq!(
+        l[0],
+        json!({"session_id": null, "kinds": ["consolidate_facts", "consolidate_summary"], "max": 1, "runner_kind": "claude-p"})
+    );
     assert_eq!(results(&fake).len(), 2);
 }
 

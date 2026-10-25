@@ -36,7 +36,7 @@ pub fn update_cache<R>(home: &Path, claude_sid: &str, f: impl FnOnce(&mut Cache)
     let out = f(&mut cache);
     if let Ok(text) = serde_json::to_string(&cache) {
         let tmp = dir.join(format!("{name}.tmp"));
-        if std::fs::write(&tmp, text).is_ok() {
+        if util::write_private(&tmp, text).is_ok() {
             let _ = std::fs::rename(&tmp, &path);
         }
     }
@@ -88,7 +88,7 @@ pub fn save_context(home: &Path, project_key: &str, block: &str) {
     if let Some(dir) = path.parent() {
         let _ = util::mkdir_private(dir);
     }
-    let _ = std::fs::write(path, block);
+    let _ = util::write_private(&path, block);
 }
 
 /// Once per day, tells the user why memory is off.
