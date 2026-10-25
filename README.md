@@ -49,14 +49,15 @@ and token written in, and allows `mcp__memory__*` in `~/.claude/settings.json`. 
 afterwards. It needs the `claude` CLI, `cargo` and `curl`, and `python3` or `jq` for the settings edit.
 
 ```bash
-make connect-status                                         # what is connected, and does the token work
+make connect-status                                         # what is connected, does the token work, tokens served lately
 make disconnect                                             # remove all of it and revoke the local token
 make connect-remote URL=https://memory.<tailnet>.ts.net TOKEN=mem_...   # the same, for a server elsewhere
 ```
 
 `make disconnect` keeps `~/.memory/spool` and `sessions` (add `PURGE=1` to delete them). Tokens of a
 remote server stay valid until its admin revokes them. All three targets call
-`clients/claude-code-plugin/connect.sh`, which you can also run directly.
+`clients/claude-code-plugin/connect.sh`, which you can also run directly. Add `INJECTION=lean` (or `full`) to
+`connect-local` or `connect-remote` to set the session-start context mode below.
 
 The first `make up` downloads the TEI models (about 4.5 GB) into a volume. `make up-lite` skips TEI and
 uses the fake deterministic embedder: the plumbing works, recall quality does not. Run `make reindex` after
@@ -155,7 +156,9 @@ there). Open it, paste a device token (`make token`, or the one in `~/.memory/co
 - mark a fact, observation or procedure helpful, wrong or outdated (with an optional note), and see how many of
   each it has;
 - forget a memory, with a reason that goes to the audit log;
-- read the open work lists per project;
+- read the open work lists per project, and the tokens your session starts and recalls have served (average,
+  median and 95th percentile per injection mode, over 1 to 90 days; an admin can switch to all users);
+- switch the default session-start context between full and lean (the selector in the header);
 - with an admin token: see the server's health checks (the same as `memvault admin doctor`), list and revoke
   tokens, and see failed work packets and background jobs, with a retry.
 
@@ -164,6 +167,33 @@ The viewer is three static files compiled into the server (`crates/server/assets
 `sessionStorage` unless you tick "Remember on this device". The page sets a strict content security policy (no
 inline script or style, same-origin requests only) and renders memory text as text, never as markup, because
 that text comes from tool output.
+
+## Full and lean session context
+
+Every session start fetches `GET /v1/context`. Two modes trade tokens against recall:
+
+| Mode | What the session starts with | About |
+|---|---|---|
+| `full` (default) | profile, open work, procedures, an index of recent observations, recent sessions and what other devices did since your last visit here | 1,000 tokens, paid at every session start, `clear` and `compact` |
+| `lean` | profile, open work and a short rubric saying when and how to call `memory_search`, `memory_timeline`, `memory_get` and `memory_remember` | 300 to 400 tokens |
+
+Lean starts cheaper but the agent has to ask: it sees recent work only if it searches, and it searches only
+when the task or the rubric tells it to. Full costs more on every start whether or not the session needs the
+history, but the index and the hand-off are already in front of the model. Lean suits short or unrelated
+sessions and long-running ones that compact often; full suits work that continues from earlier sessions on
+other devices. The tokens are estimates (characters / 4), the same ones the budgets use.
+
+The mode is the first of these that is set: the `mode=lean|full` query parameter of `GET /v1/context`; `MEM_INJECTION`
+in `~/.memory/config`, which `mem-hook` sends as that parameter; the user's default on the server, set with
+`PUT /v1/me/settings` (`{"injection_mode": "lean"}`, read back with `GET`) or the selector in the viewer's
+header; then `full`. A cached block is kept per mode, so changing the default needs no invalidation.
+`make connect-local INJECTION=lean` writes `MEM_INJECTION`. A `resume` start returns nothing in either mode.
+
+`GET /v1/stats/recall?days=7` returns, for your own calls, the count and the average, median and 95th percentile
+of tokens served (and the average number of memories selected) per call kind (`context`, `recall`) and
+injection mode. Every context call is counted, cached or rendered. `days` is 1 to 90; an admin token can add
+`all=true` for every user. `make connect-status` prints the same table, and the viewer's Work state tab shows it.
+Compare the two modes there before settling on one.
 
 ## Installing the Claude Code plugin
 
@@ -190,6 +220,7 @@ Python, `curl` or `jq`.
    MEMORY_TOKEN=mem_...
    # DEVICE_ID=laptop-x1
    # CLAUDE_BIN=/usr/local/bin/claude
+   # MEM_INJECTION=lean
    ```
 
    Export it in the shell where you run the commands below: `set -a; . ~/.memory/config; set +a`.

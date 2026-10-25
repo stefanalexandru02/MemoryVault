@@ -174,6 +174,17 @@ pub fn parse_scopes_param(value: &str) -> Result<Vec<Scope>, UnknownVariant> {
 
 str_enum!(Sensitivity { Normal = "normal", Sensitive = "sensitive", Secret = "secret" });
 
+str_enum!(
+    /// How `GET /v1/context` injects memory at session start: `full` is the budgeted block, `lean` only the
+    /// profile, open work and a rubric on when to call the pull tools.
+    #[derive(Default)]
+    InjectionMode {
+        #[default]
+        Full = "full",
+        Lean = "lean",
+    }
+);
+
 str_enum!(EventKind {
     UserPrompt = "user_prompt",
     AssistantMessage = "assistant_message",

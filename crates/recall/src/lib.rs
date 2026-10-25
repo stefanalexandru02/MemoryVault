@@ -6,6 +6,7 @@
 //! - [`context::render_context`]: the SessionStart block, used by `GET /v1/context` and by the
 //!   worker through [`cache::rerender`].
 //! - [`cache`]: context cache, `LISTEN memory_invalidate` loop.
+//! - [`settings`]: `GET`/`PUT /v1/me/settings` (the default injection mode); [`stats`]: `GET /v1/stats/recall`.
 //! - [`render`]: deterministic markdown (citations, index with glyph legend, bodies, explain).
 
 pub mod cache;
@@ -14,6 +15,8 @@ pub mod context;
 pub mod engine;
 pub mod render;
 pub mod scoring;
+pub mod settings;
+pub mod stats;
 
 use axum::Router;
 use axum::extract::State;
@@ -23,12 +26,12 @@ use axum::routing::{get, post};
 use memvault_core::auth::{MEMORIES_READ, MEMORIES_WRITE};
 use memvault_core::http::{Json, Path, Query};
 use memvault_core::schemas::memories::{ByFileQuery, GetRequest, SearchQuery, TimelineQuery};
-use memvault_core::schemas::recall::{ContextQuery, FeedbackRequest, RecallRequest};
+use memvault_core::schemas::recall::{ContextQuery, FeedbackRequest, RecallRequest, StatsQuery, UserSettings};
 use memvault_core::{ApiError, AppState, Identity, require_scope};
 use uuid::Uuid;
 
 /// Routes under `/v1` (paths without the prefix): recall, context, search, timeline, memories/get,
-/// explain, history, observations/by-file, feedback.
+/// explain, history, observations/by-file, feedback, me/settings, stats/recall.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/recall", post(recall))
@@ -40,6 +43,8 @@ pub fn router() -> Router<AppState> {
         .route("/memories/{id}/explain", get(explain))
         .route("/memories/{id}/history", get(history))
         .route("/observations/by-file", get(by_file))
+        .route("/me/settings", get(get_settings).put(put_settings))
+        .route("/stats/recall", get(recall_stats))
 }
 
 async fn recall(
@@ -69,9 +74,15 @@ async fn context(
     Query(q): Query<ContextQuery>,
 ) -> Result<Response, ApiError> {
     require_scope(&state, &identity, MEMORIES_READ).await?;
-    let body =
-        context::render_context(&state, &identity, q.project_key.as_deref(), q.device_id.as_deref(), q.source.as_str())
-            .await?;
+    let body = context::render_context(
+        &state,
+        &identity,
+        q.project_key.as_deref(),
+        q.device_id.as_deref(),
+        q.source.as_str(),
+        q.mode,
+    )
+    .await?;
     let etag = cache::etag(&body);
     let etag_value = HeaderValue::from_str(&etag).map_err(|e| ApiError::internal(e.to_string()))?;
     let matches = headers
@@ -145,4 +156,27 @@ async fn by_file(
 ) -> Result<impl IntoResponse, ApiError> {
     require_scope(&state, &identity, MEMORIES_READ).await?;
     Ok(Json(engine::by_file(&state, &identity, q).await?))
+}
+
+async fn get_settings(State(state): State<AppState>, identity: Identity) -> Result<impl IntoResponse, ApiError> {
+    require_scope(&state, &identity, MEMORIES_READ).await?;
+    Ok(Json(settings::get(&state, &identity).await?))
+}
+
+async fn put_settings(
+    State(state): State<AppState>,
+    identity: Identity,
+    Json(body): Json<UserSettings>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_scope(&state, &identity, MEMORIES_WRITE).await?;
+    Ok(Json(settings::put(&state, &identity, body).await?))
+}
+
+async fn recall_stats(
+    State(state): State<AppState>,
+    identity: Identity,
+    Query(q): Query<StatsQuery>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_scope(&state, &identity, MEMORIES_READ).await?;
+    Ok(Json(stats::recall_stats(&state, &identity, &q).await?))
 }

@@ -253,8 +253,17 @@ and repeated items are merged. The last section lists the gaps that are still op
   this client's newest session on the project, but only if it started within the last 10 minutes. The line shows the
   session summary, or the latest prompt summary while the session is still running. agentic-os clients are labelled
   `assistant`.
-- **Cache key (11.6).** The key is sha256 of `(user_id, sorted space_ids, sorted scopes, device_id, source)`. Spec 11.6
-  has no `user_id`. It is added because `context_cache` rows are per user (RLS), and `cache_key` is the primary key.
+- **Cache key (11.6).** The key is sha256 of `(user_id, sorted space_ids, sorted scopes, device_id, source, mode)`. Spec
+  11.6 has no `user_id`. It is added because `context_cache` rows are per user (RLS), and `cache_key` is the primary
+  key. `mode` is the injection mode (below).
+- **Injection modes.** `GET /v1/context` takes `mode=full|lean`; without it the user's default from `user_settings`
+  (`GET`/`PUT /v1/me/settings`), else `full`. `mem-hook` sends `MEM_INJECTION` from `~/.memory/config` as `mode`. The
+  lean block is the Profile and Open work sections (budgets 120/60/80 for profile, pinned facts and work state) plus a
+  fixed rubric of about 140 tokens; it has no since-you-were-here section. A re-render job carries the mode of the
+  block it replaces.
+- **Context calls are logged on cache hits too.** `retrieval_log` gained `tokens`, `hits` and `injection`. A hit logs
+  a row with no candidates, so `GET /v1/stats/recall` (own calls; `all=true` for admin tokens) counts every call. Rows
+  from before migration 0203 have no tokens and are left out.
 - **ETag.** The ETag is a hash of the full response body, live sections included. It replaces
   `(space, scopes, cache_version)`. `If-None-Match` gets a 304. Cached rows also expire after 1 hour, as a backstop
   against a lost NOTIFY.

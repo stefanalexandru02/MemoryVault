@@ -29,7 +29,7 @@ lock" is normal, wait; never kill cargo or delete `target/`. Build and test only
 | `crates/core` | `memvault-core` / `memvault_core` | foundation | config, db + RLS tx, ids, auth, schemas, TEI + FakeTei, prompts, appliers, invalidation, errors, AppState, test-support |
 | `crates/server` | `memvault` (bin) / `memvault_server` | foundation | CLI, router assembly, `/health`, `/metrics`, `/mcp` mount, migrate |
 | `crates/ingest` | `memvault-ingest` | ingest | sessions, events, windows, work packets (lease/result/fail/heartbeat), prompts route, extract/summary appliers |
-| `crates/recall` | `memvault-recall` | recall | candidates, fusion, rerank, budgets, rendering, context cache + listener, recall/context/search/timeline/get/explain/history/by-file/feedback routes |
+| `crates/recall` | `memvault-recall` | recall | candidates, fusion, rerank, budgets, rendering, context cache + listener, recall/context/search/timeline/get/explain/history/by-file/feedback routes, `me/settings`, `stats/recall` |
 | `crates/memories` | `memvault-memories` | memories | memories (remember/forget/feedback) + work-state routes, MCP server |
 | `crates/consolidate` | `memvault-consolidate` | consolidation | planner, consolidation appliers, revert, admin routes and admin CLI |
 | `crates/worker` | `memvault-worker` | worker | embedding parts and jobs, worker loop, sweeps, retention |
@@ -65,7 +65,7 @@ take turns on sqlx's advisory lock; migrations the binary does not know are igno
 |---|---|
 | 0001-0099 | foundation (0099 = grants) |
 | 0100-0199 | ingest (0100 exists: `session_windows`, lease bookkeeping) |
-| 0200-0299 | recall (0200-0202 exist: context cache columns, invalidations) |
+| 0200-0299 | recall (0200-0203 exist: context cache columns, invalidations, injection modes) |
 | 0300-0399 | memories / mcp |
 | 0400-0499 | consolidation (0400 exists: decay and revert bookkeeping) |
 | 0500-0599 | worker |
@@ -95,14 +95,17 @@ Full DDL of spec 4.1-4.7 plus:
 - `procedure_hints(id, space_id, scope_kind, scope_key, task_class, note, observation_id, session_id, packet_id,
   consumed_at, created_at)` - 10.4 step 4.
 - `context_cache(cache_key PK, user_id, space_id, space_ids uuid[], scopes text[] ('kind:key'), device_id, source,
-  body_md, etag, token_estimate, rendered_at)` - 11.6. RLS: a user sees only own rows.
+  body_md, etag, token_estimate, rendered_at, mode, hit_count)` - 11.6. RLS: a user sees only own rows.
+- `user_settings(user_id PK, injection_mode 'full'|'lean', updated_at)` - the user's defaults. RLS: own row only
+  (no `space_id`, so `memsvc_apply_space_rls` is not used).
 - `rate_limits(subject, window_start, count)` - 5.1. Old windows are pruned by the worker's retention job.
 - SQL functions: `app_user_id()`, `app_client_id()`, `readable_spaces()`, `writable_spaces()`,
   `memsvc_join(text[], text)`, `memsvc_apply_space_rls(tbl, write_check)`,
   `memsvc_invalidate_context(space uuid, kind text, key text) -> int` (SECURITY DEFINER; kind NULL = whole space).
 - RLS (forced) on: sessions, events, observations, summaries, entities, facts, procedures, work_state, profiles,
   embeddings, work_packets, memory_audit, procedure_hints (writes need owner/writer); retrieval_log, access_log
-  (writes need any membership); context_cache (own rows); memberships (own rows, read-only for the app role).
+  (writes need any membership); context_cache (own rows); user_settings (own row); memberships (own rows,
+  read-only for the app role).
   users, spaces, clients, api_tokens, jobs, rate_limits have no RLS.
 - Roles `memsvc_app` (NOINHERIT LOGIN) and `memsvc_system` (NOINHERIT LOGIN BYPASSRLS).
 - `emb_hnsw` HNSW index (pgvector 0.6 is fine; `hnsw.iterative_scan` only on >= 0.8). BM25 indexes `obs_bm25`,
@@ -122,6 +125,9 @@ Full DDL of spec 4.1-4.7 plus:
   executable by `memsvc_app`): a cached block is served only when no matching invalidation is newer than its
   `rendered_at`, which closes the render/NOTIFY race.
 - **0202 recall**: forced RLS on `context_invalidations` (it has `space_id`; the app role has no grants on it).
+- **0203 recall**: `user_settings`; `retrieval_log.tokens`, `.hits`, `.injection` (`full`|`lean`, context calls only)
+  and an index on `(client_id, created_at)`; `context_cache.mode`, `.hit_count`; `memsvc_recall_invalidate` is
+  recreated returning `mode` as well (same grants). The cache key is `v2` and includes the mode.
 - **0500 worker**: `jobs.priority` (claim order; live jobs 0, `reindex` backfill 10).
 - **0900 hardening**: `memsvc_app` loses INSERT/UPDATE/DELETE on `users`, `spaces`, `api_tokens`, `clients`
   (except `api_tokens.last_used_at` and `clients.last_seen_at/current_project_key/current_project_at`) and DELETE on
@@ -188,7 +194,8 @@ Full DDL of spec 4.1-4.7 plus:
   ingest must use the core path).
 - **Job types** (`jobs`, worker lanes): `embed` `{owner_table, owner_id, model?}` (`model` set by reindex; a job
   for another model than `EMBED_MODEL` fails permanently); `render_context` = `memvault_recall::cache::
-  RenderContextJob {cache_key, user_id, client_id, project_key, device_id, source}`, queued by the API's cache
+  RenderContextJob {cache_key, user_id, client_id, project_key, device_id, source, mode}` (`mode` defaults to `full`
+  for jobs queued before it existed), queued by the API's cache
   listener with `run_after = now() + CONTEXT_RERENDER_DEBOUNCE_S`, coalesced per `cache_key`, run by
   `memvault_recall::cache::rerender(&state, &payload) -> Result<bool, ApiError>` (false: user or client gone; the
   job is done either way); `reindex`; `retention` (`idempotency_key = retention:<UTC date>`, queued by the sweep).
@@ -438,7 +445,9 @@ Choices made while implementing, with the reason; the spec text stays as written
   confirmations land as conflict candidates and consolidation merges them.
 - **Context cache hits write no `access_log` row (5.3, 4.6)**: a cache miss logs what the pack returned
   (`action = 'context'`), `POST /v1/recall` always logs (`'recall'`); the cached block carries no row ids to log
-  on a hit.
+  on a hit. A hit does write a `retrieval_log` row (empty candidates and selection, the block's `hit_count`) so
+  `GET /v1/stats/recall` counts every context call, and `tokens` there is the estimate of the text returned,
+  live sections included.
 - **Windows hook and static build (2, D5)**: mem-hook is `cfg(unix)`/`cfg(windows)` portable (it type-checks for
   `x86_64-pc-windows-gnu`; it has not been run on Windows). The Linux build is a static (`crt-static`) glibc
   binary via `install.sh`; a musl build needs `musl-tools` (see the plugin README).

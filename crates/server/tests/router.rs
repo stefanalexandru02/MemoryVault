@@ -72,8 +72,10 @@ async fn viewer_is_served_with_a_strict_content_security_policy(pool: PgPool) {
     assert!(js.contains("/history`") && js.contains("p.set('as_of'"));
     // Helpful / wrong / outdated buttons post feedback on the open memory.
     assert!(js.contains("/feedback`") && js.contains("'outdated'"));
+    // The header sets the default injection mode and the Work tab shows the tokens served.
+    assert!(js.contains("/v1/me/settings") && js.contains("/v1/stats/recall"));
     let css = send(&app, Method::GET, "/viewer/app.css", None, None).await.text();
-    assert!(css.contains(".history li.current") && css.contains(".btn.verdict"));
+    assert!(css.contains(".history li.current") && css.contains(".btn.verdict") && css.contains("td.num"));
 }
 
 #[sqlx::test(migrations = "../../migrations")]

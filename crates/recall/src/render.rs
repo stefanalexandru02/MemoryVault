@@ -345,6 +345,24 @@ pub fn context_body(slots: &RecallSlots) -> String {
     ])
 }
 
+/// What the lean block tells the model about the pull tools (names and arguments as in `memories::mcp`).
+pub const LEAN_RUBRIC: &str = "### Memory tools
+Only the profile and open work are loaded here; the rest of the shared memory is on demand.
+- `memory_search` (query; optional types, scope, since, files): when the task may depend on earlier sessions, decisions or fixes, or the user refers to them. Returns an index of ids and titles.
+- `memory_timeline` (anchor_id): the rows around a search hit.
+- `memory_get` (ids): full bodies, only for the ids you need.
+- `memory_remember` (kind, content): only when the user asks you to keep something.
+Do not search for what the task already tells you.";
+
+/// Cached portion of the lean SessionStart block: profile, open work and [`LEAN_RUBRIC`].
+pub fn lean_body(slots: &RecallSlots) -> String {
+    join_sections(&[
+        section("Profile", &profile_body(slots)),
+        section("Open work", &lines(&slots.work_state, work_state_line)),
+        LEAN_RUBRIC.to_string(),
+    ])
+}
+
 /// One session in since-you-were-here (11.7).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SinceRow {
@@ -701,5 +719,25 @@ mod tests {
             token_estimate: 0,
         };
         assert_eq!(work_state_line(&w), "- todo/memory: api deploy ☐ · migrations ✓");
+    }
+
+    #[test]
+    fn lean_body_is_profile_open_work_and_rubric() {
+        assert_eq!(lean_body(&RecallSlots::default()), LEAN_RUBRIC);
+        assert!(memvault_core::estimate_tokens(LEAN_RUBRIC) <= 200, "the rubric is part of a ~400 token block");
+        for tool in ["memory_search", "memory_timeline", "memory_get", "memory_remember"] {
+            assert!(LEAN_RUBRIC.contains(&format!("`{tool}`")), "{tool}");
+        }
+        let mut fields = serde_json::Map::new();
+        fields.insert("migrations".into(), Value::String("done".into()));
+        let work = WorkStateList {
+            scope: Scope::new(ScopeKind::Project, "github.com/a/memory"),
+            list_name: "todo".into(),
+            fields,
+            updated_at: None,
+            token_estimate: 0,
+        };
+        let slots = RecallSlots { work_state: vec![work], ..RecallSlots::default() };
+        assert_eq!(lean_body(&slots), format!("### Open work\n- todo/memory: migrations ✓\n{LEAN_RUBRIC}"));
     }
 }

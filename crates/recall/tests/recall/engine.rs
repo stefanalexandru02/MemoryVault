@@ -587,7 +587,7 @@ async fn recall_and_context_write_access_log_for_returned_content(pool: PgPool) 
     let index_only: Vec<Uuid> = resp.slots.observations.iter().filter(|o| !o.expanded).map(|o| o.item.id).collect();
     assert!(index_only.iter().all(|id| !logged.contains(id)), "index lines are not content reads");
 
-    memvault_recall::context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup")
+    memvault_recall::context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", None)
         .await
         .unwrap();
     let ctx: Vec<Uuid> = sqlx::query_scalar("SELECT unnest(target_ids) FROM access_log WHERE action = 'context'")

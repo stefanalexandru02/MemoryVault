@@ -9,6 +9,9 @@ pub struct Config {
     pub token: String,
     pub device: String,
     pub claude_bin: String,
+    /// `MEM_INJECTION`: `lean` or `full`, sent as `mode` with the SessionStart request. Unset (or anything
+    /// else) leaves the choice to the user's default on the server.
+    pub injection: Option<String>,
 }
 
 /// `$MEMORY_HOME`, default `~/.memory`.
@@ -87,6 +90,7 @@ impl Config {
             token,
             device: get("DEVICE_ID").unwrap_or_else(hostname),
             claude_bin: get("CLAUDE_BIN").unwrap_or_else(|| "claude".into()),
+            injection: get("MEM_INJECTION").filter(|m| matches!(m.as_str(), "lean" | "full")),
         })
     }
 }

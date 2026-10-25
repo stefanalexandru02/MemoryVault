@@ -3,11 +3,14 @@
 use std::time::Duration;
 
 use memvault_core::auth::admin::ensure_client;
+use memvault_core::auth::scopes::TokenKind;
 use memvault_core::ids::short_id;
 use memvault_core::invalidate::notify_invalidate;
-use memvault_core::schemas::common::{ClientKind, Scope, ScopeKind, Sensitivity, SummaryGrain};
+use memvault_core::schemas::common::{ClientKind, InjectionMode, Scope, ScopeKind, Sensitivity, SummaryGrain};
+use memvault_core::schemas::recall::UserSettings;
 use memvault_core::system_tx;
-use memvault_recall::{cache, context, render};
+use memvault_core::test_support::seed_identity;
+use memvault_recall::{cache, context, render, settings};
 use serde_json::{Value, json};
 use sqlx::PgPool;
 use tokio_util::sync::CancellationToken;
@@ -74,7 +77,7 @@ async fn seed(w: &World) -> Seeded {
 async fn context_block_has_every_section(pool: PgPool) {
     let w = world(pool).await;
     let s = seed(&w).await;
-    let md = context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup").await.unwrap();
+    let md = context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", None).await.unwrap();
 
     assert!(
         md.starts_with("## Memory\n### Profile\n- prefers.vector_store: pgvector for personal projects [fact#"),
@@ -110,38 +113,56 @@ async fn context_block_has_every_section(pool: PgPool) {
             .await
             .unwrap();
     assert_eq!((n, client, project_key.as_deref()), (1, Some(w.alice.client_id), Some(PROJECT)));
-    let again = context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup").await.unwrap();
+    let again =
+        context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", None).await.unwrap();
     assert_eq!(md, again);
     // Served from the cache, with since-you-were-here still computed live.
     sqlx::query("UPDATE context_cache SET body_md = '### Open work\n- CACHED'").execute(&w.pool).await.unwrap();
-    let cached = context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup").await.unwrap();
+    let cached =
+        context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", None).await.unwrap();
     assert!(cached.contains("### Since you were here") && cached.ends_with("### Open work\n- CACHED"), "{cached}");
     // A stale row (older than the max age) is rendered again.
     sqlx::query("UPDATE context_cache SET rendered_at = now() - interval '2 hours'").execute(&w.pool).await.unwrap();
-    let fresh = context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup").await.unwrap();
+    let fresh =
+        context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", None).await.unwrap();
     assert_eq!(fresh, md);
 
     // Other sources are separate cache keys; resume returns nothing.
-    context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "clear").await.unwrap();
+    context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "clear", None).await.unwrap();
     let rows: i64 = sqlx::query_scalar("SELECT count(*) FROM context_cache").fetch_one(&w.pool).await.unwrap();
     assert_eq!(rows, 2);
-    assert_eq!(context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "resume").await.unwrap(), "");
-    // The retrieval log records context renders (cache misses).
-    let modes: Vec<String> = sqlx::query_scalar("SELECT mode FROM retrieval_log").fetch_all(&w.pool).await.unwrap();
-    assert!(modes.iter().all(|m| m == "context") && modes.len() == 3, "{modes:?}");
+    assert_eq!(
+        context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "resume", None).await.unwrap(),
+        ""
+    );
+    // The retrieval log records every context call: three renders, then the two served from the cache.
+    let rows: Vec<(String, Option<String>, i32, i32)> = sqlx::query_as(
+        "SELECT mode, injection, tokens, jsonb_array_length(selected) FROM retrieval_log ORDER BY created_at, id",
+    )
+    .fetch_all(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 5, "{rows:?}");
+    assert!(rows.iter().all(|r| r.0 == "context" && r.1.as_deref() == Some("full") && r.2 > 0), "{rows:?}");
+    let selected: Vec<bool> = rows.iter().map(|r| r.3 > 0).collect();
+    assert_eq!(selected, [true, false, false, true, true], "cache hits rank nothing: {rows:?}");
+    let hits: Vec<i32> =
+        sqlx::query_scalar("SELECT hits FROM retrieval_log ORDER BY created_at, id").fetch_all(&w.pool).await.unwrap();
+    assert!(hits[0] > 0 && hits[1] == hits[0] && hits[2] == hits[0], "a hit repeats what the block selected: {hits:?}");
     let _ = s.desktop;
 }
 
 #[sqlx::test(migrations = "../../migrations")]
 async fn context_without_project_or_data(pool: PgPool) {
     let w = world(pool).await;
-    let md = context::render_context(&w.state, &w.alice.identity, None, None, "startup").await.unwrap();
+    let md = context::render_context(&w.state, &w.alice.identity, None, None, "startup", None).await.unwrap();
     assert_eq!(md, "## Memory\n_No memories for this project yet._");
     // Device-scoped rows show up under the device given in the query.
     let mut o = Obs::new(w.alice.space_id, "Laptop battery tweak", "tlp settings");
     o.scope = Scope::new(ScopeKind::Device, "laptop-x1");
     let id = insert_obs(&w, o).await;
-    let md = context::render_context(&w.state, &w.alice.identity, None, Some("laptop-x1"), "startup").await.unwrap();
+    let md =
+        context::render_context(&w.state, &w.alice.identity, None, Some("laptop-x1"), "startup", None).await.unwrap();
     assert!(md.contains(&short_id(&id)), "{md}");
     // Stale observer packets raise a banner.
     sqlx::query(
@@ -154,7 +175,8 @@ async fn context_without_project_or_data(pool: PgPool) {
     .execute(&w.pool)
     .await
     .unwrap();
-    let md = context::render_context(&w.state, &w.alice.identity, None, Some("laptop-x1"), "startup").await.unwrap();
+    let md =
+        context::render_context(&w.state, &w.alice.identity, None, Some("laptop-x1"), "startup", None).await.unwrap();
     assert!(md.starts_with("## Memory\n> memory: 1 work packet(s) waiting since "), "{md}");
 }
 
@@ -167,7 +189,8 @@ async fn invalidation_deletes_matching_blocks_and_queues_rerender(pool: PgPool) 
     let w = world(pool).await;
     seed(&w).await;
     let space = w.alice.space_id;
-    let first = context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup").await.unwrap();
+    let first =
+        context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", None).await.unwrap();
     assert_eq!(cache_rows(&w.pool).await, 1);
 
     // Another project's scope or another space: nothing to delete.
@@ -191,7 +214,7 @@ async fn invalidation_deletes_matching_blocks_and_queues_rerender(pool: PgPool) 
     assert_eq!(payload["project_key"], PROJECT);
 
     // A burst coalesces into the one queued job.
-    context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup").await.unwrap();
+    context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", None).await.unwrap();
     assert_eq!(cache::handle_payload(&w.state, &format!("{space}:global:")).await.unwrap(), 1);
     let queued: i64 =
         sqlx::query_scalar("SELECT count(*) FROM jobs WHERE type = 'render_context'").fetch_one(&w.pool).await.unwrap();
@@ -216,7 +239,7 @@ async fn listener_deletes_blocks_on_notify(pool: PgPool) {
     let handle = cache::spawn_listener(w.state.clone(), shutdown.clone());
     // Let the listener connect (it starts by dropping every cached block).
     tokio::time::sleep(Duration::from_millis(500)).await;
-    context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup").await.unwrap();
+    context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", None).await.unwrap();
     assert_eq!(cache_rows(&w.pool).await, 1);
 
     let mut tx = w.pool.begin().await.unwrap();
@@ -243,7 +266,7 @@ async fn render_racing_with_invalidation_is_not_served(pool: PgPool) {
     let id = &w.alice.identity;
     let spaces = vec![w.alice.space_id];
     let scopes = context::context_scopes(Some(PROJECT), &id.device_id);
-    let key = cache::cache_key(id.user_id, &spaces, &scopes, &id.device_id, "startup");
+    let key = cache::cache_key(id.user_id, &spaces, &scopes, &id.device_id, "startup", InjectionMode::Full);
     let store = |rendered_at| {
         let (key, spaces, scopes) = (key.clone(), spaces.clone(), scopes.clone());
         let w = &w;
@@ -257,6 +280,8 @@ async fn render_racing_with_invalidation_is_not_served(pool: PgPool) {
                 project_key: Some(PROJECT),
                 device_id: &w.alice.identity.device_id,
                 source: "startup",
+                mode: InjectionMode::Full,
+                hits: 0,
                 rendered_at,
             };
             cache::store(&mut tx, &entry, "body").await.unwrap();
@@ -265,7 +290,7 @@ async fn render_racing_with_invalidation_is_not_served(pool: PgPool) {
     };
     let lookup = || async {
         let mut tx = memvault_core::user_tx(&w.pool, &w.alice.identity).await.unwrap();
-        cache::lookup(&mut tx, &key).await.unwrap()
+        cache::lookup(&mut tx, &key).await.unwrap().map(|c| c.body)
     };
 
     let started = {
@@ -295,4 +320,98 @@ async fn render_racing_with_invalidation_is_not_served(pool: PgPool) {
         .unwrap();
     store(later).await;
     assert_eq!(lookup().await.as_deref(), Some("body"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn lean_block_is_profile_open_work_and_rubric(pool: PgPool) {
+    let w = world(pool).await;
+    let s = seed(&w).await;
+    let lean = InjectionMode::Lean;
+    let md =
+        context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", Some(lean)).await.unwrap();
+    assert!(
+        md.starts_with("## Memory\n### Profile\n- prefers.vector_store: pgvector for personal projects [fact#"),
+        "{md}"
+    );
+    assert!(md.contains("### Open work\n- todo/homelab: api deploy ☐ · migrations ✓\n"), "{md}");
+    assert!(md.ends_with(render::LEAN_RUBRIC), "{md}");
+    for gone in ["Since you were here", "Relevant procedures", "Recent sessions", render::RECENT_OBSERVATIONS_TITLE] {
+        assert!(!md.contains(gone), "{gone} is not in the lean block:\n{md}");
+    }
+    assert!(!md.contains(&short_id(&s.decision)) && !md.contains("Deploy memory-api"), "{md}");
+    let tokens = memvault_core::estimate_tokens(&md);
+    assert!((100..=450).contains(&tokens), "a lean block is ~400 tokens, got {tokens}:\n{md}");
+
+    // Full and lean blocks are cached apart; neither is served for the other.
+    let full =
+        context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", None).await.unwrap();
+    assert!(full.contains("### Since you were here") && !full.contains("### Memory tools"), "{full}");
+    let modes: Vec<String> =
+        sqlx::query_scalar("SELECT mode FROM context_cache ORDER BY mode").fetch_all(&w.pool).await.unwrap();
+    assert_eq!(modes, ["full", "lean"]);
+    let again =
+        context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", Some(lean)).await.unwrap();
+    assert_eq!(again, md);
+
+    // Logged like a full call, under its mode; the hit repeats the render's counts.
+    let rows: Vec<(Option<String>, i32, i32)> = sqlx::query_as(
+        "SELECT injection, tokens, hits FROM retrieval_log WHERE injection = 'lean' ORDER BY created_at, id",
+    )
+    .fetch_all(&w.pool)
+    .await
+    .unwrap();
+    assert_eq!(rows.len(), 2, "{rows:?}");
+    assert_eq!(rows[0], rows[1]);
+    assert_eq!((rows[0].1, rows[0].2), (tokens, 1), "the pinned fact is the one memory selected");
+
+    // Nothing to remember still gets the rubric; a resume stays empty.
+    let bob = seed_identity(&w.pool, TokenKind::Device).await;
+    let empty = context::render_context(&w.state, &bob.identity, None, None, "startup", Some(lean)).await.unwrap();
+    assert_eq!(empty, format!("## Memory\n{}", render::LEAN_RUBRIC));
+    let resume = context::render_context(&w.state, &w.alice.identity, None, None, "resume", Some(lean)).await.unwrap();
+    assert_eq!(resume, "");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn injection_mode_precedence_and_per_mode_rerender(pool: PgPool) {
+    let w = world(pool).await;
+    seed(&w).await;
+    let id = &w.alice.identity;
+    let render = |mode| context::render_context(&w.state, id, Some(PROJECT), None, "startup", mode);
+
+    // Request > user default > full.
+    assert!(render(None).await.unwrap().contains("### Recent sessions"), "full without any setting");
+    settings::put(&w.state, id, UserSettings { injection_mode: InjectionMode::Lean }).await.unwrap();
+    assert!(render(None).await.unwrap().ends_with(render::LEAN_RUBRIC), "the user's default applies");
+    let full = render(Some(InjectionMode::Full)).await.unwrap();
+    assert!(full.contains("### Recent sessions"), "the request wins over the default");
+    // Changing the default needs no invalidation: the mode is part of the cache key.
+    settings::put(&w.state, id, UserSettings { injection_mode: InjectionMode::Full }).await.unwrap();
+    assert_eq!(render(None).await.unwrap(), full);
+    assert_eq!(settings::get(&w.state, id).await.unwrap().injection_mode, InjectionMode::Full);
+
+    // An invalidated lean block is queued, and re-rendered, as a lean block.
+    render(Some(InjectionMode::Lean)).await.unwrap();
+    let space = w.alice.space_id;
+    assert_eq!(cache::handle_payload(&w.state, &format!("{space}:project:{PROJECT}")).await.unwrap(), 2);
+    let jobs: Vec<Value> =
+        sqlx::query_scalar("SELECT payload FROM jobs WHERE type = 'render_context' ORDER BY payload->>'mode'")
+            .fetch_all(&w.pool)
+            .await
+            .unwrap();
+    let job_modes: Vec<&str> = jobs.iter().map(|j| j["mode"].as_str().unwrap()).collect();
+    assert_eq!(job_modes, ["full", "lean"]);
+    assert!(cache::rerender(&w.state, &jobs[1]).await.unwrap());
+    let rows: Vec<(String, String)> =
+        sqlx::query_as("SELECT mode, body_md FROM context_cache").fetch_all(&w.pool).await.unwrap();
+    assert_eq!(rows.len(), 1);
+    assert_eq!(rows[0].0, "lean");
+    assert!(rows[0].1.ends_with(render::LEAN_RUBRIC));
+    // A job queued before modes existed has none and renders the full block.
+    let mut legacy = jobs[0].clone();
+    legacy.as_object_mut().unwrap().remove("mode");
+    assert!(cache::rerender(&w.state, &legacy).await.unwrap());
+    let modes: Vec<String> =
+        sqlx::query_scalar("SELECT mode FROM context_cache ORDER BY mode").fetch_all(&w.pool).await.unwrap();
+    assert_eq!(modes, ["full", "lean"]);
 }

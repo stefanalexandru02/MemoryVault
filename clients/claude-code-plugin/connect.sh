@@ -1,15 +1,19 @@
 #!/usr/bin/env bash
 # Connects (or disconnects) this machine's Claude Code to a MemoryVault server.
 #
-#   connect.sh connect --url URL [--token TOKEN] [--device ID]
+#   connect.sh connect --url URL [--token TOKEN] [--device ID] [--injection lean|full]
 #       builds mem-hook, writes ~/.memory/config, installs the hook plugin, registers the MCP server and
-#       pre-approves its tools. Without --token the token already in ~/.memory/config is kept.
+#       pre-approves its tools. Without --token the token already in ~/.memory/config is kept. --injection
+#       writes MEM_INJECTION: "full" is the budgeted context block at session start, "lean" only the profile,
+#       open work and a short rubric for the search tools; without it the setting in the config (or, if there
+#       is none, the per-user default on the server) stays.
 #   connect.sh disconnect [--purge]
 #       undoes all of that and blanks the URL and token in ~/.memory/config; --purge deletes ~/.memory too
 #       (including undelivered events in ~/.memory/spool).
 #   connect.sh probe [--url URL] [--token TOKEN]
 #       exit 0 when the token authenticates against the server (defaults come from ~/.memory/config)
 #   connect.sh status
+#       what is configured and whether it works, plus the tokens served by recent context and recall calls
 #
 # Everything is idempotent. Settings touched: ~/.claude.json (MCP server "memory", user scope),
 # ~/.claude/settings.json (plugin, marketplace and the allow rule for the plugin's MCP tools, through the
@@ -130,16 +134,18 @@ allow_rule_step() {
 }
 
 cmd_connect() {
-  local url="" token="" device=""
+  local url="" token="" device="" injection=""
   while [ $# -gt 0 ]; do
     case $1 in
       --url) url=${2:?--url needs a value}; shift 2 ;;
       --token) token=${2:?--token needs a value}; shift 2 ;;
       --device) device=${2:?--device needs a value}; shift 2 ;;
+      --injection) injection=${2:?--injection needs a value}; shift 2 ;;
       *) die "unknown option '$1'" ;;
     esac
   done
   [ -n "$url" ] || die "--url is required"
+  case $injection in ""|lean|full) ;; *) die "--injection must be lean or full (got '$injection')" ;; esac
   url=$(normalize_url "$url")
   [ -n "$token" ] || token=$(cfg_get MEMORY_TOKEN)
   [ -n "$token" ] || die "no token: pass --token (or put MEMORY_TOKEN in $config)"
@@ -165,6 +171,7 @@ cmd_connect() {
   cfg_set MEMORY_URL "$url"
   cfg_set MEMORY_TOKEN "$token"
   cfg_set DEVICE_ID "$device"
+  [ -z "$injection" ] || cfg_set MEM_INJECTION "$injection"
   note "wrote $config"
 
   # Plugin: removed first so that a moved checkout or a new version is picked up.
@@ -244,6 +251,22 @@ cmd_probe() {
   token_check "$(normalize_url "$url")" "$token"
 }
 
+# Tokens served by this user's recent context and recall calls (GET $1/v1/stats/recall with bearer $2), one
+# line per call kind and injection mode. Prints nothing when the server cannot be asked.
+print_recall_stats() {
+  local body days rows
+  body=$(curl -fsS -m 10 -H "Authorization: Bearer $2" "$1/v1/stats/recall" 2>/dev/null) || return 0
+  days=$(printf '%s' "$body" | sed -n 's/.*"days":\([0-9]*\).*/\1/p')
+  rows=$(printf '%s' "$body" | sed 's/},{/}\n{/g' | sed -n 's/.*"mode":"\([a-z]*\)","injection":\(null\|"[a-z]*"\),"calls":\([0-9]*\),"avg_tokens":\([0-9.e+-]*\),"p50_tokens":\([0-9.e+-]*\),"p95_tokens":\([0-9.e+-]*\).*/\1 \2 \3 \4 \5 \6/p')
+  if [ -z "$rows" ]; then
+    echo "tokens   no context or recall calls in the last ${days:-7} days"
+    return 0
+  fi
+  echo "tokens   served per call over the last ${days:-7} days (avg / p50 / p95)"
+  printf '%s\n' "$rows" | awk '{ gsub(/"/, "", $2); if ($2 == "null") $2 = "-"
+    printf "         %-8s %-5s %5d calls  %6.0f /%6.0f /%6.0f\n", $1, $2, $3, $4, $5, $6 }'
+}
+
 cmd_status() {
   local url token
   url=$(cfg_get MEMORY_URL)
@@ -259,7 +282,13 @@ cmd_status() {
       1) echo "server   reachable, but the token was REJECTED (make connect-local or connect-remote again)" ;;
       *) echo "server   not reachable" ;;
     esac
+    if [ $rc = 0 ]; then
+      print_recall_stats "$url" "$token"
+    fi
   fi
+  local injection
+  injection=$(cfg_get MEM_INJECTION)
+  echo "inject   ${injection:-not set in the config: the per-user default on the server applies (full unless changed)}"
   if have claude; then
     if [ "$(claude plugin configure "$plugin@$marketplace" 2>/dev/null | grep -c ', set)')" = 2 ]; then
       echo "mcp      the plugin's MCP server has its URL and token"
@@ -283,5 +312,5 @@ case $sub in
   disconnect) cmd_disconnect "$@" ;;
   probe) cmd_probe "$@" ;;
   status) cmd_status ;;
-  *) sed -n '2,15p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; [ -z "$sub" ] || [ "$sub" = help ] || exit 2 ;;
+  *) sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; [ -z "$sub" ] || [ "$sub" = help ] || exit 2 ;;
 esac

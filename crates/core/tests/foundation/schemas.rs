@@ -1,11 +1,12 @@
 use chrono::{Duration, Utc};
+use memvault_core::schemas::common::InjectionMode;
 use memvault_core::schemas::common::{FeedbackVerdict, OutputSchemaName, Scope};
 use memvault_core::schemas::memories::{
     DISPUTE_THRESHOLD, FeedbackCounts, GetRequest, MemoryFeedbackRequest, MemoryItem, RememberRequest, SearchQuery,
     fact_caution, procedure_caution,
 };
 use memvault_core::schemas::outputs::{FactDecision, LlmOutput};
-use memvault_core::schemas::recall::{RecallFormat, RecallRequest};
+use memvault_core::schemas::recall::{ContextQuery, RecallFormat, RecallRequest, UserSettings};
 use memvault_core::schemas::validate::{OutputError, OutputSchemas, strip_code_fence};
 use memvault_core::schemas::work::LeaseRequest;
 use memvault_core::schemas::work_state::WorkStateQuery;
@@ -252,4 +253,18 @@ fn cautions_for_stale_and_disputed_memories() {
     assert_eq!(caution(0.1, 400, true, true), None, "pinned facts carry none");
     assert_eq!(procedure_caution(3, 1), None);
     assert_eq!(procedure_caution(1, 2).as_deref(), Some("disputed"));
+}
+
+#[test]
+fn injection_mode_spellings() {
+    assert_eq!(InjectionMode::default(), InjectionMode::Full);
+    assert_eq!("lean".parse::<InjectionMode>().unwrap(), InjectionMode::Lean);
+    assert!("fat".parse::<InjectionMode>().is_err());
+    assert_eq!(serde_json::to_value(InjectionMode::Lean).unwrap(), json!("lean"));
+    // A request names a mode or leaves the choice to the user's default; the settings body must name one.
+    let q: ContextQuery = serde_json::from_value(json!({"project_key": "p", "mode": "lean"})).unwrap();
+    assert_eq!(q.mode, Some(InjectionMode::Lean));
+    assert_eq!(serde_json::from_value::<ContextQuery>(json!({})).unwrap().mode, None);
+    assert!(serde_json::from_value::<ContextQuery>(json!({"mode": "fat"})).is_err());
+    assert!(serde_json::from_value::<UserSettings>(json!({})).is_err());
 }

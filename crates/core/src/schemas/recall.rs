@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::schemas::common::{Scope, Sensitivity, SummaryGrain};
+use crate::schemas::common::{InjectionMode, Scope, Sensitivity, SummaryGrain};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TaskState {
@@ -301,6 +301,48 @@ pub struct ContextQuery {
     pub device_id: Option<String>,
     #[serde(default)]
     pub source: ContextSource,
+    /// Overrides the user's default injection mode for this request.
+    #[serde(default)]
+    pub mode: Option<InjectionMode>,
+}
+
+/// `GET`/`PUT /v1/me/settings`: the caller's server-side defaults.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserSettings {
+    /// Injection mode of `GET /v1/context` when neither the request nor the client config names one.
+    pub injection_mode: InjectionMode,
+}
+
+/// `GET /v1/stats/recall` query.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct StatsQuery {
+    /// Window in days (default 7, at most 90).
+    #[serde(default)]
+    pub days: Option<u32>,
+    /// Admin tokens only: every user's calls instead of the caller's own.
+    #[serde(default)]
+    pub all: bool,
+}
+
+/// Tokens served by one kind of call (`context` or `recall`) in one injection mode over the window.
+/// `injection` is empty for `recall`, which has no mode.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct ModeStats {
+    pub mode: String,
+    pub injection: Option<InjectionMode>,
+    pub calls: i64,
+    pub avg_tokens: f64,
+    pub p50_tokens: f64,
+    pub p95_tokens: f64,
+    pub avg_hits: f64,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct RecallStats {
+    pub days: u32,
+    /// True when the numbers cover every user (admin with `all=true`).
+    pub all_users: bool,
+    pub modes: Vec<ModeStats>,
 }
 
 /// `POST /v1/recall/{retrieval_id}/feedback` (memories:write).

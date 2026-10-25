@@ -13,7 +13,7 @@ use chrono::{DateTime, Utc};
 use memvault_core::auth::resolve_read_spaces;
 use memvault_core::db::caps;
 use memvault_core::ids::new_id;
-use memvault_core::schemas::common::{MemoryTable, Scope, ScopeKind, Sensitivity, SummaryGrain};
+use memvault_core::schemas::common::{InjectionMode, MemoryTable, Scope, ScopeKind, Sensitivity, SummaryGrain};
 use memvault_core::schemas::memories::{
     AuditEntry, ByFileQuery, EntityRef, EvidenceObservation, ExplainResponse, FactFull, FeedbackCounts, GetResponse,
     HistoryEntry, HistoryResponse, IndexRow, MAX_GET_IDS, MemoryItem, ObservationFull, ProcedureFull, ProcedureStatus,
@@ -680,6 +680,12 @@ pub struct RetrievalRecord<'a> {
     pub scopes: &'a [Scope],
     pub budgets: Option<&'a Budgets>,
     pub latency_ms: i64,
+    /// Injection mode of a `context` call; `None` for `recall`.
+    pub injection: Option<InjectionMode>,
+    /// Tokens of the text returned (estimated).
+    pub tokens: i32,
+    /// Memories selected into the response.
+    pub hits: i32,
 }
 
 /// Insert a `retrieval_log` row (in the caller's `user_tx`) and return its id.
@@ -689,15 +695,37 @@ pub async fn log_retrieval(
     rec: RetrievalRecord<'_>,
     pack: &Pack,
 ) -> Result<Uuid, sqlx::Error> {
-    let id = new_id();
     let mut cands: Vec<&Candidate> = pack.candidates.iter().collect();
     cands.sort_by(|a, b| a.table.cmp(&b.table).then(by_score(a, b)));
     let logged: Vec<Value> = cands.iter().take(MAX_LOGGED_CANDIDATES).map(|c| c.log()).collect();
+    insert_retrieval(conn, identity, rec, Value::Array(logged), Value::Array(pack.selected.clone()), pack.reranked)
+        .await
+}
+
+/// Insert a `retrieval_log` row for a context block served from the cache: no candidates were ranked, so
+/// only what was served is recorded (the stats count every call, not only the renders).
+pub async fn log_cached_retrieval(
+    conn: &mut PgConnection,
+    identity: &Identity,
+    rec: RetrievalRecord<'_>,
+) -> Result<Uuid, sqlx::Error> {
+    insert_retrieval(conn, identity, rec, json!([]), json!([]), false).await
+}
+
+async fn insert_retrieval(
+    conn: &mut PgConnection,
+    identity: &Identity,
+    rec: RetrievalRecord<'_>,
+    candidates: Value,
+    selected: Value,
+    reranked: bool,
+) -> Result<Uuid, sqlx::Error> {
+    let id = new_id();
     let scopes: Vec<String> = rec.scopes.iter().map(Scope::as_text).collect();
     sqlx::query(
         "INSERT INTO retrieval_log (id, space_id, client_id, mode, query, scopes, budgets, candidates, selected,
-                                    latency_ms, reranked)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                                    latency_ms, reranked, injection, tokens, hits)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
     )
     .bind(id)
     .bind(rec.spaces[0])
@@ -706,10 +734,13 @@ pub async fn log_retrieval(
     .bind(rec.query)
     .bind(json!({ "space_ids": rec.spaces, "scopes": scopes }))
     .bind(rec.budgets.map(|b| json!(b)))
-    .bind(Value::Array(logged))
-    .bind(Value::Array(pack.selected.clone()))
+    .bind(candidates)
+    .bind(selected)
     .bind(i32::try_from(rec.latency_ms).unwrap_or(i32::MAX))
-    .bind(pack.reranked)
+    .bind(reranked)
+    .bind(rec.injection)
+    .bind(rec.tokens)
+    .bind(rec.hits)
     .execute(conn)
     .await?;
     Ok(id)
@@ -763,6 +794,9 @@ pub async fn recall(state: &AppState, identity: &Identity, req: RecallRequest) -
         scopes: &scopes,
         budgets: Some(&req.budgets),
         latency_ms,
+        injection: None,
+        tokens: pack.by_slot.values().sum(),
+        hits: i32::try_from(pack.selected.len()).unwrap_or(i32::MAX),
     };
     let retrieval_id = log_retrieval(&mut tx, identity, rec, &pack).await?;
     log_pack_access(&mut tx, identity, "recall", &pack.slots).await?;

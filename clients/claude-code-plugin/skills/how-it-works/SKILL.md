@@ -24,7 +24,11 @@ revoked by the server's admin. Local files: `~/.memory/config` (URL and device n
 and `cache/` (the last context block, shown if the server is down).
 
 **Recall.** At session start the hook injects a short context block: the profile, open work state, a hand-off
-from other devices and an index of recent observations. During a session the agent searches with
+from other devices and an index of recent observations (the `full` mode, about 1,000 tokens). A `lean` mode
+injects only the profile, open work state and a short rubric on when to call the search tools (300 to 400
+tokens): cheaper at every start, but recent work is then seen only if the agent searches for it. It is set with
+`MEM_INJECTION=lean` in `~/.memory/config` (`make connect-local INJECTION=lean`) or as the default in the viewer's
+header, and `make connect-status` shows the tokens each mode has served. During a session the agent searches with
 `memory_search`, `memory_timeline` and `memory_get`, and a hook mentions earlier work on a file the first time
 it is read. The `recall`, `brief` and `project-history` skills describe how to search well.
 

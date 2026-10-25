@@ -175,8 +175,12 @@ fn session_start(hook: &mut Hook) {
         return;
     }
     let key = &hook.target.project_key;
-    let query =
+    let mut query =
         format!("/v1/context?project_key={}&device_id={}&source={source}", encode(key), encode(&hook.app.cfg.device));
+    if let Some(mode) = &hook.app.cfg.injection {
+        query.push_str("&mode=");
+        query.push_str(mode);
+    }
     let fetched = hook.app.api.get(&query, CONTEXT_TIMEOUT).ok().filter(|r| r.ok());
     let block = match fetched {
         Some(resp) => {

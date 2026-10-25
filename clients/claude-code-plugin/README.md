@@ -22,7 +22,9 @@ A Claude Code plugin with four parts:
 - **Install and wiring scripts**: `install.sh` builds the binary, `connect.sh` wires a machine up in one step.
 
 The quick way, from the repository root: `make connect-local` (this machine's own stack) or
-`make connect-remote URL=... TOKEN=...`; `make disconnect` undoes it. The manual steps follow.
+`make connect-remote URL=... TOKEN=...`; `make disconnect` undoes it. Add `INJECTION=lean` to start sessions with
+only the profile, open work and a rubric for the search tools instead of the full block (see "Full and lean
+session context" in the main README); `make connect-status` shows the tokens served. The manual steps follow.
 
 Requirements on the machine: the `claude` CLI (the observer runs `claude -p`) and `git` (project
 detection). No Node, Python, `curl` or `jq`.
@@ -83,7 +85,7 @@ Headless runs that should use memory pass `--allowedTools "mcp__plugin_memory_me
 
 | Subcommand | Hook | Behavior |
 |---|---|---|
-| `session-start` | SessionStart | Replays the spool (oldest first, at most 1.5 s), posts a `system` event, fetches `GET /v1/context` (3 s) and prints it as `additionalContext`. On failure it prints the cached block from `~/.memory/cache/<project_key>.md` prefixed with `> memory: server unreachable, showing cached context from <time>`. On `resume` the event is posted but no context is returned. |
+| `session-start` | SessionStart | Replays the spool (oldest first, at most 1.5 s), posts a `system` event, fetches `GET /v1/context` (3 s; with `&mode=lean` or `&mode=full` when `MEM_INJECTION` is set) and prints it as `additionalContext`. On failure it prints the cached block from `~/.memory/cache/<project_key>.md` prefixed with `> memory: server unreachable, showing cached context from <time>`. On `resume` the event is posted but no context is returned. |
 | `prompt` | UserPromptSubmit | Posts `user_prompt`. Returns nothing. |
 | `tool` | PostToolUse | Posts `tool_use`. When the server answers `window_closed: true`, starts the observer. |
 | `tool-failure` | PostToolUseFailure | Posts `tool_failure`; same observer rule. |
@@ -167,7 +169,7 @@ leases packets of any session. Run it from cron on an always-on machine with `cl
 
 | Path | Content |
 |---|---|
-| `config` | `MEMORY_URL`, `MEMORY_TOKEN`, optional `DEVICE_ID`, `CLAUDE_BIN`, `MEMORY_ADMIN_TOKEN` (mode 0600) |
+| `config` | `MEMORY_URL`, `MEMORY_TOKEN`, optional `DEVICE_ID`, `CLAUDE_BIN`, `MEM_INJECTION` (`lean` or `full`), `MEMORY_ADMIN_TOKEN` (mode 0600) |
 | `exclude` | project keys to ignore |
 | `sessions/` | per-session cache: server session id, next sequence number, window, prompt count |
 | `spool/` | undelivered requests, one JSON line each |

@@ -447,6 +447,7 @@ fn server_checks(home: &Path, cfg: Option<&Config>) -> Vec<Check> {
         token: admin_token,
         device: cfg.device.clone(),
         claude_bin: cfg.claude_bin.clone(),
+        injection: None,
     });
     match api.get("/v1/admin/doctor", Duration::from_secs(10)) {
         Err(e) => vec![Check::warn(NAME, format!("not run: {e}"), "fix the server check first")],

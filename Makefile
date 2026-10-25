@@ -3,6 +3,7 @@
 # Quick start:
 #   make up                       # full stack with TEI (or `make up-lite` without the models)
 #   make connect-local            # wire Claude Code on this machine to the stack (token, hooks, MCP)
+#                                 # INJECTION=lean sends a ~400 token block at session start instead of the full one
 #   make disconnect               # undo that
 #   make connect-remote URL=https://memory.example.ts.net TOKEN=mem_...   # wire it to another server
 
@@ -123,12 +124,12 @@ connect-local: .env ## One step: mint a token for this machine, install the hook
 	  [ -n "$$tok" ] || { echo "$$out" >&2; exit 1; }; \
 	  echo "minted a token for $(HANDLE) on $(CLIENT)"; \
 	fi; \
-	$(CONNECT) connect --url "$(MEMORY_URL)" $${tok:+--token "$$tok"} --device "$(CLIENT)"
+	$(CONNECT) connect --url "$(MEMORY_URL)" $${tok:+--token "$$tok"} --device "$(CLIENT)" $(if $(INJECTION),--injection "$(INJECTION)")
 
 connect-remote: ## Same, for a server somewhere else: make connect-remote URL=https://... TOKEN=mem_...
 	@[ "$(origin URL)" = "command line" ] && [ "$(origin TOKEN)" = "command line" ] \
-	  || { echo "usage: make connect-remote URL=https://memory.example.ts.net TOKEN=mem_... [CLIENT=device-name]" >&2; exit 2; }
-	@$(CONNECT) connect --url "$(URL)" --token "$(TOKEN)" --device "$(CLIENT)"
+	  || { echo "usage: make connect-remote URL=https://memory.example.ts.net TOKEN=mem_... [CLIENT=device-name] [INJECTION=lean|full]" >&2; exit 2; }
+	@$(CONNECT) connect --url "$(URL)" --token "$(TOKEN)" --device "$(CLIENT)" $(if $(INJECTION),--injection "$(INJECTION)")
 
 connect-status: ## Show what Claude Code is connected to and whether it works
 	@$(CONNECT) status

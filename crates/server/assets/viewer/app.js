@@ -79,6 +79,7 @@
     loading: false,
     selected: null, // {id, table}
     live: true,
+    injection: null, // 'full' | 'lean': the user's default for what a session starts with; null when unknown
   };
   const PAGE = 50;
 
@@ -187,6 +188,7 @@
     state.selected = null;
     state.me = await api('/v1/me');
     state.admin = (state.me.scopes || []).includes('admin');
+    try { state.injection = (await api('/v1/me/settings')).injection_mode; } catch { state.injection = null; }
     renderShell();
     refreshHealth();
     stopTimers();
@@ -210,10 +212,34 @@
         h('div', { class: 'brand' }, h('i'), 'MemoryVault'),
         $tabs,
         h('div', { class: 'spacer' }),
-        $health, who,
+        $health, who, injectionToggle(),
         h('button', { class: 'btn small', onclick: toggleTheme, title: 'Switch light and dark' }, 'Theme'),
         h('button', { class: 'btn small', onclick: () => signOut(''), title: 'Forget this token in this browser' }, 'Sign out')),
       $main));
+  }
+
+  // The user's default injection mode (PUT /v1/me/settings). A MEM_INJECTION in a client's ~/.memory/config
+  // and a mode in the request take precedence over it.
+  const INJECTION_MODES = [['full', 'Full context'], ['lean', 'Lean context']];
+  function injectionToggle() {
+    if (!state.injection) return null;
+    const sel = h('select', {
+      class: 'input small', 'aria-label': 'Session start context',
+      title: 'What a new session starts with: the full memory block, or only the profile, open work and a rubric for the search tools. A client set to MEM_INJECTION overrides this.',
+      onchange: async (e) => {
+        const mode = e.target.value;
+        try {
+          await api('/v1/me/settings', { method: 'PUT', body: { injection_mode: mode } });
+          state.injection = mode;
+          toast(`New sessions start with the ${mode} context`);
+        } catch (err) {
+          e.target.value = state.injection;
+          if (err.status !== 401) toast(err.message, true);
+        }
+      },
+    }, INJECTION_MODES.map(([value, label]) => h('option', { value, text: label })));
+    sel.value = state.injection;
+    return sel;
   }
 
   async function refreshHealth() {
@@ -681,7 +707,8 @@
     $main.replaceChildren(h('div', { class: 'page' }, h('div', { class: 'page-inner' },
       h('h2', { text: 'Work state' }),
       h('p', { class: 'muted', text: 'Open lists agents keep per project, like todo or handoff. Later writes win; they are shown at the start of every session until closed.' }),
-      h('div', { class: 'toolbar' }, h('label', { class: 'field' }, h('span', { text: 'Scope' }), sel)), out)));
+      h('div', { class: 'toolbar' }, h('label', { class: 'field' }, h('span', { text: 'Scope' }), sel)), out,
+      statsPanel())));
     async function fill() {
       out.replaceChildren(h('div', { class: 'muted', text: 'Loading…' }));
       try {
@@ -695,6 +722,36 @@
       } catch (e) { if (e.status !== 401) out.replaceChildren(h('div', { class: 'error', text: e.message })); }
     }
     fill();
+  }
+
+  // Tokens served per session start (by injection mode) and per recall (GET /v1/stats/recall).
+  const CALL_LABELS = { context: 'Session start', recall: 'Recall' };
+  function statsPanel() {
+    const days = h('select', { class: 'input', 'aria-label': 'Window', onchange: () => load() },
+      [1, 7, 30, 90].map((d) => h('option', { value: String(d), text: d === 1 ? 'Last day' : `Last ${d} days` })));
+    days.value = '7';
+    const all = state.admin ? h('input', { type: 'checkbox', onchange: () => load() }) : null;
+    const out = h('div', {});
+    async function load() {
+      out.replaceChildren(h('div', { class: 'muted', text: 'Loading…' }));
+      try {
+        const stats = await api(`/v1/stats/recall?days=${days.value}${all && all.checked ? '&all=true' : ''}`);
+        if (!stats.modes.length) { out.replaceChildren(h('div', { class: 'empty', text: 'No context or recall calls in this window.' })); return; }
+        const num = (v) => h('td', { class: 'num', text: Math.round(v).toLocaleString() });
+        out.replaceChildren(h('div', { class: 'scroll-x' }, h('table', { class: 't' },
+          h('thead', {}, h('tr', {}, ['Call', 'Mode', 'Calls', 'Avg tokens', 'p50', 'p95', 'Avg memories'].map((c) => h('th', { text: c })))),
+          h('tbody', {}, stats.modes.map((m) => h('tr', {},
+            h('td', { text: CALL_LABELS[m.mode] || m.mode }), h('td', { text: m.injection || '–' }),
+            num(m.calls), num(m.avg_tokens), num(m.p50_tokens), num(m.p95_tokens), h('td', { class: 'num', text: m.avg_hits.toFixed(1) })))))));
+      } catch (e) { if (e.status !== 401) out.replaceChildren(h('div', { class: 'error', text: e.message })); }
+    }
+    load();
+    return h('div', { class: 'page-inner' },
+      h('h2', { text: 'Tokens served' }),
+      h('p', { class: 'muted', text: 'Estimated tokens per call. The full context is a budgeted block with recent observations and sessions (about 1,000 tokens); the lean context is the profile, open work and a short rubric (about 400) and leaves the rest to the search tools. Change the default in the header.' }),
+      h('div', { class: 'toolbar' }, h('label', { class: 'field' }, h('span', { text: 'Window' }), days),
+        all ? h('label', { class: 'field' }, h('span', { text: 'All users' }), all) : null),
+      out);
   }
 
   // ---------- admin ----------
