@@ -31,6 +31,31 @@ and the rationale is in [docs/architecture.md](docs/architecture.md).
 
 `CONTRACTS.md` records crate ownership, cross-crate interfaces and conventions.
 
+## Run it locally with Docker Compose
+
+`docker-compose.yml` runs the whole server on one machine: Postgres (ParadeDB, which bundles pgvector and
+`pg_search`), the two TEI servers, migrations, the API, the worker and a scheduler that runs a consolidation
+planning pass once a day. The `Makefile` wraps it; `make` lists every target.
+
+```bash
+make up              # creates .env with fresh secrets, builds the image, starts everything
+make bootstrap       # user $(whoami) + a device token for this host; prints the client config
+make install-plugin  # builds mem-hook and sets up ~/.memory (see below)
+make mcp-add         # claude mcp add ... with ${MEMORY_URL}/${MEMORY_TOKEN} references
+```
+
+The first `make up` downloads the TEI models (about 4.5 GB) into a volume. `make up-lite` skips TEI and
+uses the fake deterministic embedder: the plumbing works, recall quality does not. Run `make reindex` after
+moving from `up-lite` to `up`.
+
+Other targets: `make logs SERVICE=api`, `make ps`, `make down` (keeps data), `make psql`,
+`make consolidate`, `make admin ARGS="space list"`, `make token HANDLE=alex CLIENT=desktop KIND=runner`,
+`make test` (the Rust suite against the compose Postgres) and `make clean` (deletes the volumes, asks first).
+
+The API and Postgres bind to `127.0.0.1` by default. To serve other machines, set `BIND_ADDR` in `.env`
+to the host's LAN or Tailscale address and use `MEMORY_URL=http://<that address>:8000` on the clients.
+`.env` holds `TOKEN_PEPPER`; tokens stop working if it changes, so back it up.
+
 ## Local development
 
 ### Toolchain
@@ -40,8 +65,9 @@ Install Rust 1.89 or newer with `rustup`. The workspace uses edition 2024. Forma
 
 ### Test Postgres
 
-The tests need Postgres 16 with pgvector (0.6 or newer). Start one on `127.0.0.1:55432` with user
-`postgres` and trust authentication. `.cargo/config.toml` sets:
+The tests need Postgres 16 or newer with pgvector (0.6 or newer). Either run `make test`, which uses the
+compose Postgres, or start one on `127.0.0.1:55432` with user `postgres` and trust authentication.
+`.cargo/config.toml` sets:
 
 ```
 DATABASE_URL=postgres://postgres@127.0.0.1:55432/postgres
