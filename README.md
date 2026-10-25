@@ -21,7 +21,8 @@ and the rationale is in [docs/architecture.md](docs/architecture.md).
 | `crates/evals` | Session recorder, redaction, replay, comparison with claude-mem |
 | `crates/server` | The `memvault` binary: `serve`, `worker`, `planner`, `admin`, `evals` (and `migrate`, which `serve` already runs at start-up) |
 | `crates/mem-hook` | The `mem-hook` binary for Claude Code hooks and the observer |
-| `clients/claude-code-plugin` | Plugin manifest, hook wiring, `install.sh`, plugin README |
+| `clients/claude-code-plugin` | Plugin manifest, hook wiring, `install.sh`, `connect.sh`, plugin README |
+| `clients` | Client overview: Codex CLI, Gemini CLI, the generic hook adapter |
 | `migrations` | SQL migrations, applied in order by `memvault serve` as it starts |
 | `prompts`, `schemas` | Observer and consolidation prompts (YAML) and their JSON output schemas |
 | `evals` | Recorded sessions, questions, gold facts and the recall baseline |
@@ -57,7 +58,9 @@ make connect-remote URL=https://memory.<tailnet>.ts.net TOKEN=mem_...   # the sa
 `make disconnect` keeps `~/.memory/spool` and `sessions` (add `PURGE=1` to delete them). Tokens of a
 remote server stay valid until its admin revokes them. All three targets call
 `clients/claude-code-plugin/connect.sh`, which you can also run directly. Add `INJECTION=lean` (or `full`) to
-`connect-local` or `connect-remote` to set the session-start context mode below.
+`connect-local` or `connect-remote` to set the session-start context mode below. `AGENT=codex` or `AGENT=gemini`
+on `connect-local`, `connect-remote` and `disconnect` wires Codex CLI or Gemini CLI instead of Claude Code
+([clients/README.md](clients/README.md)).
 
 The first `make up` downloads the TEI models (about 4.5 GB) into a volume. `make up-lite` skips TEI and
 uses the fake deterministic embedder: the plumbing works, recall quality does not. Run `make reindex` after
@@ -391,4 +394,5 @@ ScaledObject in the base), and export and import per space.
 
 - [docs/deviations.md](docs/deviations.md): every deviation from the spec, with its reason.
 - [CONTRACTS.md](CONTRACTS.md): ownership, interfaces and conventions.
+- [clients/README.md](clients/README.md): Codex CLI, Gemini CLI and the generic `mem-hook event` adapter, with sources.
 - [clients/claude-code-plugin/README.md](clients/claude-code-plugin/README.md): hook behaviour, the observer, files under `~/.memory`.

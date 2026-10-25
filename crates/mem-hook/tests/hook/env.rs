@@ -93,6 +93,16 @@ impl TestEnv {
         Self::finish(self.command(&[event]), Some(input.to_string()))
     }
 
+    /// Runs `mem-hook event --client <client>` with the JSON on stdin.
+    pub fn event(&self, client: &str, input: &Value) -> Out {
+        Self::finish(self.command(&["event", "--client", client]), Some(input.to_string()))
+    }
+
+    /// Runs `mem-hook <args>` with `stdin`.
+    pub fn run(&self, args: &[&str], stdin: &str) -> Out {
+        Self::finish(self.command(args), Some(stdin.to_string()))
+    }
+
     pub fn hook_raw(&self, event: &str, stdin: &str) -> Out {
         Self::finish(self.command(&[event]), Some(stdin.to_string()))
     }

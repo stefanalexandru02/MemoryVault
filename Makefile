@@ -5,6 +5,7 @@
 #   make connect-local            # wire Claude Code on this machine to the stack (token, hooks, MCP)
 #                                 # INJECTION=lean sends a ~400 token block at session start instead of the full one
 #   make disconnect               # undo that
+#   make connect-local AGENT=codex    # the same for Codex CLI (AGENT=gemini for Gemini CLI); make disconnect AGENT=codex
 #   make connect-remote URL=https://memory.example.ts.net TOKEN=mem_...   # wire it to another server
 
 COMPOSE ?= docker compose
@@ -12,6 +13,7 @@ HANDLE  ?= $(shell whoami)
 NAME    ?= $(HANDLE)
 CLIENT  ?= $(shell hostname -s 2>/dev/null || hostname)
 KIND    ?= device
+AGENT   ?=
 SERVICE ?=
 
 ifneq (,$(wildcard .env))
@@ -111,7 +113,7 @@ doctor: ## Why is nothing remembered? Checks this machine, then the server (serv
 	@[ -x "$(MEM_HOOK)" ] || { echo "mem-hook is not built: run 'make install-plugin' first" >&2; exit 1; }
 	@$(MEM_HOOK) doctor --server
 
-connect-local: .env ## One step: mint a token for this machine, install the hooks and MCP server in Claude Code
+connect-local: .env ## One step: mint a token for this machine, install the hooks and MCP server (AGENT=codex|gemini for those CLIs)
 	@curl -fsS -o /dev/null -m 5 "$(MEMORY_URL)/health" \
 	  || { echo "the API is not answering at $(MEMORY_URL): run 'make up' (or 'make up-lite') first" >&2; exit 1; }
 	@set -e; tok=""; \
@@ -124,19 +126,21 @@ connect-local: .env ## One step: mint a token for this machine, install the hook
 	  [ -n "$$tok" ] || { echo "$$out" >&2; exit 1; }; \
 	  echo "minted a token for $(HANDLE) on $(CLIENT)"; \
 	fi; \
-	$(CONNECT) connect --url "$(MEMORY_URL)" $${tok:+--token "$$tok"} --device "$(CLIENT)" $(if $(INJECTION),--injection "$(INJECTION)")
+	$(CONNECT) connect --url "$(MEMORY_URL)" $${tok:+--token "$$tok"} --device "$(CLIENT)" $(if $(INJECTION),--injection "$(INJECTION)") $(if $(AGENT),--client "$(AGENT)")
 
 connect-remote: ## Same, for a server somewhere else: make connect-remote URL=https://... TOKEN=mem_...
 	@[ "$(origin URL)" = "command line" ] && [ "$(origin TOKEN)" = "command line" ] \
-	  || { echo "usage: make connect-remote URL=https://memory.example.ts.net TOKEN=mem_... [CLIENT=device-name] [INJECTION=lean|full]" >&2; exit 2; }
-	@$(CONNECT) connect --url "$(URL)" --token "$(TOKEN)" --device "$(CLIENT)" $(if $(INJECTION),--injection "$(INJECTION)")
+	  || { echo "usage: make connect-remote URL=https://memory.example.ts.net TOKEN=mem_... [CLIENT=device-name] [INJECTION=lean|full] [AGENT=codex|gemini]" >&2; exit 2; }
+	@$(CONNECT) connect --url "$(URL)" --token "$(TOKEN)" --device "$(CLIENT)" $(if $(INJECTION),--injection "$(INJECTION)") $(if $(AGENT),--client "$(AGENT)")
 
-connect-status: ## Show what Claude Code is connected to and whether it works
+connect-status: ## Show what Claude Code, Codex CLI and Gemini CLI are connected to and whether it works
 	@$(CONNECT) status
 
-disconnect: ## Remove the hooks, MCP server and token from this machine (PURGE=1 also deletes ~/.memory)
+disconnect: ## Remove the hooks, MCP server and token from this machine (PURGE=1 also deletes ~/.memory; AGENT=codex|gemini only that CLI)
 	@# A token minted by this stack is revoked too. Tokens of other servers are left to their admins.
-	@cfg="$${MEMORY_HOME:-$$HOME/.memory}/config"; \
+	@# Codex and Gemini share the token with the other clients on this machine, so only their entries go.
+	@if [ -n "$(AGENT)" ] && [ "$(AGENT)" != claude ]; then $(CONNECT) disconnect --client "$(AGENT)" $(if $(PURGE),--purge); exit 0; fi; \
+	cfg="$${MEMORY_HOME:-$$HOME/.memory}/config"; \
 	tok=$$(sed -n 's/^MEMORY_TOKEN=//p' "$$cfg" 2>/dev/null | tail -n 1); \
 	url=$$(sed -n 's/^MEMORY_URL=//p' "$$cfg" 2>/dev/null | tail -n 1); \
 	prefix=$$(printf '%s' "$$tok" | cut -d_ -f2); \

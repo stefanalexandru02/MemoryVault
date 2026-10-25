@@ -26,6 +26,8 @@ The quick way, from the repository root: `make connect-local` (this machine's ow
 `make connect-remote URL=... TOKEN=...`; `make disconnect` undoes it. Add `INJECTION=lean` to start sessions with
 only the profile, open work and a rubric for the search tools instead of the full block (see "Full and lean
 session context" in the main README); `make connect-status` shows the tokens served. The manual steps follow.
+Codex CLI and Gemini CLI can be wired to the same server (`make connect-local AGENT=codex|gemini`); see
+[clients/README.md](../README.md), which also documents the generic `mem-hook event --client <name>` input.
 
 Requirements on the machine: the `claude` CLI (the observer runs `claude -p`) and `git` (project
 detection). No Node, Python, `curl` or `jq`.
@@ -94,6 +96,7 @@ Headless runs that should use memory pass `--allowedTools "mcp__plugin_memory_me
 | `stop` | Stop | Posts `assistant_message` and starts the observer. Nothing is posted while `stop_hook_active` is true. |
 | `subagent-stop` | SubagentStop | Posts `subagent_stop`. |
 | `session-end` | SessionEnd | `POST /v1/sessions/{id}/end` within a 1 s budget, then starts the observer with `--final`. |
+| `event --client <name>` | other agent CLIs | One JSON event on stdin (start, prompt, tool, assistant, end), through the same delivery and spool; the session is recorded under `<name>`. See [clients/README.md](../README.md). |
 | `observe` | (spawned) | The observer runner, below. |
 | `doctor` | (by hand) | Diagnosis, below. Unlike the hooks it prints to the terminal and exits 1 when a check fails. |
 | `ingest` | (by hand) | Sends docs to the server, below. Prints to the terminal and exits 1 when a file failed. |
@@ -197,7 +200,7 @@ leases packets of any session. Run it from cron on an always-on machine with `cl
 |---|---|
 | `config` | `MEMORY_URL`, `MEMORY_TOKEN`, optional `DEVICE_ID`, `CLAUDE_BIN`, `MEM_INJECTION` (`lean` or `full`), `MEMORY_ADMIN_TOKEN` (mode 0600) |
 | `exclude` | project keys to ignore |
-| `sessions/` | per-session cache: server session id, next sequence number, window, prompt count |
+| `sessions/` | per-session cache: server session id, next sequence number, window, prompt count (`<client>_<id>` for sessions of other clients) |
 | `spool/` | undelivered requests, one JSON line each |
 | `last-delivery` | modification time = last request the server accepted (for `doctor`) |
 | `cache/` | last context block per project |

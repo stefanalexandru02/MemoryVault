@@ -1,7 +1,8 @@
 //! mem-hook: the Claude Code hook binary (spec 8). One subcommand per hook event
 //! (`session-start`, `prompt`, `tool`, `tool-failure`, `stop`, `subagent-stop`, `session-end`, `file-context`)
-//! plus `observe` (the observer runner; `observe --all` is the nightly runner), `doctor` (diagnosis) and
-//! `ingest` (send a project's docs to the server).
+//! plus `observe` (the observer runner; `observe --all` is the nightly runner), `doctor` (diagnosis),
+//! `ingest` (send a project's docs to the server) and `event --client <name>` (the generic input adapter for
+//! other agent CLIs: one JSON event on stdin).
 //!
 //! Blocking HTTP with `ureq`, no async runtime, no dependency on memvault-core. A hook never
 //! fails Claude Code: whatever goes wrong, the process exits 0. `doctor` and `ingest` are run by hand and report
@@ -39,10 +40,14 @@ fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
     match args.first().map(String::as_str) {
         Some("observe") => observe::run(&args[1..]),
+        Some("event") => match args.get(1).map(String::as_str).zip(args.get(2)) {
+            Some(("--client", client)) => hooks::run_generic(client),
+            _ => eprintln!("usage: mem-hook event --client <name>   (one JSON event on stdin)"),
+        },
         Some(event) => hooks::run(event),
         None => {
             eprintln!(
-                "usage: mem-hook <session-start|prompt|tool|tool-failure|stop|subagent-stop|session-end|file-context|observe|doctor|ingest>"
+                "usage: mem-hook <session-start|prompt|tool|tool-failure|stop|subagent-stop|session-end|file-context|event --client <name>|observe|doctor|ingest>"
             )
         }
     }

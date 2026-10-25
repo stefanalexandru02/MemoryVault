@@ -29,9 +29,20 @@ impl App {
     }
 }
 
+/// The `harness` of sessions recorded by the Claude Code hooks; spool lines written before the field existed carry it.
+pub const CLAUDE_CODE: &str = "claude-code";
+
+fn claude_code() -> String {
+    CLAUDE_CODE.into()
+}
+
 /// Identifies the session an entry belongs to; also what is needed to create it on the server.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Target {
+    /// The agent CLI that produced the session (`claude-code`, `codex`, `gemini`, ...).
+    #[serde(default = "claude_code")]
+    pub harness: String,
+    /// The client's session id, namespaced by harness for every harness but Claude Code.
     pub claude_session_id: String,
     pub project_key: String,
     pub cwd: String,
@@ -177,7 +188,7 @@ fn ensure_session(app: &App, target: &Target, deadline: &Deadline) -> Result<Str
         return Ok(id);
     }
     let body = json!({
-        "harness": "claude-code",
+        "harness": target.harness,
         "external_session_id": target.claude_session_id,
         "project_key": target.project_key,
         "cwd": target.cwd,

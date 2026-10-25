@@ -1,24 +1,30 @@
 #!/usr/bin/env bash
-# Connects (or disconnects) this machine's Claude Code to a MemoryVault server.
+# Connects (or disconnects) this machine's Claude Code, Codex CLI or Gemini CLI to a MemoryVault server.
 #
-#   connect.sh connect --url URL [--token TOKEN] [--device ID] [--injection lean|full]
+#   connect.sh connect --url URL [--token TOKEN] [--device ID] [--injection lean|full] [--client claude|codex|gemini]
 #       builds mem-hook, writes ~/.memory/config, installs the hook plugin, registers the MCP server and
 #       pre-approves its tools. Without --token the token already in ~/.memory/config is kept. --injection
 #       writes MEM_INJECTION: "full" is the budgeted context block at session start, "lean" only the profile,
 #       open work and a short rubric for the search tools; without it the setting in the config (or, if there
-#       is none, the per-user default on the server) stays.
-#   connect.sh disconnect [--purge]
+#       is none, the per-user default on the server) stays. --client picks the agent CLI (default claude):
+#       codex and gemini register the MCP server and the `mem-hook event --client ...` hooks in that tool's own
+#       config file (see clients/README.md).
+#   connect.sh disconnect [--client claude|codex|gemini] [--purge]
 #       undoes all of that and blanks the URL and token in ~/.memory/config; --purge deletes ~/.memory too
-#       (including undelivered events in ~/.memory/spool).
+#       (including undelivered events in ~/.memory/spool). For codex and gemini it removes exactly the entries
+#       connect added and leaves ~/.memory alone.
 #   connect.sh probe [--url URL] [--token TOKEN]
 #       exit 0 when the token authenticates against the server (defaults come from ~/.memory/config)
 #   connect.sh status
 #       what is configured and whether it works, plus the tokens served by recent context and recall calls
 #
-# Everything is idempotent. Settings touched: ~/.claude.json (MCP server "memory", user scope),
+# Everything is idempotent. Settings touched for Claude Code: ~/.claude.json (MCP server "memory", user scope),
 # ~/.claude/settings.json (plugin, marketplace and the allow rule for the plugin's MCP tools, through the
 # claude CLI and a JSON edit), the plugin's own settings (URL in settings.json, token in the keychain or
-# ~/.claude/.credentials.json) and ~/.memory/config. Set MEMORY_HOME to use another memory home.
+# ~/.claude/.credentials.json) and ~/.memory/config. Codex CLI: one marked block in ~/.codex/config.toml. Gemini
+# CLI: the mcpServers.memory key and the hooks named "memoryvault" in ~/.gemini/settings.json. A backup of those
+# files is kept next to them (*.memoryvault.bak) from the first change until disconnect. Set MEMORY_HOME to use
+# another memory home.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -26,6 +32,10 @@ repo=$(cd "$here/../.." && pwd)
 memory_home=${MEMORY_HOME:-$HOME/.memory}
 config=$memory_home/config
 claude_settings=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json
+codex_config=${CODEX_HOME:-$HOME/.codex}/config.toml
+gemini_settings=${GEMINI_CLI_HOME:-$HOME}/.gemini/settings.json
+codex_begin='# >>> memoryvault (managed by connect.sh; disconnect removes this block) >>>'
+codex_end='# <<< memoryvault <<<'
 marketplace=memoryvault
 plugin=memory
 # The plugin's MCP server is mcp__plugin_<plugin>_<server>. The legacy rule belongs to the user-scope entry
@@ -36,6 +46,8 @@ legacy_allow_rule='mcp__memory__*'
 die() { echo "error: $*" >&2; exit 1; }
 note() { echo "  $*"; }
 have() { command -v "$1" >/dev/null 2>&1; }
+scratch=""
+trap 'rm -f "$scratch"' EXIT
 
 # Value of KEY in the config file (the last uncommented assignment), or nothing.
 cfg_get() { [ -f "$config" ] && sed -n "s/^$1=//p" "$config" | tail -n 1 || true; }
@@ -133,10 +145,263 @@ allow_rule_step() {
   esac
 }
 
+# --- Codex CLI and Gemini CLI ---------------------------------------------------------------------------------
+# Both get the MCP server and the hooks that feed `mem-hook event --client <name>`. Each tool's own config file is
+# only touched through the entries listed in the header, after a backup, and not at all when it cannot be parsed.
+
+# The hook command line; it sits inside quotes in TOML and JSON, so characters the shell would expand are refused.
+hook_command() {
+  case $here in *[\"\'\`\$\\]*) die "the checkout path must not contain quotes, backticks, \$ or backslashes (got '$here')" ;; esac
+  printf '"%s/bin/mem-hook" event --client %s' "$here" "$1"
+}
+
+# Adds ($1 = add) or removes ($1 = remove) our entries in the Gemini CLI user settings. Prints "mcp-skipped" when
+# a server named "memory" that is not ours is already there (it is left alone). Exit 0 done, 3 the file is not
+# the JSON object this expects (nothing is written), 4 python3 is not installed.
+edit_gemini_settings() {
+  local action=$1 mcp_url=${2:-} token=${3:-} command=${4:-}
+  have python3 || return 4
+  mkdir -p "$(dirname "$gemini_settings")"
+  python3 -I - "$gemini_settings" "$action" "$mcp_url" "$token" "$command" <<'PY'
+import json, os, shutil, sys, tempfile
+path, action, mcp_url, token, command = sys.argv[1:6]
+NAME = "memoryvault"
+# (event, timeout in ms): Gemini runs hooks synchronously, so the budgets are short.
+EVENTS = [("SessionStart", 10000), ("BeforeAgent", 5000), ("AfterTool", 5000), ("AfterAgent", 5000), ("SessionEnd", 2000)]
+backup = path + ".memoryvault.bak"
+
+def ours_server(v):
+    headers = v.get("headers") if isinstance(v, dict) else None
+    auth = headers.get("Authorization") if isinstance(headers, dict) else None
+    return isinstance(auth, str) and auth.startswith("Bearer mem_") and str(v.get("httpUrl", "")).endswith("/mcp")
+
+def ours_hook(h):
+    return isinstance(h, dict) and h.get("name") == NAME
+
+def strip_hooks(hooks):
+    """Drops our hooks (and the groups and events that held only them); returns whether anything went."""
+    changed = False
+    for event in list(hooks):
+        groups = hooks[event]
+        if not isinstance(groups, list):
+            continue
+        kept = []
+        for g in groups:
+            inner = g.get("hooks") if isinstance(g, dict) else None
+            if isinstance(inner, list) and any(ours_hook(h) for h in inner):
+                changed = True
+                inner = [h for h in inner if not ours_hook(h)]
+                if not inner:
+                    continue
+                g = dict(g, hooks=inner)
+            kept.append(g)
+        if len(kept) != len(groups):
+            if kept:
+                hooks[event] = kept
+            else:
+                del hooks[event]
+    return changed
+
+try:
+    raw = open(path).read() if os.path.exists(path) else ""
+    data = json.loads(raw) if raw.strip() else {}
+    servers = data.get("mcpServers", {})
+    hooks = data.get("hooks", {})
+    if not isinstance(servers, dict) or not isinstance(hooks, dict):
+        raise ValueError
+except (ValueError, AttributeError):
+    sys.exit(3)
+
+existed = os.path.exists(path)
+had_ours = ours_server(servers.get("memory")) or any(
+    ours_hook(h) for gs in hooks.values() if isinstance(gs, list)
+    for g in gs if isinstance(g, dict) and isinstance(g.get("hooks"), list) for h in g["hooks"])
+emptied_hooks = bool(hooks)
+removed_hooks = strip_hooks(hooks)
+if action == "add":
+    if existed and not had_ours:
+        shutil.copy2(path, backup)
+    if "memory" in servers and not ours_server(servers["memory"]):
+        print("mcp-skipped")
+    else:
+        servers["memory"] = {"httpUrl": mcp_url, "headers": {"Authorization": "Bearer " + token}}
+        data["mcpServers"] = servers
+    for event, timeout in EVENTS:
+        group = {"hooks": [{"name": NAME, "type": "command", "command": command, "timeout": timeout}]}
+        if event == "AfterTool":
+            group["matcher"] = "*"
+        hooks.setdefault(event, []).append(group)
+    data["hooks"] = hooks
+else:
+    if ours_server(servers.get("memory")):
+        del servers["memory"]
+        if not servers:
+            del data["mcpServers"]
+    if removed_hooks and not hooks and emptied_hooks:
+        del data["hooks"]
+    if not had_ours:
+        sys.exit(0)
+    if os.path.exists(backup):
+        if json.load(open(backup)) == data:
+            shutil.copy2(backup, path)
+            os.remove(backup)
+            sys.exit(0)
+        os.remove(backup)
+    if not data:
+        os.remove(path)
+        sys.exit(0)
+
+fd, tmp = tempfile.mkstemp(dir=os.path.dirname(path), prefix=".settings.")
+with os.fdopen(fd, "w") as f:
+    json.dump(data, f, indent=2)
+    f.write("\n")
+os.chmod(tmp, os.stat(path).st_mode & 0o777 if existed else 0o600)
+os.replace(tmp, path)
+PY
+}
+
+gemini_step() {
+  local action=$1 rc=0 out
+  out=$(edit_gemini_settings "$@") || rc=$?
+  case $rc in
+    0) ;;
+    3) echo "warning: $gemini_settings is not a JSON object I can edit (comments? wrong shape?); nothing was changed there" >&2; return 1 ;;
+    *) echo "warning: python3 is needed to edit $gemini_settings; nothing was changed there" >&2; return 1 ;;
+  esac
+  if [ "$action" = remove ]; then
+    note "removed the memory server and the memoryvault hooks from $gemini_settings"
+  elif [ "$out" = mcp-skipped ]; then
+    echo "warning: $gemini_settings already has an MCP server named 'memory' that is not ours; left it alone" >&2
+    note "registered the hooks in $gemini_settings"
+  else
+    note "registered the MCP server and the hooks in $gemini_settings (the token is stored there)"
+  fi
+  [ ! -f "$gemini_settings.memoryvault.bak" ] || note "kept your original as $gemini_settings.memoryvault.bak"
+}
+
+# The config file without our marked block (and the blank line that precedes it).
+codex_without_block() {
+  awk -v b="$codex_begin" -v e="$codex_end" '
+    skip { if ($0 == e) skip = 0; next }
+    $0 == b { skip = 1; held = 0; next }
+    held { print ""; held = 0 }
+    $0 == "" { held = 1; next }
+    { print }
+    END { if (held) print "" }' "$1"
+}
+
+# Does $1 (a config file) define the Codex MCP server "memory" itself / any of the hook events we use?
+codex_has_memory_server() {
+  grep -Eq "^[[:space:]]*(\[mcp_servers\.[\"']?memory[\"']?[].]|mcp_servers[[:space:]]*=|mcp_servers\.[\"']?memory[\"']?[[:space:].=])" "$1"
+}
+codex_has_own_hooks() {
+  local ev='(SessionStart|UserPromptSubmit|PostToolUse|Stop|SessionEnd)'
+  grep -Eq "^[[:space:]]*(hooks[[:space:]]*=|hooks\.$ev[[:space:].=]|$ev[[:space:]]*=)" "$1"
+}
+
+# 0 when $1 parses as TOML or this machine cannot tell (no python3 with tomllib), 1 when it does not.
+toml_ok() {
+  have python3 || return 0
+  python3 -I -c 'import sys
+try:
+    import tomllib
+except ImportError:
+    sys.exit(0)
+try:
+    tomllib.load(open(sys.argv[1], "rb"))
+except Exception:
+    sys.exit(1)' "$1"
+}
+
+codex_block() {
+  local mcp_url=$1 token=$2 with_mcp=$3 with_hooks=$4 command spec name timeout async
+  command=$(hook_command codex)
+  printf '%s\n' "$codex_begin"
+  if [ "$with_mcp" = 1 ]; then
+    printf '[mcp_servers.memory]\nurl = "%s"\nhttp_headers = { Authorization = "Bearer %s" }\n' "$mcp_url" "$token"
+  fi
+  if [ "$with_hooks" = 1 ]; then
+    # SessionEnd runs for at most 3 seconds in Codex. Tool and stop events are asynchronous, like the Claude Code ones.
+    for spec in SessionStart:10: UserPromptSubmit:5: PostToolUse:5:true Stop:5:true SessionEnd:2:; do
+      IFS=: read -r name timeout async <<<"$spec"
+      printf '\n[[hooks.%s]]\n[[hooks.%s.hooks]]\ntype = '"'"'command'"'"'\ncommand = '"'"'%s'"'"'\ntimeout = %s\n' \
+        "$name" "$name" "$command" "$timeout"
+      [ -z "$async" ] || printf 'async = true\n'
+    done
+  fi
+  printf '%s\n' "$codex_end"
+}
+
+codex_connect() {
+  local mcp_url=$1 token=$2 with_mcp=1 with_hooks=1 new
+  hook_command codex >/dev/null
+  if [ -f "$codex_config" ]; then
+    grep -qxF "$codex_begin" "$codex_config" && ! grep -qxF "$codex_end" "$codex_config" \
+      && die "$codex_config has the start marker of our block but not its end; fix or remove it by hand first"
+    toml_ok "$codex_config" || die "$codex_config is not valid TOML; fix it first (nothing was changed)"
+  fi
+  new=$(mktemp "${TMPDIR:-/tmp}/codex-config.XXXXXX")
+  scratch=$new
+  if [ -f "$codex_config" ]; then
+    codex_without_block "$codex_config" > "$new"
+  fi
+  if codex_has_memory_server "$new"; then
+    with_mcp=0
+    echo "warning: $codex_config already defines an MCP server 'memory'; left it alone" >&2
+  fi
+  if codex_has_own_hooks "$new"; then
+    with_hooks=0
+    echo "warning: $codex_config defines hooks in a form I cannot extend safely; the hooks were not registered" >&2
+  fi
+  if [ "$with_mcp$with_hooks" = 00 ]; then
+    return 0
+  fi
+  { [ ! -s "$new" ] || printf '\n'; codex_block "$mcp_url" "$token" "$with_mcp" "$with_hooks"; } >> "$new"
+  toml_ok "$new" || die "the result would not be valid TOML (is $codex_config unusual?); nothing was changed"
+  mkdir -p "$(dirname "$codex_config")"
+  if [ -f "$codex_config" ]; then
+    grep -qxF "$codex_begin" "$codex_config" || cp -p "$codex_config" "$codex_config.memoryvault.bak"
+    cat "$new" > "$codex_config"
+  else
+    (umask 077; cat "$new" > "$codex_config")
+  fi
+  [ "$with_mcp" = 0 ] || note "registered the MCP server in $codex_config (the token is stored there)"
+  [ "$with_hooks" = 0 ] || note "registered the hooks in $codex_config; Codex runs a new hook only after you approve it there"
+  [ ! -f "$codex_config.memoryvault.bak" ] || note "kept your original as $codex_config.memoryvault.bak"
+}
+
+codex_disconnect() {
+  local new
+  [ -f "$codex_config" ] && grep -qxF "$codex_begin" "$codex_config" || { note "nothing of ours in $codex_config"; return 0; }
+  grep -qxF "$codex_end" "$codex_config" || die "$codex_config has the start marker of our block but not its end; remove the block by hand"
+  new=$(mktemp "${TMPDIR:-/tmp}/codex-config.XXXXXX")
+  scratch=$new
+  codex_without_block "$codex_config" > "$new"
+  if [ -f "$codex_config.memoryvault.bak" ] && [ "$(cat "$new")" = "$(cat "$codex_config.memoryvault.bak")" ]; then
+    cat "$codex_config.memoryvault.bak" > "$codex_config"
+  elif [ -z "$(tr -d '[:space:]' < "$new")" ] && [ ! -f "$codex_config.memoryvault.bak" ]; then
+    rm -f "$codex_config"
+  else
+    cat "$new" > "$codex_config"
+  fi
+  rm -f "$codex_config.memoryvault.bak"
+  note "removed our block from $codex_config"
+}
+
+# Validates a --client value.
+check_client() {
+  case $1 in claude|codex|gemini) ;; *) die "--client must be claude, codex or gemini (got '$1')" ;; esac
+}
+
+client_label() {
+  case $1 in claude) echo "Claude Code" ;; codex) echo "Codex CLI" ;; *) echo "Gemini CLI" ;; esac
+}
+
 cmd_connect() {
-  local url="" token="" device="" injection=""
+  local url="" token="" device="" injection="" client=claude hook
   while [ $# -gt 0 ]; do
     case $1 in
+      --client) client=${2:?--client needs a value}; shift 2 ;;
       --url) url=${2:?--url needs a value}; shift 2 ;;
       --token) token=${2:?--token needs a value}; shift 2 ;;
       --device) device=${2:?--device needs a value}; shift 2 ;;
@@ -146,16 +411,18 @@ cmd_connect() {
   done
   [ -n "$url" ] || die "--url is required"
   case $injection in ""|lean|full) ;; *) die "--injection must be lean or full (got '$injection')" ;; esac
+  check_client "$client"
   url=$(normalize_url "$url")
   [ -n "$token" ] || token=$(cfg_get MEMORY_TOKEN)
   [ -n "$token" ] || die "no token: pass --token (or put MEMORY_TOKEN in $config)"
   case $token in mem_*_*) ;; *) die "that does not look like a MemoryVault token (expected mem_<prefix>_<secret>)" ;; esac
   [ -n "$device" ] || device=$(cfg_get DEVICE_ID)
   [ -n "$device" ] || device=$(hostname -s 2>/dev/null || hostname)
-  have claude || die "the claude CLI is not on PATH"
+  [ "$client" != claude ] || have claude || die "the claude CLI is not on PATH"
   have curl || die "curl is needed to check the server"
+  case $url$token in *\"*|*\\*) die "the URL and token must not contain quotes or backslashes" ;; esac
 
-  echo "Connecting Claude Code to $url as $device"
+  echo "Connecting $(client_label "$client") to $url as $device"
   local rc=0
   token_check "$url" "$token" || rc=$?
   case $rc in
@@ -174,6 +441,22 @@ cmd_connect() {
   [ -z "$injection" ] || cfg_set MEM_INJECTION "$injection"
   note "wrote $config"
 
+  case $client in
+    claude) connect_claude "$url" "$token" ;;
+    codex) codex_connect "$url/mcp" "$token"; connected_message "$client" ;;
+    gemini) hook=$(hook_command gemini); gemini_step add "$url/mcp" "$token" "$hook" || exit 1; connected_message "$client" ;;
+  esac
+}
+
+connected_message() {
+  echo
+  echo "Done. Start a new $(client_label "$1") session (running ones keep the old setup)."
+  echo "Undo it with:  $here/connect.sh disconnect --client $1"
+}
+
+connect_claude() {
+  local url=$1 token=$2
+
   # Plugin: removed first so that a moved checkout or a new version is picked up.
   claude plugin uninstall "$plugin@$marketplace" >/dev/null 2>&1 || true
   claude plugin marketplace remove "$marketplace" >/dev/null 2>&1 || true
@@ -183,7 +466,6 @@ cmd_connect() {
 
   # MCP: the plugin bundles the server (.mcp.json) and reads the URL and token from its own settings, so apps
   # that do not read the shell profile work too. The token goes to the keychain, not into ~/.claude.json.
-  case $url$token in *\"*|*\\*) die "the URL and token must not contain quotes or backslashes" ;; esac
   printf '{"memory_url":"%s","memory_token":"%s"}' "$url" "$token" \
     | claude plugin configure "$plugin@$marketplace" --values-stdin >/dev/null \
     || die "claude plugin configure $plugin@$marketplace failed"
@@ -199,13 +481,27 @@ cmd_connect() {
 }
 
 cmd_disconnect() {
-  local purge=0
+  local purge=0 client=claude
   while [ $# -gt 0 ]; do
     case $1 in
       --purge) purge=1; shift ;;
+      --client) client=${2:?--client needs a value}; shift 2 ;;
       *) die "unknown option '$1'" ;;
     esac
   done
+  check_client "$client"
+  if [ "$client" != claude ]; then
+    # The shared ~/.memory stays: other clients on this machine may still use it.
+    echo "Disconnecting $(client_label "$client") from MemoryVault"
+    if [ "$client" = codex ]; then codex_disconnect; else gemini_step remove || exit 1; fi
+    if [ "$purge" = 1 ]; then
+      rm -rf "$memory_home"
+      note "deleted $memory_home"
+    fi
+    echo
+    echo "Done."
+    return 0
+  fi
   echo "Disconnecting Claude Code from MemoryVault"
   if have claude; then
     claude mcp remove -s user memory >/dev/null 2>&1 && note "removed the old user-scope MCP entry 'memory'" || true
@@ -303,6 +599,12 @@ cmd_status() {
     echo "allow    no allow rule (tool calls will prompt)"
   fi
   [ -x "$here/bin/mem-hook" ] && echo "binary   $here/bin/mem-hook" || echo "binary   $here/bin/mem-hook missing"
+  if [ -f "$codex_config" ] && grep -qxF "$codex_begin" "$codex_config"; then
+    echo "codex    registered in $codex_config"
+  fi
+  if [ -f "$gemini_settings" ] && grep -q '"name": "memoryvault"' "$gemini_settings"; then
+    echo "gemini   registered in $gemini_settings"
+  fi
 }
 
 sub=${1:-}
@@ -312,5 +614,5 @@ case $sub in
   disconnect) cmd_disconnect "$@" ;;
   probe) cmd_probe "$@" ;;
   status) cmd_status ;;
-  *) sed -n '2,16p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; [ -z "$sub" ] || [ "$sub" = help ] || exit 2 ;;
+  *) sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; [ -z "$sub" ] || [ "$sub" = help ] || exit 2 ;;
 esac

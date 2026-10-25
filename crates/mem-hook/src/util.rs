@@ -235,6 +235,19 @@ pub fn sanitize_component(s: &str) -> String {
     if out.is_empty() || out.chars().all(|c| c == '.') { "_".into() } else { out }
 }
 
+/// True when `bin` is an existing file (a path) or one found in a `PATH` directory (a bare name).
+pub fn on_path(bin: &str) -> bool {
+    if bin.contains(['/', '\\']) {
+        return Path::new(bin).is_file();
+    }
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            let plain = dir.join(bin);
+            plain.is_file() || (cfg!(windows) && plain.with_extension("exe").is_file())
+        })
+    })
+}
+
 /// `$HOME` (`%USERPROFILE%` on Windows).
 pub fn home_dir() -> Option<PathBuf> {
     ["HOME", "USERPROFILE"].iter().find_map(|v| std::env::var_os(v).filter(|h| !h.is_empty())).map(PathBuf::from)
@@ -259,6 +272,16 @@ mod tests {
         }
         assert_eq!(parse_rfc3339("yesterday"), None);
         assert_eq!(parse_rfc3339("2026-13-01T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn on_path_finds_files_and_bare_names() {
+        let dir = tempfile::tempdir().unwrap();
+        let bin = dir.path().join("tool");
+        std::fs::write(&bin, "").unwrap();
+        assert!(on_path(&bin.to_string_lossy()));
+        assert!(!on_path(&dir.path().join("nope").to_string_lossy()));
+        assert!(!on_path("definitely-not-a-real-binary-name"));
     }
 
     #[test]
