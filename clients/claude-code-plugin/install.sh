@@ -6,6 +6,7 @@
 #   MEM_HOOK_STATIC=0 ./install.sh   build dynamically linked instead
 #   MEM_HOOK_BIN=/path/mem-hook ./install.sh   install a prebuilt binary instead of building
 #   MEMORY_HOME=/other/dir ./install.sh        use another memory home (default ~/.memory)
+#   MEM_INSTALL_QUIET=1 ./install.sh           skip the "Next steps" text (connect.sh does that)
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -54,23 +55,16 @@ else
 fi
 chmod 600 "$memory_home/config"
 
+[ "${MEM_INSTALL_QUIET:-0}" = 1 ] && exit 0
+
 cat <<NEXT
 
 Next steps
 
-1. Edit $memory_home/config, then add to your shell profile:
-     set -a; . $memory_home/config; set +a
+The quick way, from the repository root:  make connect-local   (or: make connect-remote URL=... TOKEN=...)
+That fills in the config, installs the plugin (hooks, skills, MCP server) and allows its tools.
 
-2. Register the MCP server (user scope; the token stays a reference):
-     claude mcp add -s user -t http memory '\${MEMORY_URL}/mcp' -H 'Authorization: Bearer \${MEMORY_TOKEN}'
-
-3. Pre-approve its tools in ~/.claude/settings.json:
-     { "permissions": { "allow": ["mcp__memory__*"] } }
-
-4. Load the plugin (hooks):
-     claude --plugin-dir $here
-   or add this directory to a plugin marketplace and install "memory".
-
-5. Optional nightly runner (consolidation), with a runner token in the config:
+By hand: see the plugin README, "Install". An optional nightly runner (consolidation), with a runner token in
+the config:
      0 3 * * *  $here/bin/mem-hook observe --all --max 50
 NEXT
