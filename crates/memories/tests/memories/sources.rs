@@ -296,3 +296,26 @@ async fn a_chunk_can_be_forgotten_but_takes_no_feedback(pool: PgPool) {
     let listed = ok(&w.get(&w.alice.token, "/sources").await);
     assert_eq!(listed["sources"][0]["chunks"].as_i64().unwrap(), live_chunks(&w, URI).await);
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn posting_the_same_content_again_restores_a_forgotten_chunk(pool: PgPool) {
+    let w = world(pool).await;
+    let first = ok(&w.post(&w.alice.token, "/sources", body(URI, &adr("Use Postgres."), "h1")).await);
+    let chunks = first["chunks"].as_i64().unwrap();
+    let id: Uuid =
+        sqlx::query_scalar("SELECT id FROM documents WHERE chunk_index = 1").fetch_one(&w.pool).await.unwrap();
+    ok(&w.delete(&w.alice.token, &format!("/memories/{id}")).await);
+    assert_eq!(live_chunks(&w, URI).await, chunks - 1);
+
+    let again = w.post(&w.alice.token, "/sources", body(URI, &adr("Use Postgres."), "h1")).await;
+    assert_eq!(again.status, StatusCode::CREATED, "{}", again.text());
+    let out = again.json();
+    assert_eq!((out["status"].as_str(), out["chunks"].as_i64()), (Some("replaced"), Some(chunks)));
+    assert_eq!(live_chunks(&w, URI).await, chunks);
+
+    let third = w.post(&w.alice.token, "/sources", body(URI, &adr("Use Postgres."), "h1")).await;
+    assert_eq!(
+        (third.status, third.json()["status"].as_str().map(String::from)),
+        (StatusCode::OK, Some("unchanged".into()))
+    );
+}

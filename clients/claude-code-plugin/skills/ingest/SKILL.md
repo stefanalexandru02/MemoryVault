@@ -18,7 +18,8 @@ since the last run are sent, so running it again is cheap.
    or removed, and sends nothing. Tell the user what it found.
 3. After they agree, run it again without `--dry-run`. Add `--prune` for a directory whose deleted files should
    also leave memory, `--glob "**/*.md"` to pick other files, and `--scope global` only for docs that belong to no
-   project. A single file is `mem-hook ingest README.md`.
+   project. A single file is `mem-hook ingest README.md`. Add `--force` to send files whose content has not changed,
+   for instance to bring back a chunk the user forgot.
 4. Report the summary line it prints. It exits non-zero when a file failed; show the `error:` lines.
 
 Do not paste the files yourself or call `memory_remember` for them: the command chunks them by heading, keeps

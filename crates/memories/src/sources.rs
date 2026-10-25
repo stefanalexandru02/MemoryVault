@@ -1,8 +1,9 @@
 //! Document sources: `POST`, `GET` and `DELETE /v1/sources`.
 //!
 //! A source is `(space, scope, uri)` and its chunks are `documents` rows (see [`crate::chunk`]). Posting it
-//! with the content hash it already has changes nothing; with another hash it retires the old chunks, drops
-//! their embeddings and writes the new ones, each with an embed job, in one transaction. A transaction-scoped
+//! with the content hash it already has, and all its chunks live, changes nothing; with another hash, or with a
+//! chunk forgotten since, it retires the old chunks, drops their embeddings and writes the new ones, each with
+//! an embed job, in one transaction. A transaction-scoped
 //! advisory lock per source serialises concurrent posts of the same uri. Documents are not part of the
 //! SessionStart block, so none of this signals the context cache.
 
@@ -187,8 +188,11 @@ async fn ingest(
         retired,
         content_hash: request.content_hash.clone(),
     };
+    let expected = i64::try_from(chunked.chunks.len()).unwrap_or(i64::MAX);
+    // A chunk forgotten on its own leaves the hash in place, so only a full set of live chunks is unchanged.
     if let Some((hash, chunks)) = &live
         && *hash == request.content_hash
+        && *chunks == expected
     {
         return Ok(respond(SourceStatus::Unchanged, *chunks, 0));
     }
@@ -233,7 +237,6 @@ async fn ingest(
         enqueue_embed(conn, MemoryTable::Documents.as_str(), id).await?;
         first.get_or_insert(id);
     }
-    let chunks = i64::try_from(chunked.chunks.len()).unwrap_or(i64::MAX);
     let (status, action, before) = match &live {
         Some((hash, count)) => (
             SourceStatus::Replaced,
@@ -249,12 +252,12 @@ async fn ingest(
         target_id: first.expect("a source with chunks has a first one"),
         before,
         after: Some(
-            json!({"uri": request.uri, "scope": scope.as_text(), "content_hash": request.content_hash, "chunks": chunks}),
+            json!({"uri": request.uri, "scope": scope.as_text(), "content_hash": request.content_hash, "chunks": expected}),
         ),
         reason: Some("ingested"),
     };
     record_audit(conn, identity, audit).await?;
-    Ok(respond(status, chunks, i64::try_from(retired.len()).unwrap_or(i64::MAX)))
+    Ok(respond(status, expected, i64::try_from(retired.len()).unwrap_or(i64::MAX)))
 }
 
 #[cfg(test)]

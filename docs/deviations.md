@@ -361,8 +361,9 @@ and repeated items are merged. The last section lists the gaps that are still op
   as memory of a new kind `document`; the spec has nothing like it. A source is `(space, scope, uri)` with a
   project or the global scope. `content` is chunked in `memvault_memories::chunk` (markdown by heading, text by
   paragraph, 600 to 800 tokens, a heading stays with the block after it, the heading path in effect at the chunk's
-  first line is stored) and each chunk is a `documents` row with an embed job. The same `content_hash` is a no-op
-  (200 `unchanged`); another hash retires the old chunks (`retired_at`, their embeddings deleted) and writes new ones
+  first line is stored) and each chunk is a `documents` row with an embed job. The same `content_hash` with all
+  its chunks live is a no-op (200 `unchanged`); with a chunk forgotten since it is rewritten like a changed one;
+  another hash retires the old chunks (`retired_at`, their embeddings deleted) and writes new ones
   in one transaction under an advisory lock per source (201 `replaced`). Retired chunks stay for `as_of` searches;
   `DELETE` removes every chunk of the source, retired ones too, and is a 404 when there is none. `GET` lists the
   default space unless `space_id` is given. `content` over `SOURCE_MAX_BYTES` (400 KiB) is 413 `payload_too_large`.

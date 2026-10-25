@@ -1,18 +1,19 @@
-//! `mem-hook ingest [<path|dir>] [--scope project|global] [--glob PATTERN]... [--dry-run] [--prune]`: send a
-//! project's docs (ADRs, READMEs, runbooks) to the server as searchable memory.
+//! `mem-hook ingest [<path|dir>] [--scope project|global] [--glob PATTERN]... [--dry-run] [--prune] [--force]`:
+//! send a project's docs (ADRs, READMEs, runbooks) to the server as searchable memory.
 //!
 //! Walks a file or a directory (markdown, text, rst and asciidoc by default; `--glob` picks other files, with
 //! `**` for any number of directories and a pattern without `/` matching file names at any depth), skips
 //! `.git`, `node_modules`, `target`, symlinks, binaries and files over [`MAX_FILE_BYTES`], hashes what is left
-//! and compares it with `GET /v1/sources`, so a second run posts only the files that changed. `--prune` (for a
-//! directory) deletes the sources under it whose file is gone. Unlike the hooks this command talks to the
-//! terminal and reports failure through its exit code: 0 when every file was handled, 1 when something failed,
-//! 2 for a bad command line.
+//! and compares it with `GET /v1/sources`, so a second run posts only the files that changed (`--force` posts
+//! them all and lets the server restore chunks that were forgotten). `--prune` (for a directory) deletes the
+//! sources under it whose file no longer exists, whatever the extension or `--glob`. Unlike the hooks this
+//! command talks to the terminal and reports failure through its exit code: 0 when every file was handled, 1
+//! when something failed, 2 for a bad command line.
 //!
 //! A source's uri is the path relative to the git root for the project scope (the root is the target itself
 //! outside a repository) and the absolute path for the global scope.
 
-use std::collections::{BTreeSet, HashMap};
+use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::thread::sleep;
@@ -26,7 +27,7 @@ use crate::config::{self, Config};
 use crate::project;
 
 const USAGE: &str =
-    "usage: mem-hook ingest [<path|dir>] [--scope project|global] [--glob PATTERN]... [--dry-run] [--prune]";
+    "usage: mem-hook ingest [<path|dir>] [--scope project|global] [--glob PATTERN]... [--dry-run] [--prune] [--force]";
 const TIMEOUT: Duration = Duration::from_secs(30);
 /// Files above this are skipped (the server refuses more than 400 KiB per source by default).
 const MAX_FILE_BYTES: u64 = 400 * 1024;
@@ -43,10 +44,18 @@ struct Options {
     globs: Vec<String>,
     dry_run: bool,
     prune: bool,
+    force: bool,
 }
 
 fn parse_args(args: &[String]) -> Result<Options, String> {
-    let mut opts = Options { path: PathBuf::from("."), global: false, globs: Vec::new(), dry_run: false, prune: false };
+    let mut opts = Options {
+        path: PathBuf::from("."),
+        global: false,
+        globs: Vec::new(),
+        dry_run: false,
+        prune: false,
+        force: false,
+    };
     let mut path = None;
     let mut it = args.iter();
     while let Some(arg) = it.next() {
@@ -59,6 +68,7 @@ fn parse_args(args: &[String]) -> Result<Options, String> {
             "--glob" => opts.globs.push(it.next().ok_or("--glob takes a pattern")?.clone()),
             "--dry-run" => opts.dry_run = true,
             "--prune" => opts.prune = true,
+            "--force" => opts.force = true,
             flag if flag.starts_with("--") => return Err(format!("unknown option {flag}")),
             _ if path.is_some() => return Err("only one path".into()),
             _ => path = Some(PathBuf::from(arg)),
@@ -161,14 +171,12 @@ fn ingest(opts: &Options) -> Result<Report, String> {
         if is_dir { walk(&target).map_err(|e| format!("{}: {e}", target.display()))? } else { vec![target.clone()] };
 
     let mut report = Report::default();
-    let mut seen: BTreeSet<String> = BTreeSet::new();
     for file in files {
         let rel_to_target = relative(&file, if is_dir { &target } else { &dir });
         if is_dir && !selected(&rel_to_target, &opts.globs) {
             continue;
         }
         let uri = source_uri(&file, &root, opts.global);
-        seen.insert(uri.clone());
         let content = match read_text(&file) {
             Ok(text) => text,
             Err(why) => {
@@ -178,7 +186,7 @@ fn ingest(opts: &Options) -> Result<Report, String> {
         };
         let hash = hex::encode(Sha256::digest(content.as_bytes()));
         match known.get(&uri) {
-            Some(old) if *old == hash => {
+            Some(old) if *old == hash && !opts.force => {
                 report.unchanged += 1;
                 continue;
             }
@@ -192,11 +200,19 @@ fn ingest(opts: &Options) -> Result<Report, String> {
         let body = json!({
             "scope": scope, "uri": uri, "content_type": content_type, "content": content, "content_hash": hash,
         });
-        if let Err(e) = send_with_retry(|| api.post("/v1/sources", &body, TIMEOUT)) {
-            report.error(format!("{uri}: {e}"));
-            // Not sent: it must not be reported as ingested.
-            report.created.retain(|u| *u != uri);
-            report.changed.retain(|u| *u != uri);
+        match send_with_retry(|| api.post("/v1/sources", &body, TIMEOUT)) {
+            // A forced post of a file the server already has whole.
+            Ok(resp) if resp.json().is_some_and(|v| v["status"] == "unchanged") => {
+                report.changed.retain(|u| *u != uri);
+                report.unchanged += 1;
+            }
+            Ok(_) => {}
+            Err(e) => {
+                report.error(format!("{uri}: {e}"));
+                // Not sent: it must not be reported as ingested.
+                report.created.retain(|u| *u != uri);
+                report.changed.retain(|u| *u != uri);
+            }
         }
     }
 
@@ -210,7 +226,9 @@ fn ingest(opts: &Options) -> Result<Report, String> {
                 Err(_) => String::new(),
             }
         };
-        let mut gone: Vec<&String> = known.keys().filter(|u| u.starts_with(&prefix) && !seen.contains(*u)).collect();
+        // A file that exists stays, even when this run's extensions or globs leave it out.
+        let mut gone: Vec<&String> =
+            known.keys().filter(|u| u.starts_with(&prefix) && !root.join(u.as_str()).exists()).collect();
         gone.sort();
         for uri in gone {
             report.removed.push(uri.clone());
@@ -384,6 +402,7 @@ mod tests {
             "*.rst",
             "--dry-run",
             "--prune",
+            "--force",
         ]))
         .unwrap();
         assert_eq!(
@@ -393,11 +412,12 @@ mod tests {
                 global: true,
                 globs: vec!["**/*.md".into(), "*.rst".into()],
                 dry_run: true,
-                prune: true
+                prune: true,
+                force: true
             }
         );
         let o = parse_args(&[]).unwrap();
-        assert_eq!((o.path, o.global, o.dry_run, o.prune), (PathBuf::from("."), false, false, false));
+        assert_eq!((o.path, o.global, o.dry_run, o.prune, o.force), (PathBuf::from("."), false, false, false, false));
         for bad in [&["--scope", "device"][..], &["--scope"], &["--glob"], &["a", "b"], &["--nope"]] {
             assert!(parse_args(&args(bad)).is_err(), "{bad:?}");
         }

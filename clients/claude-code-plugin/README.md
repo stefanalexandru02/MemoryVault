@@ -144,7 +144,7 @@ refused). `make doctor` in the repository runs `mem-hook doctor --server`.
 
 ## Ingest
 
-`mem-hook ingest [<path|dir>] [--scope project|global] [--glob PATTERN]... [--dry-run] [--prune]` sends documents
+`mem-hook ingest [<path|dir>] [--scope project|global] [--glob PATTERN]... [--dry-run] [--prune] [--force]` sends documents
 to the server (`POST /v1/sources`), which splits them by heading into chunks of 600 to 800 tokens and keeps them as
 memories of type `document`. They are searched with `memory_search` and `GET /v1/search` (`types=document`), show
 up in `POST /v1/recall` results as `source: <uri>#<heading>`, rank below facts of equal relevance and are never
@@ -159,8 +159,10 @@ part of the session-start block.
   the git root as `uri`; `--scope global` keeps them for every project, with the absolute path as `uri`.
 - The command fetches `GET /v1/sources` for the scope and sends only the files whose SHA-256 differs from the
   stored `content_hash`, so a second run sends what changed. A rate-limited request waits for the `Retry-After`
-  and is tried again.
-- `--prune` (directories only) deletes the sources under the directory whose file is gone, or no longer matches.
+  and is tried again. `--force` sends every file anyway: the server then restores chunks that were forgotten
+  one by one (it answers `unchanged` for a source that is whole), which a plain run would skip.
+- `--prune` (directories only) deletes the sources under the directory whose file is gone. A file that exists but
+  is left out by the extensions or `--glob` of this run is kept.
 - `--dry-run` prints what would be sent and removed (`+` new, `~` changed, `-` removed) and changes nothing.
 
 Exit status: 0 when every file was handled, 1 when a request failed, the server could not be listed or the

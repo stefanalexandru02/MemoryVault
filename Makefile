@@ -138,17 +138,20 @@ connect-status: ## Show what Claude Code, Codex CLI and Gemini CLI are connected
 
 disconnect: ## Remove the hooks, MCP server and token from this machine (PURGE=1 also deletes ~/.memory; AGENT=codex|gemini only that CLI)
 	@# A token minted by this stack is revoked too. Tokens of other servers are left to their admins.
-	@# Codex and Gemini share the token with the other clients on this machine, so only their entries go.
+	@# Codex and Gemini share the token with the other clients on this machine, so only their entries go. While they
+	@# are still registered, Claude's disconnect keeps and does not revoke the token they use.
 	@if [ -n "$(AGENT)" ] && [ "$(AGENT)" != claude ]; then $(CONNECT) disconnect --client "$(AGENT)" $(if $(PURGE),--purge); exit 0; fi; \
 	cfg="$${MEMORY_HOME:-$$HOME/.memory}/config"; \
 	tok=$$(sed -n 's/^MEMORY_TOKEN=//p' "$$cfg" 2>/dev/null | tail -n 1); \
 	url=$$(sed -n 's/^MEMORY_URL=//p' "$$cfg" 2>/dev/null | tail -n 1); \
 	prefix=$$(printf '%s' "$$tok" | cut -d_ -f2); \
+	others=$$($(CONNECT) clients | tr '\n' ' '); \
 	revoked=""; \
-	if [ -n "$$prefix" ] && [ "$$url" = "$(MEMORY_URL)" ] && $(ADMIN) token revoke "$$prefix" >/dev/null 2>&1; then \
+	if [ -n "$$prefix" ] && [ -z "$$others" ] && [ "$$url" = "$(MEMORY_URL)" ] && $(ADMIN) token revoke "$$prefix" >/dev/null 2>&1; then \
 	  revoked=1; echo "revoked token $$prefix on the local stack"; fi; \
 	$(CONNECT) disconnect $(if $(PURGE),--purge); \
-	if [ -n "$$prefix" ] && [ -z "$$revoked" ]; then echo "The token ($$url) still works on its server until an admin revokes it."; fi
+	if [ -n "$$prefix" ] && [ -n "$$others" ]; then echo "The token was kept and not revoked: still registered and using it: $${others}. Run make disconnect AGENT=<client> for each, then make disconnect again."; \
+	elif [ -n "$$prefix" ] && [ -z "$$revoked" ]; then echo "The token ($$url) still works on its server until an admin revokes it."; fi
 
 install-plugin: ## Build mem-hook and set up ~/.memory on this machine
 	./clients/claude-code-plugin/install.sh

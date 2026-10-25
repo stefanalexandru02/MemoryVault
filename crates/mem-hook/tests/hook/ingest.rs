@@ -141,10 +141,31 @@ fn prune_removes_the_sources_of_files_that_disappeared_under_the_directory() {
     // The uris are relative to the git root, not to the directory that was named.
     assert!(fake.posted_sources().is_empty());
 
+    // A file that exists stays even when this run's extensions leave it out.
+    write(&env.cwd, "docs/api.yaml", "kind: Api\n");
+    fake.state().sources = vec![listed("docs/api.yaml", "kind: Api\n")];
+    let before = fake.matching("DELETE", "/v1/sources").len();
+    assert_eq!(env.ingest(&["docs", "--prune"]).code, Some(0));
+    assert_eq!(fake.matching("DELETE", "/v1/sources").len(), before);
+
     // A file cannot be pruned.
     let out = env.ingest(&["docs/a.md", "--prune"]);
     assert_eq!(out.code, Some(1));
     assert!(out.stderr.contains("--prune applies to a directory"), "{}", out.stderr);
+}
+
+#[test]
+fn force_posts_unchanged_files_and_reports_what_the_server_kept() {
+    let (fake, env) = TestEnv::with_fake();
+    write(&env.cwd, "README.md", "# One\n");
+    write(&env.cwd, "docs/a.md", "# A\n");
+    fake.state().sources = vec![listed("README.md", "# One\n"), listed("docs/a.md", "# A old\n")];
+
+    let out = env.ingest(&["--force"]);
+    assert_eq!(out.code, Some(0), "{}{}", out.stdout, out.stderr);
+    assert_eq!(uris(&fake.posted_sources()), ["README.md", "docs/a.md"]);
+    assert!(out.stdout.contains("~ docs/a.md") && !out.stdout.contains("~ README.md"), "{}", out.stdout);
+    assert!(out.stdout.contains("send 0 new and 1 changed") && out.stdout.contains("1 unchanged"), "{}", out.stdout);
 }
 
 #[test]

@@ -55,7 +55,8 @@ make disconnect                                             # remove all of it a
 make connect-remote URL=https://memory.<tailnet>.ts.net TOKEN=mem_...   # the same, for a server elsewhere
 ```
 
-`make disconnect` keeps `~/.memory/spool` and `sessions` (add `PURGE=1` to delete them). Tokens of a
+`make disconnect` keeps `~/.memory/spool` and `sessions` (add `PURGE=1` to delete them), and keeps and does not
+revoke the token while Codex CLI or Gemini CLI is still registered, since they use it. Tokens of a
 remote server stay valid until its admin revokes them. All three targets call
 `clients/claude-code-plugin/connect.sh`, which you can also run directly. Add `INJECTION=lean` (or `full`) to
 `connect-local` or `connect-remote` to set the session-start context mode below. `AGENT=codex` or `AGENT=gemini`
@@ -268,8 +269,8 @@ mem-hook ingest README.md          # one file, or: --glob "**/*.adoc", --scope g
 The server splits each file by heading into chunks of 600 to 800 tokens and keeps the heading path with each one.
 `memory_search` with `types: ["document"]` (or `GET /v1/search?types=document`) finds them and `memory_get` reads
 a chunk; `POST /v1/recall` returns them in a `documents` slot as `source: docs/adr/0003.md#Decision`. They rank
-below facts of equal relevance and are never injected at session start. A file that did not change is skipped, a
-changed one replaces its chunks (the old ones are retired and stay visible to an `as_of` search), and
+below facts of equal relevance and are never injected at session start. A file that did not change is skipped (`--force` sends it
+anyway, which restores chunks forgotten one by one), a changed one replaces its chunks (the old ones are retired and stay visible to an `as_of` search), and
 `DELETE /v1/sources?uri=...&scope=project:<key>` removes a source. `GET /v1/sources` lists them. A file may be at
 most `SOURCE_MAX_BYTES` (400 KiB). The `ingest` skill asks Claude to do this for the current repository. See the
 plugin README for the options.

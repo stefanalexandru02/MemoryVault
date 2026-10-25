@@ -10,13 +10,16 @@
 #       codex and gemini register the MCP server and the `mem-hook event --client ...` hooks in that tool's own
 #       config file (see clients/README.md).
 #   connect.sh disconnect [--client claude|codex|gemini] [--purge]
-#       undoes all of that and blanks the URL and token in ~/.memory/config; --purge deletes ~/.memory too
+#       undoes all of that and blanks the URL and token in ~/.memory/config, unless Codex CLI or Gemini CLI
+#       still has our entries (they use that token): then the config stays. --purge deletes ~/.memory too
 #       (including undelivered events in ~/.memory/spool). For codex and gemini it removes exactly the entries
 #       connect added and leaves ~/.memory alone.
 #   connect.sh probe [--url URL] [--token TOKEN]
 #       exit 0 when the token authenticates against the server (defaults come from ~/.memory/config)
 #   connect.sh status
 #       what is configured and whether it works, plus the tokens served by recent context and recall calls
+#   connect.sh clients
+#       the names of the Codex CLI and Gemini CLI setups that still hold our entries, one per line
 #
 # Everything is idempotent. Settings touched for Claude Code: ~/.claude.json (MCP server "memory", user scope),
 # ~/.claude/settings.json (plugin, marketplace and the allow rule for the plugin's MCP tools, through the
@@ -480,6 +483,15 @@ connect_claude() {
   echo "Check it with:  make connect-status    Undo it with:  make disconnect"
 }
 
+codex_registered() { [ -f "$codex_config" ] && grep -qxF "$codex_begin" "$codex_config"; }
+gemini_registered() { [ -f "$gemini_settings" ] && grep -q '"name": "memoryvault"' "$gemini_settings"; }
+
+# The other clients that still hold our entries: they carry a copy of the token in ~/.memory/config.
+cmd_clients() {
+  if codex_registered; then echo codex; fi
+  if gemini_registered; then echo gemini; fi
+}
+
 cmd_disconnect() {
   local purge=0 client=claude
   while [ $# -gt 0 ]; do
@@ -517,6 +529,8 @@ cmd_disconnect() {
   if [ "$purge" = 1 ]; then
     rm -rf "$memory_home"
     note "deleted $memory_home"
+  elif [ -f "$config" ] && [ -n "$(cmd_clients)" ]; then
+    note "kept $config: still registered and using its token: $(cmd_clients | tr '\n' ' ')(disconnect them with --client first)"
   elif [ -f "$config" ]; then
     cfg_set MEMORY_URL ""
     cfg_set MEMORY_TOKEN ""
@@ -553,7 +567,8 @@ print_recall_stats() {
   local body days rows
   body=$(curl -fsS -m 10 -H "Authorization: Bearer $2" "$1/v1/stats/recall" 2>/dev/null) || return 0
   days=$(printf '%s' "$body" | sed -n 's/.*"days":\([0-9]*\).*/\1/p')
-  rows=$(printf '%s' "$body" | sed 's/},{/}\n{/g' | sed -n 's/.*"mode":"\([a-z]*\)","injection":\(null\|"[a-z]*"\),"calls":\([0-9]*\),"avg_tokens":\([0-9.e+-]*\),"p50_tokens":\([0-9.e+-]*\),"p95_tokens":\([0-9.e+-]*\).*/\1 \2 \3 \4 \5 \6/p')
+  # Extended regex and `tr` instead of GNU-only sed escapes, so that macOS parses it too: every row ends in `}`.
+  rows=$(printf '%s' "$body" | tr '}' '\n' | sed -nE 's/.*"mode":"([a-z]+)","injection":(null|"[a-z]+"),"calls":([0-9]+),"avg_tokens":([0-9.e+-]+),"p50_tokens":([0-9.e+-]+),"p95_tokens":([0-9.e+-]+).*/\1 \2 \3 \4 \5 \6/p')
   if [ -z "$rows" ]; then
     echo "tokens   no context or recall calls in the last ${days:-7} days"
     return 0
@@ -599,12 +614,8 @@ cmd_status() {
     echo "allow    no allow rule (tool calls will prompt)"
   fi
   [ -x "$here/bin/mem-hook" ] && echo "binary   $here/bin/mem-hook" || echo "binary   $here/bin/mem-hook missing"
-  if [ -f "$codex_config" ] && grep -qxF "$codex_begin" "$codex_config"; then
-    echo "codex    registered in $codex_config"
-  fi
-  if [ -f "$gemini_settings" ] && grep -q '"name": "memoryvault"' "$gemini_settings"; then
-    echo "gemini   registered in $gemini_settings"
-  fi
+  if codex_registered; then echo "codex    registered in $codex_config"; fi
+  if gemini_registered; then echo "gemini   registered in $gemini_settings"; fi
 }
 
 sub=${1:-}
@@ -614,5 +625,6 @@ case $sub in
   disconnect) cmd_disconnect "$@" ;;
   probe) cmd_probe "$@" ;;
   status) cmd_status ;;
-  *) sed -n '2,19p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; [ -z "$sub" ] || [ "$sub" = help ] || exit 2 ;;
+  clients) cmd_clients ;;
+  *) sed -n '2,21p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'; [ -z "$sub" ] || [ "$sub" = help ] || exit 2 ;;
 esac

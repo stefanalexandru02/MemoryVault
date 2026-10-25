@@ -264,6 +264,10 @@ fn route(s: &mut State, req: Req) -> (u16, &'static str, Value) {
                 let error = json!({"code": "payload_too_large", "message": "content is too big", "retryable": false});
                 return (413, json, json!({ "error": error }));
             }
+            let listed = s.sources.iter().any(|l| l["uri"] == body["uri"] && l["content_hash"] == body["content_hash"]);
+            if listed {
+                return (200, json, json!({"uri": uri, "status": "unchanged", "chunks": 1, "retired": 0}));
+            }
             (201, json, json!({"uri": uri, "status": "created", "chunks": 1, "retired": 0}))
         }
         ("DELETE", ["v1", "sources"]) => (200, json, json!({"deleted": 1})),

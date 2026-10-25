@@ -684,7 +684,7 @@
       h('form', { method: 'dialog' },
         h('h3', { id: 'forget-title', text: 'Forget this memory?' }),
         h('div', { class: 'pre', text: label }),
-        h('p', { class: 'muted', text: item.table === 'facts' ? 'The fact is retracted: agents stop using it, and the history stays in the audit log.' : item.table === 'procedures' ? 'The procedure is retired.' : item.table === 'documents' ? 'This chunk of the document is retired: it no longer shows up in searches. Ingest the file again to bring it back.' : 'The observation is archived: it no longer shows up in searches or context. The viewer cannot undo this.' }),
+        h('p', { class: 'muted', text: item.table === 'facts' ? 'The fact is retracted: agents stop using it, and the history stays in the audit log.' : item.table === 'procedures' ? 'The procedure is retired.' : item.table === 'documents' ? 'This chunk of the document is retired: it no longer shows up in searches. `mem-hook ingest --force` on the file brings it back.' : 'The observation is archived: it no longer shows up in searches or context. The viewer cannot undo this.' }),
         h('label', { class: 'field', for: 'reason' }, h('span', { text: 'Why' }), reason),
         h('menu', {}, h('button', { class: 'btn', type: 'submit', value: 'cancel' }, 'Cancel'), go)));
     document.body.append(dlg);
