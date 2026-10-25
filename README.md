@@ -38,7 +38,7 @@ and the rationale is in [docs/architecture.md](docs/architecture.md).
 planning pass once a day. The `Makefile` wraps it; `make` lists every target.
 
 ```bash
-make up              # creates .env with fresh secrets, builds the image, starts everything
+make up              # creates .env with fresh secrets, builds the image, starts everything (viewer at /viewer)
 make bootstrap       # user $(whoami) + a device token for this host; prints the client config
 make install-plugin  # builds mem-hook and sets up ~/.memory (see below)
 make mcp-add         # claude mcp add ... with ${MEMORY_URL}/${MEMORY_TOKEN} references
@@ -119,6 +119,25 @@ cargo run -p memvault -- admin token create --user alex --client laptop-x1 --kin
 ```
 
 `token create` prints the raw token once. Store it when it appears.
+
+## Web viewer
+
+The server serves a viewer at `/viewer` (`http://127.0.0.1:8000/viewer` for the compose stack; `/` redirects
+there). Open it, paste a device token (`make token`, or the one in `~/.memory/config`) and you can:
+
+- browse and search observations, summaries, facts and procedures, filtered by kind, project, type and period,
+  with live updates as new memories arrive (`/` focuses the search box, `j`/`k` step through the list);
+- open any memory to read it in full, see where it came from (session, device, extractor, the observations a
+  fact rests on, the audit history) and what was recorded around it;
+- forget a memory, with a reason that goes to the audit log;
+- read the open work lists per project;
+- with an admin token: list and revoke tokens, and see failed work packets and background jobs, with a retry.
+
+The viewer is three static files compiled into the server (`crates/server/assets/viewer`). It calls the same
+`/v1` API as the clients, so it shows exactly what your token may see and nothing more. The token stays in
+`sessionStorage` unless you tick "Remember on this device". The page sets a strict content security policy (no
+inline script or style, same-origin requests only) and renders memory text as text, never as markup, because
+that text comes from tool output.
 
 ## Installing the Claude Code plugin
 

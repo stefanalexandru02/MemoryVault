@@ -58,11 +58,11 @@ build: .env ## Build the memvault image
 
 up: .env ## Start the full stack (Postgres, TEI, migrations, API, worker, scheduler)
 	COMPOSE_PROFILES=tei FAKE_TEI=0 $(COMPOSE) up -d --build --wait
-	@echo "API: $(MEMORY_URL)  (first start: TEI downloads its models, see 'make logs SERVICE=tei-embed')"
+	@echo "API: $(MEMORY_URL)  viewer: $(MEMORY_URL)/viewer  (first start: TEI downloads its models, see 'make logs SERVICE=tei-embed')"
 
 up-lite: .env ## Start without TEI, using fake deterministic embeddings
 	FAKE_TEI=1 $(COMPOSE) up -d --build --wait
-	@echo "API: $(MEMORY_URL)  (FAKE_TEI=1: run 'make reindex' after switching to 'make up')"
+	@echo "API: $(MEMORY_URL)  viewer: $(MEMORY_URL)/viewer  (FAKE_TEI=1: run 'make reindex' after switching to 'make up')"
 
 down: ## Stop the stack (data is kept)
 	COMPOSE_PROFILES=tei $(COMPOSE) down

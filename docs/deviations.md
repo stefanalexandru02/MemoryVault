@@ -479,3 +479,9 @@ and repeated items are merged. The last section lists the gaps that are still op
   candidates until consolidation resolves them.
 - **Eval replay and checks not run here.** The acceptance checks in spec section 17 need a live environment. The
   Windows hook has not been run.
+- **Web viewer.** Phase 4's admin viewer is a static page at `/viewer` that signs in with a bearer token. It lists,
+  searches and forgets memories, shows provenance and work state, and for admin tokens lists and revokes tokens and
+  shows failed packets and jobs. It adds `GET /v1/me` (who the token is, used to hide admin pages) and a `reason` query
+  parameter on `DELETE /v1/memories/{id}` (the audit log already had a reason column). Not built: sessions and raw
+  events, editing a memory, undoing a forget, user and space administration, and server-side sign-in (cookies,
+  OAuth), so a token is typed or pasted per browser.
