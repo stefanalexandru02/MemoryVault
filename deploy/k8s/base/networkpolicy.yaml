@@ -1,0 +1,218 @@
+# Default deny for the namespace, then explicit allows. Spec 14: api and worker reach postgres and TEI;
+# nothing else egresses except the Tailscale ingress path into the API.
+#
+# Pods that talk to postgres carry memvault.io/db-client=true; pods that talk to TEI carry
+# memvault.io/tei-client=true. The Tailscale proxy runs in the `tailscale` namespace and Prometheus in
+# `monitoring`; both namespaces are selected by their kubernetes.io/metadata.name label.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: default-deny
+spec:
+  podSelector: {}
+  policyTypes: ["Ingress", "Egress"]
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: allow-dns
+spec:
+  podSelector: {}
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: api-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: memory-api
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: tailscale
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: worker-ingress
+spec:
+  podSelector:
+    matchLabels:
+      app: memory-worker
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: monitoring
+      ports:
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: db-clients-egress
+spec:
+  podSelector:
+    matchLabels:
+      memvault.io/db-client: "true"
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: memory-pg
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tei-clients-egress
+spec:
+  podSelector:
+    matchLabels:
+      memvault.io/tei-client: "true"
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - podSelector:
+            matchExpressions:
+              - key: app
+                operator: In
+                values: ["tei-embed", "tei-rerank"]
+      # Container port (NetworkPolicy sees the pod port after the Service maps 80 to 8080; see tei.yaml).
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-ingress
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: memory-pg
+  policyTypes: ["Ingress"]
+  ingress:
+    # Clients, the operator (status on 8000, and it reads the instance over 5432), and replication between
+    # instances of the same cluster.
+    - from:
+        - podSelector:
+            matchLabels:
+              memvault.io/db-client: "true"
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: memory-pg
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: cnpg-system
+      ports:
+        - protocol: TCP
+          port: 5432
+        - protocol: TCP
+          port: 8000
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: postgres-egress
+spec:
+  podSelector:
+    matchLabels:
+      cnpg.io/cluster: memory-pg
+  policyTypes: ["Egress"]
+  egress:
+    # Backups and WAL archive to the S3-compatible endpoint (MinIO in the minio namespace).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: minio
+      ports:
+        - protocol: TCP
+          port: 9000
+    # Instance manager talks to the Kubernetes API. Narrow this to the API server endpoint in an overlay.
+    - ports:
+        - protocol: TCP
+          port: 6443
+        - protocol: TCP
+          port: 443
+    # Replication between instances of the same cluster.
+    - to:
+        - podSelector:
+            matchLabels:
+              cnpg.io/cluster: memory-pg
+      ports:
+        - protocol: TCP
+          port: 5432
+---
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tei-ingress
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: ["tei-embed", "tei-rerank"]
+  policyTypes: ["Ingress"]
+  ingress:
+    - from:
+        - podSelector:
+            matchLabels:
+              memvault.io/tei-client: "true"
+      ports:
+        - protocol: TCP
+          port: 8080
+---
+# First start downloads the models from huggingface.co. Keep this policy until both PVCs hold the model
+# files, then delete it; afterwards TEI needs no egress at all.
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: tei-model-download
+spec:
+  podSelector:
+    matchExpressions:
+      - key: app
+        operator: In
+        values: ["tei-embed", "tei-rerank"]
+  policyTypes: ["Egress"]
+  egress:
+    - to:
+        - ipBlock:
+            cidr: 0.0.0.0/0
+            except:
+              - 10.0.0.0/8
+              - 172.16.0.0/12
+              - 192.168.0.0/16
+      ports:
+        - protocol: TCP
+          port: 443

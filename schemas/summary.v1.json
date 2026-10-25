@@ -1,0 +1,16 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "summary.v1",
+  "title": "summary.v1",
+  "description": "Prompt/session summary (spec 10.5). next_steps is mandatory and phrased as the current trajectory.",
+  "type": "object",
+  "required": ["next_steps"],
+  "properties": {
+    "request": {"type": ["string", "null"], "maxLength": 600},
+    "investigated": {"type": ["string", "null"], "maxLength": 600},
+    "learned": {"type": ["string", "null"], "maxLength": 600},
+    "completed": {"type": ["string", "null"], "maxLength": 600},
+    "next_steps": {"type": "string", "minLength": 1, "maxLength": 600},
+    "notes": {"type": ["string", "null"], "maxLength": 600}
+  }
+}

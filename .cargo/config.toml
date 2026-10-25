@@ -1,0 +1,3 @@
+[env]
+# Test database (Postgres 16 + pgvector). #[sqlx::test] creates one fresh database per test from it.
+DATABASE_URL = "postgres://postgres@127.0.0.1:55432/postgres"

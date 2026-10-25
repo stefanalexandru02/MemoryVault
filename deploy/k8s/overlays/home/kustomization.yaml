@@ -1,0 +1,32 @@
+# Home cluster overlay. Apply with: kubectl apply -k deploy/k8s/overlays/home
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+
+resources:
+  - ../../base
+
+images:
+  - name: memvault
+    newName: ghcr.io/REPLACE-OWNER/memvault
+    newTag: 0.1.0
+
+patches:
+  # Home MinIO for barman backups. Adjust the endpoint and bucket to the home setup.
+  - target:
+      group: postgresql.cnpg.io
+      version: v1
+      kind: Cluster
+      name: memory-pg
+    patch: |-
+      - op: replace
+        path: /spec/backup/barmanObjectStore/endpointURL
+        value: http://minio.minio.svc.cluster.local:9000
+  - target:
+      group: postgresql.cnpg.io
+      version: v1
+      kind: Cluster
+      name: memory-pg
+    patch: |-
+      - op: replace
+        path: /spec/imageName
+        value: ghcr.io/REPLACE-OWNER/memvault-postgres:17

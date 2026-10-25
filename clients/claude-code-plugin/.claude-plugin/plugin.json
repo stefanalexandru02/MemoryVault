@@ -1,0 +1,7 @@
+{
+  "name": "memory",
+  "version": "0.1.0",
+  "description": "MemoryVault for Claude Code: records session events and injects recalled context at session start.",
+  "author": { "name": "MemoryVault" },
+  "keywords": ["memory", "hooks"]
+}

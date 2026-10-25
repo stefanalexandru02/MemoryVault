@@ -12,7 +12,7 @@ Status: draft for implementation. Companion to `memory-architecture.md`, which h
 | D2 | The cluster runs no model and stores no Claude credential. | All LLM calls happen on clients that already hold Claude: `claude -p` on Claude Code machines, the Agent SDK inside the agentic OS, a nightly runner for consolidation. The server builds, leases and validates work packets. |
 | D3 | Clients are thin. | A Claude Code machine needs the plugin (hooks + one script), `curl`, `jq`, and the `claude` CLI it already has. The agentic OS needs the Python client. |
 | D4 | Multi-user from the first migration. | `users`, `spaces`, `memberships`, `space_id` on every memory table, RLS everywhere. First deploy creates one user and one private space. |
-| D5 | Server language: Python 3.12, FastAPI, asyncpg, pydantic v2. | See Section 2 for the Rust analysis. Shared pydantic models between server and agentic OS. |
+| D5 | Language: Rust for the server and the Claude Code hook binary. | Decided by the owner after the Section 2 analysis, once the agentic OS was dropped from scope. Stack in Section 2. |
 | D6 | Observer prompt ported from claude-mem `plugin/modes/code.json`; progressive-disclosure index format copied. | Observation quality is equal to claude-mem by construction; improvements come from context, retrieval and tiers. |
 | D7 | Auth v1 is bearer tokens over a Tailscale-only ingress. OAuth is a later phase behind the same middleware. | Claude Code connects with `--header "Authorization: Bearer ${MEMORY_TOKEN}"`. |
 
@@ -66,41 +66,55 @@ The question is whether Rust makes the system more efficient. It does, in CPU an
 
 ### Decision
 
-- **Server in Python** (FastAPI, asyncpg, pydantic v2, `mcp` SDK). Two replicas at 250 MB each is a rounding error on a personal cluster.
-- **Hook client in shell for v1** (`bash` + `curl` + `jq`, which claude-mem also assumes), with a **Rust single-binary hook as a Phase 4 item** for sub-2 ms startup and Windows support. This is where a Rust binary earns its place: it runs on every tool call on every machine, and claude-mem compiled its launcher for the same reason.
-- Revisit the server language only if p99 or memory becomes a measured problem; the recall engine is isolated behind one interface so it could be ported alone.
+**Rust for everything that runs**, decided by the owner. The agentic OS is out of scope, which removed the main argument for Python (shared models with a Python client). The efficiency gains that matter are the hook binary that runs on every tool call (about 1 ms startup, no `jq`, Windows support) and the small, flat-latency server footprint.
 
-Go would sit between: ~30 MB RSS, fast startup, good SDKs, but the same schema duplication problem as Rust without Rust's safety or performance ceiling. Not recommended as a middle path.
+Stack:
+
+| Concern | Crate | Notes |
+|---|---|---|
+| HTTP server | `axum` 0.8, `tokio`, `tower-http` | body limits, tracing, timeouts |
+| Postgres | `sqlx` 0.8 (postgres, runtime-tokio, rustls, uuid, chrono, json, migrate) | runtime queries (`sqlx::query`/`query_as`), not compile-time macros, so builds need no database; `#[sqlx::test]` gives every test a fresh database with migrations applied |
+| Vectors | `pgvector` crate with the `sqlx` feature | |
+| Migrations | `sqlx::migrate!` over the top-level `migrations/` directory | replaces Alembic; same `NNNN_name.sql` files |
+| JSON | `serde`, `serde_json` | |
+| LLM output validation | `jsonschema` against the schema files in `schemas/`, then `serde` into typed structs | the schema name in a packet maps to a file |
+| Prompts | `serde_yaml` for loading, `minijinja` for rendering | |
+| MCP | `rmcp` (official Rust MCP SDK), streamable HTTP server, stateless, mounted in axum | |
+| TEI client | `reqwest` with rustls | |
+| CLI | `clap` derive | one `memvault` binary: `serve`, `worker`, `planner`, `migrate`, `admin …`, `evals …` |
+| Logging, metrics | `tracing`, `tracing-subscriber` (JSON), `metrics` + `metrics-exporter-prometheus` | |
+| IDs, crypto | `uuid` (v7 feature), `hmac`, `sha2`, `rand` | |
+| Hook binary | `mem-hook`: `ureq`, `serde_json`, no async runtime | static release build; replaces the bash scripts |
+
+Token estimates stay `ceil(chars / 4)`.
 
 ---
 
 ## 3. Repository layout
 
 ```
-memory/
-├── server/                     # Python package `memsvc`
-│   ├── memsvc/
-│   │   ├── api/                # FastAPI routers: sessions, events, recall, memories, work, admin
-│   │   ├── mcp/                # MCP streamable-HTTP app mounted at /mcp
-│   │   ├── auth/               # token parsing, scopes, RLS session setup
-│   │   ├── recall/             # candidates.sql, fuse.py, rerank.py, budget.py, render.py, cache.py
-│   │   ├── packets/            # packet builders (extract, summarize, consolidate_*), validators, appliers
-│   │   ├── consolidate/        # planner stages
-│   │   ├── embed/              # TEI client, part splitting, backfill
-│   │   ├── prompts/            # prompt registry loader (YAML files, versioned)
-│   │   ├── schemas/            # pydantic models shared with clients (published as `memsvc-schemas`)
-│   │   └── worker.py           # broker loop: leases, expiry, jobs
-│   ├── migrations/             # Alembic, additive only
-│   ├── prompts/                # observer.code.v3.yaml, observer.assistant.v1.yaml, summary.v2.yaml, consolidate.*.yaml
-│   └── tests/
-├── clients/
-│   ├── claude-code-plugin/     # .claude-plugin/plugin.json, hooks/hooks.json, bin/mem-hook, bin/mem-observe
-│   └── python/                 # `memory_client` (httpx), used by the agentic OS and the nightly runner
-├── deploy/
-│   ├── k8s/                    # Kustomize base + overlays: cnpg cluster, api, worker, cronjob, tei, ingress, secrets
-│   └── docker/                 # server image, postgres image (if pg_search needs a custom build)
-└── evals/                      # recorded sessions, held-out questions, scorer, replay runner
+MemoryVault/
+├── Cargo.toml                  # workspace; all shared dependency versions in [workspace.dependencies]
+├── crates/
+│   ├── core/                   # memvault-core: config, db pools + user_tx (RLS), ids, auth, schemas, TEI client + fake,
+│   │                           #   prompt registry, applier registry trait, invalidation, errors, AppState
+│   ├── ingest/                 # memvault-ingest: sessions, events, windows, work packets, extract/summary appliers
+│   ├── recall/                 # memvault-recall: candidates, fusion, rerank, budgets, rendering, context cache, recall routes
+│   ├── memories/               # memvault-memories: memories + work-state routes, MCP server
+│   ├── consolidate/            # memvault-consolidate: planner, consolidation appliers, revert, admin routes and CLI
+│   ├── worker/                 # memvault-worker: embedding parts and jobs, worker loop, retention
+│   ├── evals/                  # memvault-evals: record, redact, replay, compare
+│   ├── server/                 # memvault (binary): CLI, router assembly, migrate
+│   └── mem-hook/               # mem-hook (binary): Claude Code hooks + observer runner
+├── migrations/                 # NNNN_name.sql, applied by sqlx
+├── schemas/                    # JSON Schemas for LLM outputs (observer.v1.json, summary.v1.json, consolidate.*.v1.json)
+├── prompts/                    # observer.code.yaml, summary.*.yaml, consolidate.*.yaml
+├── clients/claude-code-plugin/ # .claude-plugin/plugin.json, hooks/hooks.json, install script, README
+├── deploy/                     # docker/ (server, postgres), k8s/ (kustomize base + overlays/home)
+└── evals/                      # recorded sessions, questions, gold facts, baseline
 ```
+
+Section 8's `mem-hook` and `mem-observe` bash scripts become two subcommands of the `mem-hook` binary (`mem-hook <event>` and `mem-hook observe`). Their behavior, flags and file layout under `~/.memory/` are unchanged. The plugin's `hooks.json` calls `${CLAUDE_PLUGIN_ROOT}/bin/mem-hook`, which the install script builds or downloads.
 
 ---
 

@@ -1,0 +1,113 @@
+# Local MemoryVault helpers. `make` lists the targets.
+#
+# Quick start:
+#   make up                       # full stack with TEI (or `make up-lite` without the models)
+#   make bootstrap                # first user + device token, prints the client config
+#   make install-plugin           # build mem-hook and set up ~/.memory on this machine
+
+COMPOSE ?= docker compose
+HANDLE  ?= $(shell whoami)
+NAME    ?= $(HANDLE)
+CLIENT  ?= $(shell hostname -s 2>/dev/null || hostname)
+KIND    ?= device
+SERVICE ?=
+
+ifneq (,$(wildcard .env))
+include .env
+endif
+MEMVAULT_PORT ?= 8000
+PG_PORT       ?= 55432
+BIND_ADDR     ?= 127.0.0.1
+API_HOST      := $(if $(filter 0.0.0.0,$(BIND_ADDR)),127.0.0.1,$(BIND_ADDR))
+MEMORY_URL    ?= http://$(API_HOST):$(MEMVAULT_PORT)
+
+ADMIN := $(COMPOSE) exec -T -e LOG_LEVEL=warn api memvault admin
+
+.DEFAULT_GOAL := help
+.PHONY: help env build up up-lite down restart ps logs migrate bootstrap user token tokens admin \
+        consolidate reindex psql install-plugin mcp-add test clean
+
+help: ## List the targets
+	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
+	@echo
+	@echo "  Variables: HANDLE=$(HANDLE) NAME=$(NAME) CLIENT=$(CLIENT) KIND=$(KIND) MEMORY_URL=$(MEMORY_URL)"
+
+env: .env ## Create .env with fresh secrets (kept if it exists)
+
+.env:
+	@rand() { head -c 32 /dev/urandom | od -An -tx1 | tr -d ' \n'; }; \
+	sed -e "s/^TOKEN_PEPPER=.*/TOKEN_PEPPER=$$(rand)/" \
+	    -e "s/^POSTGRES_PASSWORD=.*/POSTGRES_PASSWORD=$$(rand)/" \
+	    -e "s/^MEMSVC_APP_PASSWORD=.*/MEMSVC_APP_PASSWORD=$$(rand)/" \
+	    -e "s/^MEMSVC_SYSTEM_PASSWORD=.*/MEMSVC_SYSTEM_PASSWORD=$$(rand)/" \
+	    .env.example > .env
+	@chmod 600 .env
+	@echo "wrote .env with new secrets (back it up: TOKEN_PEPPER is needed to keep tokens valid)"
+
+build: .env ## Build the memvault image
+	$(COMPOSE) build
+
+up: .env ## Start the full stack (Postgres, TEI, migrations, API, worker, scheduler)
+	COMPOSE_PROFILES=tei FAKE_TEI=0 $(COMPOSE) up -d --build --wait
+	@echo "API: $(MEMORY_URL)  (first start: TEI downloads its models, see 'make logs SERVICE=tei-embed')"
+
+up-lite: .env ## Start without TEI, using fake deterministic embeddings
+	FAKE_TEI=1 $(COMPOSE) up -d --build --wait
+	@echo "API: $(MEMORY_URL)  (FAKE_TEI=1: run 'make reindex' after switching to 'make up')"
+
+down: ## Stop the stack (data is kept)
+	COMPOSE_PROFILES=tei $(COMPOSE) down
+
+restart: down up ## Restart the full stack
+
+ps: ## Show service status
+	COMPOSE_PROFILES=tei $(COMPOSE) ps
+
+logs: ## Follow logs (SERVICE=api for one service)
+	COMPOSE_PROFILES=tei $(COMPOSE) logs -f --tail=100 $(SERVICE)
+
+migrate: ## Apply pending migrations
+	$(COMPOSE) run --rm migrate
+
+bootstrap: user token ## Create user HANDLE and a token for CLIENT, print the client config
+
+user: ## Create user HANDLE (NAME sets the display name)
+	@$(ADMIN) user create "$(HANDLE)" --display-name "$(NAME)" >/dev/null 2>&1 \
+	  && echo "created user $(HANDLE)" || echo "user $(HANDLE) not created (it may already exist)"
+
+token: ## Mint a token for HANDLE on CLIENT (KIND=device|runner|admin)
+	@out=$$($(ADMIN) token create --user "$(HANDLE)" --client "$(CLIENT)" --kind "$(KIND)") || exit 1; \
+	tok=$$(printf '%s' "$$out" | sed -n 's/.*"token": *"\(mem_[^"]*\)".*/\1/p'); \
+	[ -n "$$tok" ] || { echo "$$out"; exit 1; }; \
+	echo; echo "Token for $(HANDLE) on $(CLIENT) ($(KIND)). It is shown once; put it in ~/.memory/config:"; echo; \
+	echo "  MEMORY_URL=$(MEMORY_URL)"; echo "  MEMORY_TOKEN=$$tok"; echo "  DEVICE_ID=$(CLIENT)"; echo
+
+tokens: ## List tokens for HANDLE
+	$(ADMIN) token list --user "$(HANDLE)"
+
+admin: ## Run an admin command: make admin ARGS="space list"
+	$(ADMIN) $(ARGS)
+
+consolidate: ## Run one consolidation planning pass now
+	$(COMPOSE) exec -T api memvault planner
+
+reindex: ## Re-embed everything with the current model (after leaving FAKE_TEI)
+	$(ADMIN) reindex
+
+psql: ## Open psql on the memsvc database as the superuser
+	$(COMPOSE) exec postgres psql -U postgres -d memsvc
+
+install-plugin: ## Build mem-hook and set up ~/.memory on this machine
+	./clients/claude-code-plugin/install.sh
+
+mcp-add: ## Register the memory MCP server with Claude Code (user scope)
+	claude mcp add -s user -t http memory '$${MEMORY_URL}/mcp' -H 'Authorization: Bearer $${MEMORY_TOKEN}'
+
+test: .env ## Run the Rust test suite against the compose Postgres
+	DATABASE_URL=postgres://postgres:$(POSTGRES_PASSWORD)@127.0.0.1:$(PG_PORT)/postgres \
+	  MEMSVC_APP_PASSWORD=$(MEMSVC_APP_PASSWORD) cargo test --workspace --no-fail-fast
+
+clean: ## Stop the stack and DELETE all data volumes (asks first)
+	@printf "This deletes the database and the TEI model cache. Type 'yes' to continue: "; \
+	read ans; [ "$$ans" = yes ] || { echo aborted; exit 1; }
+	COMPOSE_PROFILES=tei $(COMPOSE) down -v --remove-orphans

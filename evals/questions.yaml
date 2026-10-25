@@ -1,0 +1,18 @@
+# Held-out questions. Ids differ on every replay, so expectations name content:
+#   observation: case-insensitive substring of an observation title
+#   fact:        {subject, predicate} of a fact
+#   summary:     case-insensitive substring of a summary's request/learned/completed/next_steps
+# recall@5 counts an expectation as found when a matching item is among the top 5 recalled items.
+questions:
+  - id: parser-last-token
+    query: why does the parser drop the last token
+    expect:
+      - observation: parser drops the last token
+  - id: ci-cache
+    query: how did we speed up CI
+    expect:
+      - observation: caching cargo dependencies
+  - id: parser-next-steps
+    query: what is left to do for the parser fix
+    expect:
+      - summary: regression test

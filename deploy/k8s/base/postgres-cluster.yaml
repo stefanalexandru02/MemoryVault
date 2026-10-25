@@ -1,0 +1,82 @@
+# CloudNativePG cluster: one instance, Postgres 17, pgvector and pg_search (see docker/postgres.Dockerfile).
+# Spec section 14. Requires the CloudNativePG operator in the cluster.
+apiVersion: postgresql.cnpg.io/v1
+kind: Cluster
+metadata:
+  name: memory-pg
+spec:
+  instances: 1
+  # Replace the owner with the registry that holds the image built from deploy/docker/postgres.Dockerfile.
+  imageName: ghcr.io/REPLACE-OWNER/memvault-postgres:17
+  storage:
+    size: 50Gi
+  postgresql:
+    parameters:
+      shared_buffers: 1GB
+      maintenance_work_mem: 512MB
+      hnsw.ef_search: "80"
+  bootstrap:
+    initdb:
+      database: memsvc
+      # The migrations create tables and run the grants of 0099 as the database owner, which must be
+      # memsvc_system (BYPASSRLS, so the planner and migrations see every space).
+      owner: memsvc_system
+      # Runs as the superuser. CREATE EXTENSION needs superuser for these extensions, and migration 0001
+      # would otherwise have to run them as memsvc_system. Both are IF NOT EXISTS, so 0001 is a no-op.
+      postInitApplicationSQL:
+        - CREATE EXTENSION IF NOT EXISTS vector;
+        - |
+          DO $$
+          BEGIN
+            CREATE EXTENSION IF NOT EXISTS pg_search;
+          EXCEPTION WHEN OTHERS THEN
+            RAISE NOTICE 'pg_search not installed; BM25 falls back to tsvector';
+          END
+          $$;
+  managed:
+    roles:
+      # API and MCP: RLS applies (no BYPASSRLS). The app code also SET LOCAL ROLE memsvc_app.
+      - name: memsvc_app
+        ensure: present
+        login: true
+        inherit: false
+        passwordSecret:
+          name: memory-pg-memsvc-app
+      # Broker, worker, planner, migrations: BYPASSRLS, never used by the API.
+      - name: memsvc_system
+        ensure: present
+        login: true
+        inherit: false
+        bypassrls: true
+        passwordSecret:
+          name: memory-pg-memsvc-system
+  backup:
+    retentionPolicy: 30d
+    barmanObjectStore:
+      # Overlay patches endpointURL for the home MinIO. WAL archiving is continuous once this is set.
+      destinationPath: s3://memory-backups/memory-pg
+      endpointURL: http://minio.minio.svc.cluster.local:9000
+      s3Credentials:
+        accessKeyId:
+          name: memory-backup-s3
+          key: ACCESS_KEY_ID
+        secretAccessKey:
+          name: memory-backup-s3
+          key: SECRET_ACCESS_KEY
+      wal:
+        compression: gzip
+        maxParallel: 2
+      data:
+        compression: gzip
+        jobs: 2
+---
+# Nightly base backup at 03:00 (CloudNativePG cron has a leading seconds field).
+apiVersion: postgresql.cnpg.io/v1
+kind: ScheduledBackup
+metadata:
+  name: memory-pg-nightly
+spec:
+  schedule: "0 0 3 * * *"
+  backupOwnerReference: self
+  cluster:
+    name: memory-pg

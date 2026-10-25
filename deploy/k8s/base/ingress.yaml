@@ -1,0 +1,26 @@
+# Tailscale-only ingress: the tailnet is the network boundary (spec 5.1); bearer tokens sit on top of it.
+# Requires the Tailscale Kubernetes operator (ingressClassName tailscale).
+apiVersion: networking.k8s.io/v1
+kind: Ingress
+metadata:
+  name: memory
+  annotations:
+    # Spec 14 asks for this annotation. It is an ingress-nginx annotation and the Tailscale proxy ignores it;
+    # the 8 MB body limit is enforced by the server (core http layer) regardless.
+    nginx.ingress.kubernetes.io/proxy-body-size: 8m
+spec:
+  ingressClassName: tailscale
+  tls:
+    - hosts:
+        - memory
+  rules:
+    - host: memory
+      http:
+        paths:
+          - path: /
+            pathType: Prefix
+            backend:
+              service:
+                name: memory-api
+                port:
+                  number: 8000

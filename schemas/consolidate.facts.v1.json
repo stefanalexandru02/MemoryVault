@@ -1,0 +1,66 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "consolidate.facts.v1",
+  "title": "consolidate.facts.v1",
+  "description": "Fact-cluster decisions (spec 12.2). Ids are strings exactly as given in the packet inputs.",
+  "type": "object",
+  "required": ["decisions"],
+  "properties": {
+    "decisions": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["action", "reason"],
+        "properties": {
+          "action": {"enum": ["supersede", "merge_into", "keep_both", "retract", "promote_scope", "set_confidence"]},
+          "reason": {"type": "string", "minLength": 1}
+        },
+        "allOf": [
+          {
+            "if": {"properties": {"action": {"const": "supersede"}}},
+            "then": {
+              "required": ["target_id", "by_candidate_id"],
+              "properties": {
+                "target_id": {"type": "string"},
+                "by_candidate_id": {"type": "string"},
+                "valid_from": {"type": ["string", "null"]}
+              }
+            }
+          },
+          {
+            "if": {"properties": {"action": {"const": "merge_into"}}},
+            "then": {
+              "required": ["target_id", "candidate_id"],
+              "properties": {"target_id": {"type": "string"}, "candidate_id": {"type": "string"}}
+            }
+          },
+          {
+            "if": {"properties": {"action": {"const": "keep_both"}}},
+            "then": {
+              "required": ["ids"],
+              "properties": {"ids": {"type": "array", "minItems": 2, "items": {"type": "string"}}}
+            }
+          },
+          {
+            "if": {"properties": {"action": {"const": "retract"}}},
+            "then": {"required": ["target_id"], "properties": {"target_id": {"type": "string"}}}
+          },
+          {
+            "if": {"properties": {"action": {"const": "promote_scope"}}},
+            "then": {
+              "required": ["target_id", "to"],
+              "properties": {"target_id": {"type": "string"}, "to": {"enum": ["global", "project", "device", "agent"]}}
+            }
+          },
+          {
+            "if": {"properties": {"action": {"const": "set_confidence"}}},
+            "then": {
+              "required": ["target_id", "confidence"],
+              "properties": {"target_id": {"type": "string"}, "confidence": {"type": "number", "minimum": 0, "maximum": 1}}
+            }
+          }
+        ]
+      }
+    }
+  }
+}

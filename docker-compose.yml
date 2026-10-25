@@ -1,0 +1,128 @@
+# Local MemoryVault stack: Postgres (pgvector + pg_search), TEI embed and rerank, migrations, API,
+# worker and a planner scheduler. Same image and settings as deploy/k8s, minus Kubernetes.
+#
+#   make up        full stack (first start downloads the two TEI models, about 4.5 GB)
+#   make up-lite   no TEI: FAKE_TEI=1 deterministic embeddings, for trying the plumbing
+#
+# Settings and secrets come from .env (`make env` creates it from .env.example).
+
+name: memvault
+
+x-memvault: &memvault
+  image: memvault:local
+  build:
+    context: .
+    dockerfile: deploy/docker/server.Dockerfile
+  restart: unless-stopped
+  environment: &memvault-env
+    DATABASE_URL: postgres://memsvc_app:${MEMSVC_APP_PASSWORD:?run make env}@postgres:5432/memsvc
+    DATABASE_SYSTEM_URL: postgres://memsvc_system:${MEMSVC_SYSTEM_PASSWORD:?run make env}@postgres:5432/memsvc
+    TOKEN_PEPPER: ${TOKEN_PEPPER:?run make env}
+    FAKE_TEI: ${FAKE_TEI:-0}
+    TEI_EMBED_URL: http://tei-embed:8080
+    TEI_RERANK_URL: http://tei-rerank:8080
+    EMBED_MODEL: bge-m3
+    EMBED_DIMS: "1024"
+    RERANK_MODEL: bge-reranker-v2-m3
+    LOG_LEVEL: ${LOG_LEVEL:-info}
+    LOG_FORMAT: text
+  depends_on: &memvault-deps
+    migrate:
+      condition: service_completed_successfully
+    tei-embed:
+      condition: service_started
+      required: false
+    tei-rerank:
+      condition: service_started
+      required: false
+
+services:
+  postgres:
+    image: ${POSTGRES_IMAGE:-paradedb/paradedb:0.26.3-pg17}
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: postgres
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?run make env}
+      POSTGRES_DB: postgres
+      MEMSVC_APP_PASSWORD: ${MEMSVC_APP_PASSWORD}
+      MEMSVC_SYSTEM_PASSWORD: ${MEMSVC_SYSTEM_PASSWORD}
+    command: ["postgres", "-c", "shared_buffers=512MB", "-c", "maintenance_work_mem=256MB", "-c", "hnsw.ef_search=80"]
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./deploy/compose/initdb/20-memvault.sh:/docker-entrypoint-initdb.d/20-memvault.sh:ro
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${PG_PORT:-55432}:5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U postgres -d memsvc"]
+      interval: 5s
+      timeout: 3s
+      retries: 30
+
+  tei-embed:
+    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.8}
+    profiles: ["tei"]
+    restart: unless-stopped
+    command: ["--model-id", "BAAI/bge-m3", "--max-batch-tokens", "16384", "--port", "8080"]
+    volumes:
+      - tei-models:/data
+
+  tei-rerank:
+    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.8}
+    profiles: ["tei"]
+    restart: unless-stopped
+    command: ["--model-id", "BAAI/bge-reranker-v2-m3", "--port", "8080"]
+    volumes:
+      - tei-models:/data
+
+  migrate:
+    <<: *memvault
+    restart: "no"
+    command: ["migrate"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+
+  api:
+    <<: *memvault
+    command: ["serve"]
+    ports:
+      - "${BIND_ADDR:-127.0.0.1}:${MEMVAULT_PORT:-8000}:8000"
+    healthcheck:
+      # The runtime image has bash but no curl.
+      test: ["CMD", "bash", "-c", "exec 3<>/dev/tcp/127.0.0.1/8000 && printf 'GET /health HTTP/1.0\\r\\n\\r\\n' >&3 && head -n1 <&3 | grep -q ' 200 '"]
+      interval: 10s
+      timeout: 3s
+      retries: 12
+      start_period: 5s
+
+  worker:
+    <<: *memvault
+    command: ["worker"]
+    environment:
+      <<: *memvault-env
+      DATABASE_URL: postgres://memsvc_system:${MEMSVC_SYSTEM_PASSWORD}@postgres:5432/memsvc
+
+  # Stands in for the Kubernetes consolidation CronJob: one planning pass every PLANNER_INTERVAL_S.
+  # Planned packets are run by the clients (`mem-hook observe --all`), not here.
+  scheduler:
+    <<: *memvault
+    entrypoint: ["/usr/bin/tini", "--", "bash", "-c"]
+    command:
+      - |
+        trap 'exit 0' TERM INT
+        while true; do
+          memvault planner || echo "planner pass failed; retrying next interval" >&2
+          sleep "$${PLANNER_INTERVAL_S}" & wait $$!
+        done
+    environment:
+      <<: *memvault-env
+      DATABASE_URL: postgres://memsvc_system:${MEMSVC_SYSTEM_PASSWORD}@postgres:5432/memsvc
+      PLANNER_INTERVAL_S: ${PLANNER_INTERVAL_S:-86400}
+    depends_on:
+      <<: *memvault-deps
+      api:
+        condition: service_healthy
+
+volumes:
+  pgdata:
+  tei-models:
