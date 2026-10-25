@@ -253,6 +253,7 @@ fn send_once(app: &App, entry: &Entry, deadline: &Deadline) -> Result<Delivered,
         }
         return Err(judge(&resp));
     }
+    store::touch_delivery(app.home());
     let reply = resp.json().unwrap_or(Value::Null);
     if let Some(w) = reply.get("window_no").and_then(Value::as_i64) {
         store::update_cache(app.home(), &entry.target.claude_session_id, |c| c.window = w);

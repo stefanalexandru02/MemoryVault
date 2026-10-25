@@ -1,6 +1,7 @@
 use axum::http::{Method, StatusCode};
 use memvault_core::AppliersRegistry;
-use memvault_core::test_support::{send, test_settings, test_state, test_state_with};
+use memvault_core::auth::scopes::TokenKind;
+use memvault_core::test_support::{seed_identity, send, test_settings, test_state, test_state_with};
 use memvault_server::build_router;
 use sqlx::PgPool;
 
@@ -65,6 +66,21 @@ async fn viewer_is_served_with_a_strict_content_security_policy(pool: PgPool) {
     // And the script never writes markup.
     let js = send(&app, Method::GET, "/viewer/app.js", None, None).await.text();
     assert!(!js.contains(".innerHTML") && !js.contains("insertAdjacentHTML(") && !js.contains("document.write("));
+    // The Admin tab's Health panel reads the doctor endpoint.
+    assert!(js.contains("/v1/admin/doctor"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn admin_doctor_is_served_to_admin_tokens_only(pool: PgPool) {
+    let admin = seed_identity(&pool, TokenKind::Admin).await;
+    let device = seed_identity(&pool, TokenKind::Device).await;
+    let app = build_router(test_state(pool));
+    let r = send(&app, Method::GET, "/v1/admin/doctor", Some(&device.token), None).await;
+    assert_eq!((r.status, r.error_code().as_deref()), (StatusCode::FORBIDDEN, Some("insufficient_scope")));
+    let r = send(&app, Method::GET, "/v1/admin/doctor", Some(&admin.token), None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let checks = r.json()["checks"].clone();
+    assert!(checks.as_array().unwrap().iter().any(|c| c["name"] == "database" && c["status"] == "ok"), "{checks}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

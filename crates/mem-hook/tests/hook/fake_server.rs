@@ -41,6 +41,10 @@ pub struct State {
     pub packets: VecDeque<Value>,
     /// Replies for `POST /v1/work/{id}/result`; empty = 200.
     pub result_replies: VecDeque<(u16, Value)>,
+    /// Status of `GET /v1/me` (200 = a device token, 401 = rejected).
+    pub me_status: u16,
+    /// Reply of `GET /v1/admin/doctor`.
+    pub admin_doctor: (u16, Value),
 }
 
 #[derive(Clone)]
@@ -64,6 +68,11 @@ impl Fake {
             context: None,
             packets: VecDeque::new(),
             result_replies: VecDeque::new(),
+            me_status: 200,
+            admin_doctor: (
+                403,
+                json!({"error": {"code": "insufficient_scope", "message": "admin", "retryable": false}}),
+            ),
         }));
         let shared = state.clone();
         std::thread::spawn(move || {
@@ -175,6 +184,16 @@ fn route(s: &mut State, req: Req) -> (u16, &'static str, Value) {
     let route = path.split('?').next().unwrap_or_default().to_string();
     let segs: Vec<&str> = route.trim_matches('/').split('/').collect();
     match (method.as_str(), segs.as_slice()) {
+        ("GET", ["health"]) => (200, json, json!({"status": "ok", "db": true})),
+        ("GET", ["v1", "me"]) if s.me_status == 200 => (
+            200,
+            json,
+            json!({"device_id": "laptop-x1", "token_kind": "device", "scopes": ["events:write", "memories:read", "work:lease"]}),
+        ),
+        ("GET", ["v1", "me"]) => {
+            (s.me_status, json, json!({"error": {"code": "invalid_token", "message": "no", "retryable": false}}))
+        }
+        ("GET", ["v1", "admin", "doctor"]) => (s.admin_doctor.0, json, s.admin_doctor.1.clone()),
         ("POST", ["v1", "sessions"]) => (
             201,
             json,

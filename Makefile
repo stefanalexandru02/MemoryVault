@@ -32,10 +32,11 @@ MEMORY_URL    ?= http://$(API_HOST):$(MEMVAULT_PORT)
 
 ADMIN   := $(COMPOSE) exec -T -e LOG_LEVEL=warn api memvault admin
 CONNECT := ./clients/claude-code-plugin/connect.sh
+MEM_HOOK ?= ./clients/claude-code-plugin/bin/mem-hook
 
 .DEFAULT_GOAL := help
 .PHONY: help env build up up-lite down restart ps logs bootstrap user token tokens admin \
-        consolidate reindex psql connect-local connect-remote connect-status disconnect install-plugin test clean
+        consolidate reindex psql doctor connect-local connect-remote connect-status disconnect install-plugin test clean
 
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -104,6 +105,10 @@ reindex: ## Re-embed everything with the current model (after leaving FAKE_TEI)
 
 psql: ## Open psql on the memsvc database as the superuser
 	$(COMPOSE) exec postgres psql -U postgres -d memsvc
+
+doctor: ## Why is nothing remembered? Checks this machine, then the server (server checks need MEMORY_ADMIN_TOKEN)
+	@[ -x "$(MEM_HOOK)" ] || { echo "mem-hook is not built: run 'make install-plugin' first" >&2; exit 1; }
+	@$(MEM_HOOK) doctor --server
 
 connect-local: .env ## One step: mint a token for this machine, install the hooks and MCP server in Claude Code
 	@curl -fsS -o /dev/null -m 5 "$(MEMORY_URL)/health" \

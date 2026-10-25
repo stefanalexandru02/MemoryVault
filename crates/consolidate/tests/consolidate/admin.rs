@@ -64,6 +64,7 @@ async fn every_route_needs_the_admin_scope(pool: PgPool) {
         (Method::GET, "/v1/admin/jobs".into(), None),
         (Method::GET, "/v1/admin/packets?status=failed".into(), None),
         (Method::POST, format!("/v1/admin/packets/{id}/retry"), None),
+        (Method::GET, "/v1/admin/doctor".into(), None),
         (Method::POST, "/v1/admin/reindex".into(), None),
         (Method::POST, "/v1/admin/project-remap".into(), Some(json!({"from": "a", "to": "b"}))),
     ];

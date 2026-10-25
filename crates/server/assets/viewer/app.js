@@ -638,10 +638,25 @@
   // ---------- admin ----------
   async function renderAdmin() {
     const own = (state.token.split('_')[1] || '');
-    const tokens = h('div', {}), packets = h('div', {}), jobs = h('div', {});
+    const health = h('div', {}), tokens = h('div', {}), packets = h('div', {}), jobs = h('div', {});
     $main.replaceChildren(h('div', { class: 'page' }, h('div', { class: 'page-inner' },
+      h('div', { class: 'head-row' }, h('h2', { text: 'Health' }), h('button', { class: 'btn small', onclick: () => loadDoctor() }, 'Check again')), health,
       h('h2', { text: 'Tokens' }), tokens, h('h2', { text: 'Failed work packets' }), packets, h('h2', { text: 'Failed background jobs' }), jobs)));
 
+    // Server diagnosis (GET /v1/admin/doctor). detail and fix are server text: textContent only, the fix in <code>.
+    async function loadDoctor() {
+      health.replaceChildren(h('div', { class: 'muted', text: 'Checking…' }));
+      try {
+        const { checks } = await api('/v1/admin/doctor');
+        const level = { ok: 'ok', warn: 'warn', fail: 'bad' };
+        health.replaceChildren(h('div', { class: 'scroll-x' }, h('table', { class: 't' },
+          h('thead', {}, h('tr', {}, ['Check', 'Status', 'Detail'].map((c) => h('th', { text: c })))),
+          h('tbody', {}, checks.map((c) => h('tr', {},
+            h('td', { text: c.name }),
+            h('td', {}, h('i', { class: `dot ${level[c.status] || 'bad'}` }), ` ${c.status}`),
+            h('td', {}, c.detail, c.fix ? h('div', { class: 'muted' }, 'Fix: ', h('code', { text: c.fix })) : null)))))));
+      } catch (e) { if (e.status !== 401) health.replaceChildren(h('div', { class: 'error', text: e.message })); }
+    }
     async function loadTokens() {
       try {
         const list = await api('/v1/admin/tokens');
@@ -676,7 +691,7 @@
           h('tbody', {}, list.map((j) => h('tr', {}, h('td', { text: j.type }), h('td', { text: j.attempts }), h('td', { text: ago(j.created_at) }), h('td', { text: j.last_error || '' })))))) : h('div', { class: 'muted', text: 'None.' }));
       } catch (e) { if (e.status !== 401) jobs.replaceChildren(h('div', { class: 'error', text: e.message })); }
     }
-    loadTokens(); loadPackets(); loadJobs();
+    loadDoctor(); loadTokens(); loadPackets(); loadJobs();
   }
 
   // ---------- keyboard ----------

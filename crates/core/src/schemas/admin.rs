@@ -205,3 +205,58 @@ pub struct ReindexRequest {
 pub struct ReindexResponse {
     pub jobs_enqueued: i64,
 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum DoctorStatus {
+    Ok,
+    Warn,
+    Fail,
+}
+
+impl DoctorStatus {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            DoctorStatus::Ok => "ok",
+            DoctorStatus::Warn => "warn",
+            DoctorStatus::Fail => "fail",
+        }
+    }
+}
+
+/// One line of `GET /v1/admin/doctor`: what was checked, how it came out and, unless it is fine, the
+/// command or setting that fixes it.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoctorCheck {
+    pub name: String,
+    pub status: DoctorStatus,
+    pub detail: String,
+    #[serde(default)]
+    pub fix: Option<String>,
+}
+
+impl DoctorCheck {
+    pub fn ok(name: &str, detail: impl Into<String>) -> Self {
+        Self { name: name.into(), status: DoctorStatus::Ok, detail: detail.into(), fix: None }
+    }
+
+    pub fn warn(name: &str, detail: impl Into<String>, fix: impl Into<String>) -> Self {
+        Self { name: name.into(), status: DoctorStatus::Warn, detail: detail.into(), fix: Some(fix.into()) }
+    }
+
+    pub fn fail(name: &str, detail: impl Into<String>, fix: impl Into<String>) -> Self {
+        Self { name: name.into(), status: DoctorStatus::Fail, detail: detail.into(), fix: Some(fix.into()) }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DoctorResponse {
+    pub checks: Vec<DoctorCheck>,
+}
+
+impl DoctorResponse {
+    /// No check failed (warnings do not count).
+    pub fn healthy(&self) -> bool {
+        self.checks.iter().all(|c| c.status != DoctorStatus::Fail)
+    }
+}

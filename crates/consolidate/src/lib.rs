@@ -17,6 +17,7 @@ pub mod admin;
 pub mod admin_cli;
 pub mod appliers;
 pub mod audit;
+pub mod doctor;
 pub mod ops;
 pub mod planner;
 pub mod profiles;

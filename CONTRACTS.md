@@ -330,7 +330,7 @@ JSON 404/405 fallbacks, `DefaultBodyLimit` 8 MB, request ids (`x-request-id`), t
 CLI `memvault`: `serve [--host] [--port]` (graceful shutdown on SIGINT/SIGTERM), `worker`
 (`memvault_worker::run_worker_with(state, batch_embedder(&state), shutdown)`), `planner [--space-id]`,
 `migrate [--dsn]`,
-`admin <args...>` -> `memvault_consolidate::admin_cli::run`, `evals <args...>` -> `memvault_evals::cli::run`.
+`admin <args...>` -> `memvault_consolidate::admin_cli::run` (including `admin doctor [--json]`, the checks of `GET /v1/admin/doctor`), `evals <args...>` -> `memvault_evals::cli::run`.
 
 ## Cross-crate signatures (fill in, keep the signatures)
 

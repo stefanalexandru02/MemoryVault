@@ -35,6 +35,31 @@ fn civil_from_days(days: i64) -> (i64, u32, u32) {
     (y, m, d)
 }
 
+/// (year, month, day) to days since 1970-01-01; the inverse of [`civil_from_days`].
+fn days_from_civil(y: i64, m: u32, d: u32) -> i64 {
+    let y = if m <= 2 { y - 1 } else { y };
+    let era = y.div_euclid(400);
+    let yoe = y - era * 400;
+    let doy = (153 * i64::from((m + 9) % 12) + 2) / 5 + i64::from(d) - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
+/// Seconds since the epoch of a timestamp in the shape [`rfc3339`] writes (`2026-10-24T09:30:00.123Z`).
+pub fn parse_rfc3339(s: &str) -> Option<i64> {
+    let b = s.as_bytes();
+    if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[10] != b'T' || b[13] != b':' || b[16] != b':' {
+        return None;
+    }
+    let num = |from: usize, to: usize| s.get(from..to)?.parse::<u32>().ok();
+    let (y, mo, d) = (i64::from(num(0, 4)?), num(5, 7)?, num(8, 10)?);
+    let (h, mi, sec) = (num(11, 13)?, num(14, 16)?, num(17, 19)?);
+    if !(1..=12).contains(&mo) || !(1..=31).contains(&d) || h > 23 || mi > 59 || sec > 60 {
+        return None;
+    }
+    Some(days_from_civil(y, mo, d) * 86_400 + i64::from(h * 3600 + mi * 60 + sec))
+}
+
 /// `2026-10-24T09:30:00.123Z`.
 pub fn rfc3339(secs: i64, millis: u32) -> String {
     let (y, mo, d) = civil_from_days(secs.div_euclid(86_400));
@@ -225,6 +250,15 @@ mod tests {
         assert_eq!(rfc3339(1_782_293_400, 123), "2026-06-24T09:30:00.123Z");
         assert_eq!(rfc3339(951_782_400, 0), "2000-02-29T00:00:00.000Z");
         assert_eq!(yyyymmdd(1_782_293_400), "20260624");
+    }
+
+    #[test]
+    fn rfc3339_round_trips() {
+        for secs in [0, 951_782_400, 1_782_293_400, 4_102_444_799] {
+            assert_eq!(parse_rfc3339(&rfc3339(secs, 250)), Some(secs));
+        }
+        assert_eq!(parse_rfc3339("yesterday"), None);
+        assert_eq!(parse_rfc3339("2026-13-01T00:00:00Z"), None);
     }
 
     #[test]

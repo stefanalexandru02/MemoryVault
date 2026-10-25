@@ -103,6 +103,22 @@ impl TestEnv {
         Self::finish(cmd, Some(input.to_string()))
     }
 
+    /// Runs `mem-hook doctor <args>` to completion.
+    pub fn doctor(&self, args: &[&str]) -> Out {
+        let mut all = vec!["doctor"];
+        all.extend_from_slice(args);
+        let mut cmd = self.command(&all);
+        cmd.current_dir(&self.cwd);
+        Self::finish(cmd, None)
+    }
+
+    /// Writes Claude Code's user settings (`$HOME/.claude/settings.json`).
+    pub fn write_claude_settings(&self, settings: &Value) {
+        let dir = self.dir.path().join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
+    }
+
     /// Runs `mem-hook observe ...` to completion.
     pub fn observe(&self, args: &[&str]) -> Out {
         let mut all = vec!["observe"];

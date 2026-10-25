@@ -9,9 +9,9 @@ use axum::routing::{delete, get, post};
 use memvault_core::auth::{self, Identity, require_scope};
 use memvault_core::http::{Json, Path, Query};
 use memvault_core::schemas::admin::{
-    ConsolidateRequest, ConsolidateResponse, JobOut, MembershipCreate, MembershipOut, PacketRetryRequest,
-    ReindexRequest, ReindexResponse, RevertResponse, SpaceCreate, SpaceOut, TokenCreate, TokenMinted, TokenOut,
-    UserCreate, UserOut,
+    ConsolidateRequest, ConsolidateResponse, DoctorResponse, JobOut, MembershipCreate, MembershipOut,
+    PacketRetryRequest, ReindexRequest, ReindexResponse, RevertResponse, SpaceCreate, SpaceOut, TokenCreate,
+    TokenMinted, TokenOut, UserCreate, UserOut,
 };
 use memvault_core::schemas::common::{PacketKind, PacketStatus};
 use memvault_core::schemas::work::PacketRecord;
@@ -37,6 +37,7 @@ pub fn router() -> Router<AppState> {
         .route("/admin/jobs", get(list_jobs))
         .route("/admin/packets", get(list_packets))
         .route("/admin/packets/{id}/retry", post(retry_packet))
+        .route("/admin/doctor", get(doctor))
         .route("/admin/reindex", post(reindex))
         .route("/admin/project-remap", post(remap_project))
 }
@@ -235,6 +236,11 @@ async fn retry_packet(
     let out = ops::retry_packet(&mut tx, id, reset).await?;
     tx.commit().await?;
     Ok(Json(out))
+}
+
+async fn doctor(State(state): State<AppState>, identity: Identity) -> Result<Json<DoctorResponse>, ApiError> {
+    admin(&state, &identity).await?;
+    Ok(Json(crate::doctor::doctor(&state).await))
 }
 
 async fn reindex(

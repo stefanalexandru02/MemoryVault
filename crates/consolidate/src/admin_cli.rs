@@ -11,6 +11,7 @@
 //! memvault admin consolidate revert <run_id>
 //! memvault admin packets list --status failed | packets retry <id>
 //! memvault admin reindex [--model m] [--table facts]... [--space-id <uuid>]
+//! memvault admin doctor [--json]
 //! memvault admin project remap --from <old> --to <new> [--space-id <uuid>]
 //! ```
 
@@ -79,6 +80,12 @@ enum Command {
     /// Project keys.
     #[command(subcommand)]
     Project(ProjectCommand),
+    /// Diagnose the server side (database, extensions, embeddings, queues); exits 1 if a check fails.
+    Doctor {
+        /// Print the checks as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -266,6 +273,20 @@ async fn execute(state: &AppState, command: Command, out: &mut dyn Write) -> Res
         Command::Consolidate(ConsolidateCommand::Now { space_id }) => {
             print(out, &api(run_planner(state, space_id).await)?)
         }
+        Command::Doctor { json } => {
+            let report = crate::doctor::doctor(state).await;
+            if json {
+                print(out, &report)?;
+            } else {
+                for c in &report.checks {
+                    writeln!(out, "{:<4} {:<18} {}", c.status.as_str(), c.name, c.detail)?;
+                    if let Some(fix) = &c.fix {
+                        writeln!(out, "     fix: {fix}")?;
+                    }
+                }
+            }
+            if report.healthy() { Ok(()) } else { bail!("doctor: at least one check failed") }
+        }
         command => {
             let mut tx = system_tx(pool).await.context("connecting to the database")?;
             let conn = &mut *tx;
@@ -345,7 +366,7 @@ async fn execute(state: &AppState, command: Command, out: &mut dyn Write) -> Res
                 Command::Project(ProjectCommand::Remap { from, to, space_id }) => {
                     print(out, &api(ops::remap_project(conn, &RemapRequest { from, to, space_id }, CLI_ACTOR).await)?)?
                 }
-                Command::Consolidate(ConsolidateCommand::Now { .. }) => bail!("unreachable"),
+                Command::Consolidate(ConsolidateCommand::Now { .. }) | Command::Doctor { .. } => bail!("unreachable"),
             }
             tx.commit().await?;
             Ok(())

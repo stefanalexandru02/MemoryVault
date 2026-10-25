@@ -32,3 +32,8 @@ it is read. The `recall`, `brief` and `project-history` skills describe how to s
 where an entry came from. To keep one project out of memory entirely, add its key to `~/.memory/exclude`
 (one project key per line, such as `github.com/me/private-repo`). To stop capture on this machine, run
 `make disconnect` in the MemoryVault checkout.
+
+**Troubleshooting.** When the user asks why nothing is remembered, have them run `mem-hook doctor` (the binary is
+`bin/mem-hook` in the plugin; `make doctor` in the MemoryVault checkout also asks the server). It checks the
+config, the server, the token, the plugin, the spool of undelivered events and the last successful delivery, and
+prints the command that fixes each failing line.

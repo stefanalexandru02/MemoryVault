@@ -63,8 +63,16 @@ uses the fake deterministic embedder: the plumbing works, recall quality does no
 moving from `up-lite` to `up`.
 
 Other targets: `make logs SERVICE=api`, `make ps`, `make down` (keeps data), `make psql`,
-`make consolidate`, `make admin ARGS="space list"`, `make token HANDLE=alex CLIENT=desktop KIND=runner`,
+`make consolidate`, `make doctor`, `make admin ARGS="space list"`, `make token HANDLE=alex CLIENT=desktop KIND=runner`,
 `make test` (the Rust suite against the compose Postgres) and `make clean` (deletes the volumes, asks first).
+
+If nothing seems to be remembered, run `make doctor`. It runs `mem-hook doctor` on this machine (config, server
+reachable, token valid, hook binary, Claude Code plugin enabled, spool backlog, session cache, last delivery),
+then asks the server for its own checks. Every failing line comes with the command that fixes it, and the exit
+status is 1 when a check fails. The server checks (`GET /v1/admin/doctor`: migrations, pgvector and pg_search,
+embedding backlog, embed queue, TEI, work packet queue, runners, last consolidation) need an admin token: put
+`MEMORY_ADMIN_TOKEN=mem_...` in `~/.memory/config` or the environment, or run
+`docker compose exec api memvault admin doctor [--json]` on the server.
 
 The API and Postgres bind to `127.0.0.1` by default. To serve other machines, set `BIND_ADDR` in `.env`
 to the host's LAN or Tailscale address and use `MEMORY_URL=http://<that address>:8000` on the clients.
@@ -114,7 +122,7 @@ export FAKE_TEI=1                             # deterministic embeddings, no TEI
 cargo run -p memvault -- serve --port 8000    # applies pending migrations, then serves the HTTP API and MCP server
 cargo run -p memvault -- worker               # embed jobs, sweeps, re-render, retention (waits for the schema)
 cargo run -p memvault -- planner              # one consolidation planning pass
-cargo run -p memvault -- admin --help         # users, spaces, tokens, consolidation, reindex
+cargo run -p memvault -- admin --help         # users, spaces, tokens, consolidation, reindex, doctor
 cargo run -p memvault -- evals --help         # record, redact, replay, compare
 ```
 
@@ -144,7 +152,8 @@ there). Open it, paste a device token (`make token`, or the one in `~/.memory/co
   fact rests on, the audit history) and what was recorded around it;
 - forget a memory, with a reason that goes to the audit log;
 - read the open work lists per project;
-- with an admin token: list and revoke tokens, and see failed work packets and background jobs, with a retry.
+- with an admin token: see the server's health checks (the same as `memvault admin doctor`), list and revoke
+  tokens, and see failed work packets and background jobs, with a retry.
 
 The viewer is three static files compiled into the server (`crates/server/assets/viewer`). It calls the same
 `/v1` API as the clients, so it shows exactly what your token may see and nothing more. The token stays in
@@ -299,7 +308,7 @@ run, then reverted) needs a live run. The on-demand consolidation trigger from a
 
 **Phase 4: polish.** Built: procedure mining (through `consolidate_procedures`) and the Rust hook binary for
 Linux. The hook code type-checks for Windows but has not been run there. The RLS test suite exists in the crate
-tests. Not built: the file-context hook, the admin viewer UI, OAuth for more users, KEDA scaling (no
+tests. Not built: OAuth for more users, KEDA scaling (no
 ScaledObject in the base), and export and import per space.
 
 ## More

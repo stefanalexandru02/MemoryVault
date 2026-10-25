@@ -238,6 +238,16 @@ pub async fn retry_packet(conn: &mut PgConnection, id: Uuid, reset_attempts: boo
 
 // ---------- reindex ----------
 
+/// SQL condition selecting the rows of `table` that get embeddings (`true` when all do).
+pub(crate) fn live_filter(table: EmbeddingOwnerTable) -> &'static str {
+    match table {
+        EmbeddingOwnerTable::Observations => "archived_at IS NULL",
+        EmbeddingOwnerTable::Facts => "status IN ('candidate', 'active')",
+        EmbeddingOwnerTable::Procedures => "status = 'active'",
+        EmbeddingOwnerTable::Summaries | EmbeddingOwnerTable::Entities => "true",
+    }
+}
+
 /// Queue `embed` jobs for every live row of the chosen tables (default: all five), optionally in one
 /// space. The payload carries the target `model` for the worker.
 pub async fn reindex(
@@ -249,14 +259,9 @@ pub async fn reindex(
     let tables: Vec<EmbeddingOwnerTable> = req.tables.clone().unwrap_or_else(|| EmbeddingOwnerTable::ALL.to_vec());
     let mut enqueued = 0_i64;
     for table in tables {
-        let live = match table {
-            EmbeddingOwnerTable::Observations => "AND archived_at IS NULL",
-            EmbeddingOwnerTable::Facts => "AND status IN ('candidate', 'active')",
-            EmbeddingOwnerTable::Procedures => "AND status = 'active'",
-            EmbeddingOwnerTable::Summaries | EmbeddingOwnerTable::Entities => "",
-        };
+        let live = live_filter(table);
         let owners: Vec<Uuid> = sqlx::query_scalar(&format!(
-            "SELECT id FROM {table} WHERE ($1::uuid IS NULL OR space_id = $1) {live} ORDER BY id"
+            "SELECT id FROM {table} WHERE ($1::uuid IS NULL OR space_id = $1) AND {live} ORDER BY id"
         ))
         .bind(req.space_id)
         .fetch_all(&mut *conn)

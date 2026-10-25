@@ -20,7 +20,7 @@ pub struct Cache {
     pub surfaced_files: Vec<String>,
 }
 
-fn sessions_dir(home: &Path) -> PathBuf {
+pub fn sessions_dir(home: &Path) -> PathBuf {
     home.join("sessions")
 }
 
@@ -44,6 +44,24 @@ pub fn update_cache<R>(home: &Path, claude_sid: &str, f: impl FnOnce(&mut Cache)
         }
     }
     out
+}
+
+/// `last-delivery`: its modification time is the last request the server accepted, for `mem-hook doctor`.
+/// Refreshed at most once a minute so the hot path does not write on every event; best effort.
+pub fn touch_delivery(home: &Path) {
+    let path = delivery_marker(home);
+    let fresh = std::fs::metadata(&path)
+        .and_then(|m| m.modified())
+        .ok()
+        .and_then(|t| t.elapsed().ok())
+        .is_some_and(|age| age < Duration::from_secs(60));
+    if !fresh {
+        let _ = util::write_private(&path, util::now_rfc3339());
+    }
+}
+
+pub fn delivery_marker(home: &Path) -> PathBuf {
+    home.join("last-delivery")
 }
 
 /// Takes the next event sequence number (and counts a prompt when asked).

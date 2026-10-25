@@ -63,18 +63,22 @@ fn hostname() -> String {
         .unwrap_or_else(|| "unknown".into())
 }
 
+/// The settings in `home/config` (empty when the file is missing or unreadable).
+pub fn read_file(home: &Path) -> HashMap<String, String> {
+    std::fs::read_to_string(home.join("config")).map(|t| parse(&t)).unwrap_or_default()
+}
+
+/// `key` from the config file, else the environment; blank counts as unset. The file wins over the
+/// environment, like sourcing it would.
+pub fn lookup(file: &HashMap<String, String>, key: &str) -> Option<String> {
+    file.get(key).cloned().or_else(|| std::env::var(key).ok()).map(|v| v.trim().to_string()).filter(|v| !v.is_empty())
+}
+
 impl Config {
-    /// None when `MEMORY_URL` or `MEMORY_TOKEN` is missing. Values in the file win over the
-    /// environment, like sourcing the file would.
+    /// None when `MEMORY_URL` or `MEMORY_TOKEN` is missing.
     pub fn load(home: &Path) -> Option<Config> {
-        let file = std::fs::read_to_string(home.join("config")).map(|t| parse(&t)).unwrap_or_default();
-        let get = |key: &str| {
-            file.get(key)
-                .cloned()
-                .or_else(|| std::env::var(key).ok())
-                .map(|v| v.trim().to_string())
-                .filter(|v| !v.is_empty())
-        };
+        let file = read_file(home);
+        let get = |key: &str| lookup(&file, key);
         let url = get("MEMORY_URL")?.trim_end_matches('/').to_string();
         let token = get("MEMORY_TOKEN")?;
         Some(Config {

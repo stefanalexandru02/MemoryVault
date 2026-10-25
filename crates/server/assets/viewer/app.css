@@ -189,6 +189,8 @@ table.t td { padding: 6px 8px; border-bottom: 1px solid var(--line); vertical-al
 .page { height: 100%; overflow: auto; padding: 20px 24px 40px; }
 .page-inner { max-width: 1000px; display: grid; gap: 22px; }
 .page h2 { font-size: 18px; }
+.head-row { display: flex; align-items: center; gap: 12px; }
+td .dot { display: inline-block; }
 .toolbar { display: flex; gap: 12px; flex-wrap: wrap; align-items: end; }
 
 /* ---------- toast + dialog ---------- */

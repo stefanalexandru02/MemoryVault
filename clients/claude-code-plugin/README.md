@@ -92,8 +92,9 @@ Headless runs that should use memory pass `--allowedTools "mcp__plugin_memory_me
 | `subagent-stop` | SubagentStop | Posts `subagent_stop`. |
 | `session-end` | SessionEnd | `POST /v1/sessions/{id}/end` within a 1 s budget, then starts the observer with `--final`. |
 | `observe` | (spawned) | The observer runner, below. |
+| `doctor` | (by hand) | Diagnosis, below. Unlike the hooks it prints to the terminal and exits 1 when a check fails. |
 
-Every invocation exits 0, whatever happens. Each starts with the same checks: nothing happens when
+Every hook invocation exits 0, whatever happens (`doctor` is the exception). Each starts with the same checks: nothing happens when
 `MEMORY_OBSERVER` is set (recursion guard), when `MEMORY_URL`/`MEMORY_TOKEN` are missing (a one-line
 stderr hint once a day on `session-start`), or when the project is listed in `~/.memory/exclude`.
 
@@ -111,6 +112,28 @@ has a stable idempotency key (`<session>:<seq>`). A request that cannot be deliv
 timeout, 5xx, 429, 401/403/404) is appended to `~/.memory/spool/YYYYMMDD.jsonl` and replayed in order at the
 next `session-start`; replay stops at the first failure. A request the server rejects as invalid (other
 4xx) is dropped. The request timeout is 2 s.
+
+## Doctor
+
+`mem-hook doctor [--json] [--server]` answers "why is nothing being remembered?". It prints one line per check
+with `[ ok ]`, `[warn]` or `[FAIL]` and, unless the check passed, the command that fixes it:
+
+| Check | Looks at |
+|---|---|
+| `config` | `~/.memory/config` exists, every line is `KEY=value`, `MEMORY_URL` and `MEMORY_TOKEN` are set |
+| `server` | `GET /health` (3 s) |
+| `token` | `GET /v1/me`: accepted, token kind and scopes (a token without `events:write` cannot record) |
+| `environment` | `MEMORY_OBSERVER` is not set (it makes every hook return at once) |
+| `hook binary` | the path and version of the running binary |
+| `plugin` | `enabledPlugins` and `disableAllHooks` in `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR`) and the project's `.claude/settings*.json`; read from disk, `claude` is not run |
+| `spool` | undelivered events and the age of the oldest (a warning, a failure after a day) |
+| `session cache` | `~/.memory/sessions` is writable |
+| `last delivery` | when the server last accepted a request from this machine (`~/.memory/last-delivery`, refreshed at most once a minute) |
+
+`--json` prints the same checks as `{"checks": [{name, status, detail, fix}]}`. `--server` appends the server's
+own checks from `GET /v1/admin/doctor`, which needs an admin token: set `MEMORY_ADMIN_TOKEN` in the config file
+or the environment (the device token is tried otherwise, and the section is skipped with a hint when it is
+refused). `make doctor` in the repository runs `mem-hook doctor --server`.
 
 ## The observer
 
@@ -144,10 +167,11 @@ leases packets of any session. Run it from cron on an always-on machine with `cl
 
 | Path | Content |
 |---|---|
-| `config` | `MEMORY_URL`, `MEMORY_TOKEN`, optional `DEVICE_ID`, `CLAUDE_BIN` (mode 0600) |
+| `config` | `MEMORY_URL`, `MEMORY_TOKEN`, optional `DEVICE_ID`, `CLAUDE_BIN`, `MEMORY_ADMIN_TOKEN` (mode 0600) |
 | `exclude` | project keys to ignore |
 | `sessions/` | per-session cache: server session id, next sequence number, window, prompt count |
 | `spool/` | undelivered requests, one JSON line each |
+| `last-delivery` | modification time = last request the server accepted (for `doctor`) |
 | `cache/` | last context block per project |
 | `observe.lock`, `observe.log` | observer lock and log |
 
