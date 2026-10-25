@@ -53,6 +53,12 @@ impl TestEnv {
         .unwrap();
     }
 
+    /// Adds a line to `config`; a later line wins over an earlier one.
+    pub fn append_config(&self, line: &str) {
+        let path = self.home.join("config");
+        std::fs::write(&path, format!("{}{line}\n", std::fs::read_to_string(&path).unwrap())).unwrap();
+    }
+
     /// Hook stdin: the common fields plus `extra`.
     pub fn input(&self, event: &str, extra: Value) -> Value {
         let mut v = json!({"session_id": SESSION, "cwd": self.cwd, "hook_event_name": event});

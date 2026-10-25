@@ -18,6 +18,9 @@ pub struct Cache {
     /// Files whose past observations were already shown this session (`file-context`).
     #[serde(default)]
     pub surfaced_files: Vec<String>,
+    /// Estimated tokens `file-context` has added to the session so far.
+    #[serde(default)]
+    pub file_context_tokens: u32,
 }
 
 pub fn sessions_dir(home: &Path) -> PathBuf {
@@ -89,6 +92,24 @@ pub fn first_surface(home: &Path, claude_sid: &str, path: &str) -> bool {
         c.surfaced_files.push(path.to_string());
         true
     })
+}
+
+/// Takes `tokens` from the session's `budget` of `file-context` output; false (and nothing taken) when they do
+/// not fit.
+pub fn take_file_context_budget(home: &Path, claude_sid: &str, tokens: u32, budget: u32) -> bool {
+    update_cache(home, claude_sid, |c| {
+        let spent = c.file_context_tokens.saturating_add(tokens);
+        if spent > budget {
+            return false;
+        }
+        c.file_context_tokens = spent;
+        true
+    })
+}
+
+/// What is left of the session's `budget` of `file-context` output.
+pub fn file_context_left(home: &Path, claude_sid: &str, budget: u32) -> u32 {
+    update_cache(home, claude_sid, |c| budget.saturating_sub(c.file_context_tokens))
 }
 
 /// Session caches older than 30 days are deleted.
@@ -172,6 +193,18 @@ mod tests {
         assert!(first_surface(dir.path(), "s2", "/a/b.rs"));
         // The sequence counters share the cache file and are untouched.
         assert_eq!(alloc_seq(dir.path(), "s1", false), 0);
+    }
+
+    #[test]
+    fn file_context_spends_a_per_session_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(take_file_context_budget(dir.path(), "s1", 100, 250));
+        assert!(take_file_context_budget(dir.path(), "s1", 100, 250));
+        assert!(!take_file_context_budget(dir.path(), "s1", 100, 250), "a third block would pass 250");
+        assert_eq!(file_context_left(dir.path(), "s1", 250), 50);
+        assert!(take_file_context_budget(dir.path(), "s1", 50, 250), "a smaller one still fits");
+        assert_eq!(file_context_left(dir.path(), "s1", 250), 0);
+        assert_eq!(file_context_left(dir.path(), "s2", 250), 250);
     }
 
     #[test]

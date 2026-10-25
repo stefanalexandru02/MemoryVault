@@ -1,6 +1,6 @@
 ---
 name: recall
-description: Search shared memory for earlier work. Use when the user asks what was decided or done before ("did we", "last time", "why did we", "how did we fix"), refers to something from another session or machine, or when starting work that may repeat earlier work, such as a bug that was probably seen before.
+description: Search shared memory when the user refers to earlier work ("last time", "did we", "why did we"), another session or machine, or wants a project's history over a period.
 ---
 
 # Recall from shared memory
@@ -37,3 +37,21 @@ Then answer from what you read:
   the session, the events and the extractor behind it, and the versions it replaced.
 - Context injected at the start of a session (if present) is a digest of this same memory. Search when you
   need more than the digest shows.
+
+## A project's history over a period
+
+For "what happened on this project", a timeline, a weekly digest or "what did we do last month": build the story
+from recorded observations, not from guesses, and say which period each part covers.
+
+1. Fix the project (default: the current one) and the period with the user if they are unclear.
+2. Page through the period with `memory_search` using `scope: "project"` and `since`, in slices (a week or a month)
+   so nothing important drops off the end of a list. A few broad queries ("decision", "bug fix", "design",
+   "release") and `types` such as `decision` and `bugfix` bring the important entries forward. Use
+   `memory_timeline` around turning points, and fetch bodies with `memory_get` only for decisions, reversals and
+   incidents.
+3. For "what did we believe then", run `memory_search` with `as_of` at the start and at the end of the period and
+   compare. For a fact or procedure that changed, `memory_get` with `trace: true` lists every version, oldest
+   first, with when each held and who replaced it and why.
+4. Write in order of time: the goal, what was tried, what was decided and why, what was left open. Quote ids or
+   dates for the claims that matter, and finish with open threads (recorded next steps not yet done, decisions
+   never confirmed). If memory holds little for the period, say so instead of padding the report.

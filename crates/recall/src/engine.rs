@@ -928,6 +928,10 @@ fn index_row(row: &TierRow, score: Option<f64>, anchor: bool) -> IndexRow {
         TierRow::Proc(r) => procedure_caution(r.success_count, r.failure_count),
         TierRow::Obs(_) | TierRow::Sum(_) | TierRow::Doc(_) => None,
     };
+    let importance = match row {
+        TierRow::Obs(r) => Some(round6(f64::from(r.importance))),
+        _ => None,
+    };
     IndexRow {
         id: row.id(),
         table,
@@ -939,6 +943,7 @@ fn index_row(row: &TierRow, score: Option<f64>, anchor: bool) -> IndexRow {
         score: score.map(round6),
         is_anchor: anchor,
         caution,
+        importance,
     }
 }
 

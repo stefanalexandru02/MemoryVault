@@ -595,11 +595,15 @@ and repeated items are merged. The last section lists the gaps that are still op
   the token as an environment reference. The plugin now ships `.mcp.json` and takes the URL and token from its own
   `userConfig` (token in the keychain, or `~/.claude/.credentials.json` where there is none), so no shell profile
   is involved and IDE and desktop apps connect too. Tool names become `mcp__plugin_memory_memory__*`. The plugin
-  also ships seven skills (`recall`, `remember`, `brief`, `project-history`, `handoff`, `ingest`, `how-it-works`), which the
-  spec does not list. `make connect-local`, `make connect-remote` and `make disconnect` wrap the setup.
-- **File-context hook is informational.** Phase 4's file-context hook is built as a `PreToolUse` hook on `Read`
-  (`mem-hook file-context`). It adds earlier observations for the file as context, once per file per session, and
-  never blocks or replaces the read. claude-mem's file-read gate can replace a read of a large unchanged file with
+  also ships six skills (`recall`, `remember`, `brief`, `handoff`, `ingest`, `how-it-works`), which the
+  spec does not list; only `recall` and `remember` are model-invocable, so their frontmatter is all the skills put
+  into a session (the project history guide is a section of `recall`). `make connect-local`, `make connect-remote`
+  and `make disconnect` wrap the setup.
+- **File-context hook is informational and small.** Phase 4's file-context hook is built as a `PreToolUse` hook on
+  `Read` (`mem-hook file-context`). It adds a one-line header and at most three titles with short ids for the file
+  (project-relative path; minor observations, importance below 0.4, and near-duplicate titles left out; silent when
+  nothing is left), once per file per session, within `MEM_FILE_CONTEXT_BUDGET` estimated tokens per session
+  (default 1,200; 0 turns the hook off), and never blocks or replaces the read. claude-mem's file-read gate can replace a read of a large unchanged file with
   its timeline; this one does not, because a wrong block costs the agent the file.
 - **Web viewer.** Phase 4's admin viewer is a static page at `/viewer` that signs in with a bearer token. It lists,
   searches and forgets memories, shows provenance and work state, and for admin tokens lists and revokes tokens and

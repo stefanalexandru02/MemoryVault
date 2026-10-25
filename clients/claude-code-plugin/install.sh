@@ -49,6 +49,7 @@ MEMORY_TOKEN=
 # DEVICE_ID=laptop-x1
 # CLAUDE_BIN=/usr/local/bin/claude
 # MEM_INJECTION=lean       # lean or full: what a session starts with (see the README)
+# MEM_FILE_CONTEXT_BUDGET=1200   # tokens per session for notes shown before a file is read; 0 turns it off
 CONFIG
   echo "wrote $memory_home/config (fill in MEMORY_URL and MEMORY_TOKEN)"
 else

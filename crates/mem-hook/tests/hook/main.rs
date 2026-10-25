@@ -7,6 +7,7 @@ mod events;
 mod fake_server;
 mod generic;
 mod ingest;
+mod inject;
 mod observe;
 mod session_start;
 mod spool;

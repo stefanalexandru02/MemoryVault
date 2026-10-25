@@ -9,17 +9,18 @@ A Claude Code plugin with four parts:
   `trace`, it adds where a memory came from and how it changed), `memory_remember`, `memory_forget`,
   `memory_feedback` and `work_state_write`. It reads its URL and token from the
   plugin's own settings (`userConfig`); the token is kept in the keychain, not in a file you edit.
-- **Skills**, invoked as `/memory:<name>` or picked up by Claude from the description:
+- **Skills**, invoked as `/memory:<name>`. Only `recall` and `remember` are loaded into every session (about 80
+  estimated tokens of frontmatter) and picked up by Claude from their description; the others are set to
+  `disable-model-invocation`, so they cost nothing until you invoke them:
 
   | Skill | Use it to |
   |---|---|
-  | `recall` | search earlier work (search, then timeline, then get), look at it as of an earlier date, trace where a memory came from, and tell memory when a recalled fact was wrong or outdated |
+  | `recall` | search earlier work (search, then timeline, then get), look at it as of an earlier date, trace where a memory came from, write a project's history over a period, and tell memory when a recalled fact was wrong or outdated |
   | `remember` | store a fact, note or procedure on request, or forget one after confirming it |
-  | `brief` | compile a sourced briefing on a topic from facts, procedures and past work |
-  | `project-history` | write a narrative of a project over a period from the recorded timeline, using `as_of` and `memory_get` with `trace` for what changed |
-  | `handoff` | leave the goal, state and next steps as work state for the next session, on any machine |
-  | `ingest` | send the repository's docs (ADRs, READMEs, runbooks) to memory with `mem-hook ingest`; only on request |
-  | `how-it-works` | explain what is captured, where it lives, and how to inspect or delete it |
+  | `brief` | compile a sourced briefing on a topic from facts, procedures and past work (you invoke it) |
+  | `handoff` | leave the goal, state and next steps as work state for the next session, on any machine (you invoke it) |
+  | `ingest` | send the repository's docs (ADRs, READMEs, runbooks) to memory with `mem-hook ingest` (you invoke it) |
+  | `how-it-works` | explain what is captured, where it lives, and how to inspect or delete it (you invoke it) |
 
 - **Install and wiring scripts**: `install.sh` builds the binary, `connect.sh` wires a machine up in one step.
 
@@ -93,7 +94,7 @@ Headless runs that should use memory pass `--allowedTools "mcp__plugin_memory_me
 | `prompt` | UserPromptSubmit | Posts `user_prompt`. Returns nothing. |
 | `tool` | PostToolUse | Posts `tool_use`. When the server answers `window_closed: true`, starts the observer. |
 | `tool-failure` | PostToolUseFailure | Posts `tool_failure`; same observer rule. |
-| `file-context` | PreToolUse (`Read`) | Looks up observations that touched the file (`GET /v1/observations/by-file`, 1.5 s) and, the first time a file is read in a session, prints up to five of them (date, type, title, id) as `additionalContext`. It never blocks or changes the read, and prints nothing when there is nothing to say. |
+| `file-context` | PreToolUse (`Read`) | The first time a file is read in a session, looks up observations that touched it (`GET /v1/observations/by-file`, 1 s) and prints a one-line header with at most three titles and short ids (about 60 to 110 estimated tokens) as `additionalContext`. Minor observations and near-duplicate titles are left out, and nothing is printed when nothing is left. A session may spend `MEM_FILE_CONTEXT_BUDGET` estimated tokens this way (default 1,200; 0 turns the hook off). It never blocks or changes the read. |
 | `stop` | Stop | Posts `assistant_message` and starts the observer. Nothing is posted while `stop_hook_active` is true. |
 | `subagent-stop` | SubagentStop | Posts `subagent_stop`. |
 | `session-end` | SessionEnd | `POST /v1/sessions/{id}/end` within a 1 s budget, then starts the observer with `--final`. |
@@ -201,9 +202,9 @@ leases packets of any session. Run it from cron on an always-on machine with `cl
 
 | Path | Content |
 |---|---|
-| `config` | `MEMORY_URL`, `MEMORY_TOKEN`, optional `DEVICE_ID`, `CLAUDE_BIN`, `MEM_INJECTION` (`lean` or `full`), `MEMORY_ADMIN_TOKEN` (mode 0600) |
+| `config` | `MEMORY_URL`, `MEMORY_TOKEN`, optional `DEVICE_ID`, `CLAUDE_BIN`, `MEM_INJECTION` (`lean` or `full`), `MEM_FILE_CONTEXT_BUDGET`, `MEMORY_ADMIN_TOKEN` (mode 0600) |
 | `exclude` | project keys to ignore |
-| `sessions/` | per-session cache: server session id, next sequence number, window, prompt count (`<client>_<id>` for sessions of other clients) |
+| `sessions/` | per-session cache: server session id, next sequence number, window, prompt count, files and tokens `file-context` has used (`<client>_<id>` for sessions of other clients) |
 | `spool/` | undelivered requests, one JSON line each |
 | `last-delivery` | modification time = last request the server accepted (for `doctor`) |
 | `cache/` | last context block per project |

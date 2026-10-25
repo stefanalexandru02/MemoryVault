@@ -226,6 +226,7 @@ Python, `curl` or `jq`.
    # DEVICE_ID=laptop-x1
    # CLAUDE_BIN=/usr/local/bin/claude
    # MEM_INJECTION=lean
+   # MEM_FILE_CONTEXT_BUDGET=1200
    ```
 
    Export it in the shell where you run the commands below: `set -a; . ~/.memory/config; set +a`.
@@ -249,8 +250,8 @@ Python, `curl` or `jq`.
    Start a new session. `claude --plugin-dir /path/to/clients/claude-code-plugin` loads the plugin for one
    session without installing it.
 
-The plugin brings seven skills (`recall`, `remember`, `brief`, `project-history`, `handoff`, `ingest`,
-`how-it-works`), the MCP tools and the hooks. The plugin README lists them.
+The plugin brings six skills (`recall`, `remember`, `brief`, `handoff`, `ingest`, `how-it-works`; only the first two
+are loaded into every session), the MCP tools and the hooks. The plugin README lists them.
 
 Each hook event runs one `mem-hook` subcommand: `session-start`, `prompt`, `tool`, `tool-failure`, `stop`,
 `subagent-stop`, `session-end` and `file-context`. Hooks exit 0 in every case. Undelivered requests go to

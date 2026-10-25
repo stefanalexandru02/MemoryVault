@@ -38,6 +38,12 @@ pub struct State {
     /// Event posts whose body contains this text are answered 500 (a request the server chokes on).
     pub poison: Option<String>,
     pub context: Option<String>,
+    /// Rows of `GET /v1/observations/by-file`.
+    pub by_file: Vec<Value>,
+    /// Reply of `POST /v1/context/prompt` (the text may be empty); None = 404.
+    pub prompt_context: Option<String>,
+    /// Every reply is held back this long.
+    pub reply_delay: Duration,
     pub packets: VecDeque<Value>,
     /// Replies for `POST /v1/work/{id}/result`; empty = 200.
     pub result_replies: VecDeque<(u16, Value)>,
@@ -72,6 +78,9 @@ impl Fake {
             next_seq: 0,
             poison: None,
             context: None,
+            by_file: vec![],
+            prompt_context: None,
+            reply_delay: Duration::ZERO,
             packets: VecDeque::new(),
             result_replies: VecDeque::new(),
             me_status: 200,
@@ -178,7 +187,12 @@ fn handle(mut stream: TcpStream, shared: &Arc<Mutex<State>>) {
     let body: Value = serde_json::from_slice(&buf[header_end..]).unwrap_or(Value::Null);
     let req = Req { method, path, headers, body };
 
-    let (status, ctype, reply) = route(&mut shared.lock().unwrap(), req);
+    let (status, ctype, reply, delay) = {
+        let mut state = shared.lock().unwrap();
+        let (status, ctype, reply) = route(&mut state, req);
+        (status, ctype, reply, state.reply_delay)
+    };
+    std::thread::sleep(delay);
     let text = reply.to_string();
     let text = if ctype == "text/markdown" { reply.as_str().unwrap_or_default().to_string() } else { text };
     let retry_after = if status == 429 { "Retry-After: 0\r\n" } else { "" };
@@ -249,6 +263,11 @@ fn route(s: &mut State, req: Req) -> (u16, &'static str, Value) {
             Some(c) => (200, "text/markdown", Value::String(c.clone())),
             None => (404, json, json!({"error": {"code": "not_found", "message": "none", "retryable": false}})),
         },
+        ("POST", ["v1", "context", "prompt"]) => match &s.prompt_context {
+            Some(c) => (200, "text/markdown", Value::String(c.clone())),
+            None => (404, json, json!({"error": {"code": "not_found", "message": "none", "retryable": false}})),
+        },
+        ("GET", ["v1", "observations", "by-file"]) => (200, json, json!({"rows": s.by_file, "limit": 8, "offset": 0})),
         ("GET", ["v1", "sources"]) => (200, json, json!({"sources": s.sources})),
         ("POST", ["v1", "sources"]) => {
             if s.sources_throttled > 0 {

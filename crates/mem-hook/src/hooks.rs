@@ -7,26 +7,22 @@ use serde_json::{Value, json};
 
 use crate::config::{self, Config};
 use crate::deliver::{self, App, CLAUDE_CODE, Delivered, Entry, Fail, Target};
-use crate::{project, spool, store, util};
+use crate::{inject, project, spool, store, util};
 
 const LIVE_BUDGET: Duration = Duration::from_secs(3);
 const DRAIN_BUDGET: Duration = Duration::from_millis(1500);
 const CONTEXT_TIMEOUT: Duration = Duration::from_secs(3);
 const END_BUDGET: Duration = Duration::from_secs(1);
-const FILE_CONTEXT_TIMEOUT: Duration = Duration::from_millis(1500);
-const FILE_CONTEXT_ROWS: usize = 5;
-/// Characters of an id shown at least, as in the memory tables.
-const SHORT_ID_MIN: usize = 6;
 
 /// Claude Code's hook input plus everything derived from it.
-struct Hook {
-    app: App,
-    input: Value,
-    target: Target,
+pub struct Hook {
+    pub app: App,
+    pub input: Value,
+    pub target: Target,
 }
 
 impl Hook {
-    fn str(&self, key: &str) -> Option<&str> {
+    pub fn str(&self, key: &str) -> Option<&str> {
         self.input.get(key).and_then(Value::as_str)
     }
 
@@ -115,7 +111,7 @@ pub fn run(event: &str) {
             record(&hook, "subagent_stop", payload, false);
         }
         "session-end" => session_end(&hook),
-        "file-context" => file_context(&hook),
+        "file-context" => inject::file_context(&hook),
         _ => eprintln!("mem-hook: unknown event {event:?}"),
     }
 }
@@ -273,8 +269,11 @@ fn session_start(hook: &mut Hook) {
         return;
     }
     let key = &hook.target.project_key;
-    let mut query =
-        format!("/v1/context?project_key={}&device_id={}&source={source}", encode(key), encode(&hook.app.cfg.device));
+    let mut query = format!(
+        "/v1/context?project_key={}&device_id={}&source={source}",
+        util::encode(key),
+        util::encode(&hook.app.cfg.device)
+    );
     if let Some(mode) = &hook.app.cfg.injection {
         query.push_str("&mode=");
         query.push_str(mode);
@@ -303,58 +302,6 @@ fn session_start(hook: &mut Hook) {
     println!("{out}");
 }
 
-/// `PreToolUse` on `Read`: tells the agent what earlier sessions learned about the file it is about to read.
-/// It never blocks or rewrites the read, and speaks at most once per file per session.
-fn file_context(hook: &Hook) {
-    if hook.str("tool_name") != Some("Read") {
-        return;
-    }
-    let Some(path) = hook.input.get("tool_input").and_then(|i| i.get("file_path")).and_then(Value::as_str) else {
-        return;
-    };
-    if path.is_empty() || !store::first_surface(hook.app.home(), &hook.target.claude_session_id, path) {
-        return;
-    }
-    let query = format!(
-        "/v1/observations/by-file?path={}&project_key={}&limit={FILE_CONTEXT_ROWS}",
-        encode(path),
-        encode(&hook.target.project_key)
-    );
-    let Some(rows) = hook
-        .app
-        .api
-        .get(&query, FILE_CONTEXT_TIMEOUT)
-        .ok()
-        .filter(|r| r.ok())
-        .and_then(|r| r.json())
-        .and_then(|v| v.get("rows").and_then(Value::as_array).cloned())
-    else {
-        return;
-    };
-    let rows: Vec<(&str, &str, &str, &str)> = rows
-        .iter()
-        .filter_map(|row| {
-            let id = row.get("id")?.as_str()?;
-            let title = row.get("title")?.as_str()?;
-            let day = row.get("created_at").and_then(Value::as_str).map(|t| &t[..t.len().min(10)]).unwrap_or("");
-            let kind = row.get("type").and_then(Value::as_str).unwrap_or("note");
-            Some((id, day, kind, title))
-        })
-        .collect();
-    let ids = short_ids(&rows.iter().map(|r| r.0).collect::<Vec<_>>());
-    let lines: Vec<String> =
-        rows.iter().zip(ids).map(|((_, day, kind, title), id)| format!("- {day} [{kind}] {title} (id {id})")).collect();
-    if lines.is_empty() {
-        return;
-    }
-    let block = format!(
-        "memory: earlier sessions touched {path}, newest first. Fetch details with memory_get when one matters:\n{}",
-        lines.join("\n")
-    );
-    let out = json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": block } });
-    println!("{out}");
-}
-
 fn session_end(hook: &Hook) {
     let reason = hook.str("reason").unwrap_or("other").to_string();
     let entry = Entry::end(&hook.target, &reason);
@@ -363,56 +310,11 @@ fn session_end(hook: &Hook) {
     }
 }
 
-/// The last characters of each id (hyphens ignored) that tell it from the others, at least [`SHORT_ID_MIN`]; the
-/// memory tools take such an ending in place of the whole id.
-fn short_ids(ids: &[&str]) -> Vec<String> {
-    let plain: Vec<String> = ids.iter().map(|id| id.replace('-', "")).collect();
-    let tail = |id: &str, len: usize| id.get(id.len().saturating_sub(len)..).unwrap_or(id).to_string();
-    plain
-        .iter()
-        .map(|own| {
-            let len = (SHORT_ID_MIN..own.len())
-                .find(|&len| plain.iter().all(|other| other == own || tail(other, len) != tail(own, len)))
-                .unwrap_or(own.len());
-            tail(own, len)
-        })
-        .collect()
-}
-
-/// Percent-encodes everything but unreserved characters.
-fn encode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
-    use super::{Mapped, map_event, short_ids, valid_client};
-
-    #[test]
-    fn short_ids_keep_six_characters_unless_rows_end_alike() {
-        let ids = [
-            "01930000-0000-7000-8000-0000001a1b2c3",
-            "01930000-0000-7000-8000-0000002a1b2c3",
-            "01930000-0000-7000-8000-000000ffffff",
-        ];
-        assert_eq!(short_ids(&ids), ["1a1b2c3", "2a1b2c3", "ffffff"]);
-        assert_eq!(short_ids(&["x"]), ["x"]);
-    }
-
-    #[test]
-    fn encodes_query_values() {
-        assert_eq!(super::encode("github.com/alex/home lab"), "github.com%2Falex%2Fhome%20lab");
-    }
+    use super::{Mapped, map_event, valid_client};
 
     #[test]
     fn generic_events_map_onto_the_hook_events() {

@@ -1,6 +1,7 @@
 ---
 name: how-it-works
-description: Explain how MemoryVault captures, stores and recalls memory, what leaves this machine, and how to inspect or delete it. Use when the user asks how the memory plugin works, what it records, where the data lives, whether it is private, or how to stop or erase it.
+description: Use when the user asks what MemoryVault records, where it lives, or how to inspect, stop or erase it.
+disable-model-invocation: true
 ---
 
 # How MemoryVault works

@@ -12,7 +12,12 @@ pub struct Config {
     /// `MEM_INJECTION`: `lean` or `full`, sent as `mode` with the SessionStart request. Unset (or anything
     /// else) leaves the choice to the user's default on the server.
     pub injection: Option<String>,
+    /// `MEM_FILE_CONTEXT_BUDGET`: estimated tokens the file-context hook may add to one session; 0 turns it off.
+    pub file_context_budget: u32,
 }
+
+/// Default of `MEM_FILE_CONTEXT_BUDGET`.
+pub const DEFAULT_FILE_CONTEXT_BUDGET: u32 = 1200;
 
 /// `$MEMORY_HOME`, default `~/.memory`.
 pub fn memory_home() -> PathBuf {
@@ -91,6 +96,9 @@ impl Config {
             device: get("DEVICE_ID").unwrap_or_else(hostname),
             claude_bin: get("CLAUDE_BIN").unwrap_or_else(|| "claude".into()),
             injection: get("MEM_INJECTION").filter(|m| matches!(m.as_str(), "lean" | "full")),
+            file_context_budget: get("MEM_FILE_CONTEXT_BUDGET")
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(DEFAULT_FILE_CONTEXT_BUDGET),
         })
     }
 }

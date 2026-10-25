@@ -96,6 +96,8 @@ async fn memory_routes(pool: PgPool) {
     let resp = send(&app, Method::GET, &uri, Some(token), None).await;
     assert_eq!(resp.status, StatusCode::OK, "{}", resp.text());
     assert_eq!(resp.json()["rows"][0]["id"], json!(obs));
+    // Observation rows carry the observer's importance (the file-context hook skips minor ones); other rows do not.
+    assert!(resp.json()["rows"][0]["importance"].as_f64().is_some_and(|i| (0.0..=1.0).contains(&i)));
 }
 
 #[sqlx::test(migrations = "../../migrations")]

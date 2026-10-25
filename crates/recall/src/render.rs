@@ -785,6 +785,7 @@ mod tests {
             score: None,
             is_anchor: false,
             caution: None,
+            importance: None,
         }
     }
 
