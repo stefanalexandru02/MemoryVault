@@ -121,6 +121,7 @@ async fn embedding_backlog(state: &AppState) -> Result<DoctorCheck, sqlx::Error>
         EmbeddingOwnerTable::Summaries,
         EmbeddingOwnerTable::Facts,
         EmbeddingOwnerTable::Procedures,
+        EmbeddingOwnerTable::Documents,
     ] {
         missing += sqlx::query_scalar::<_, i64>(&format!(
             "SELECT count(*) FROM (

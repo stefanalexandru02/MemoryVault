@@ -17,6 +17,7 @@ A Claude Code plugin with four parts:
   | `brief` | compile a sourced briefing on a topic from facts, procedures and past work |
   | `project-history` | write a narrative of a project over a period from the recorded timeline, using `as_of` and `memory_history` for what changed |
   | `handoff` | leave the goal, state and next steps as work state for the next session, on any machine |
+  | `ingest` | send the repository's docs (ADRs, READMEs, runbooks) to memory with `mem-hook ingest`; only on request |
   | `how-it-works` | explain what is captured, where it lives, and how to inspect or delete it |
 
 - **Install and wiring scripts**: `install.sh` builds the binary, `connect.sh` wires a machine up in one step.
@@ -95,8 +96,9 @@ Headless runs that should use memory pass `--allowedTools "mcp__plugin_memory_me
 | `session-end` | SessionEnd | `POST /v1/sessions/{id}/end` within a 1 s budget, then starts the observer with `--final`. |
 | `observe` | (spawned) | The observer runner, below. |
 | `doctor` | (by hand) | Diagnosis, below. Unlike the hooks it prints to the terminal and exits 1 when a check fails. |
+| `ingest` | (by hand) | Sends docs to the server, below. Prints to the terminal and exits 1 when a file failed. |
 
-Every hook invocation exits 0, whatever happens (`doctor` is the exception). Each starts with the same checks: nothing happens when
+Every hook invocation exits 0, whatever happens (`doctor` and `ingest` are the exceptions). Each starts with the same checks: nothing happens when
 `MEMORY_OBSERVER` is set (recursion guard), when `MEMORY_URL`/`MEMORY_TOKEN` are missing (a one-line
 stderr hint once a day on `session-start`), or when the project is listed in `~/.memory/exclude`.
 
@@ -136,6 +138,30 @@ with `[ ok ]`, `[warn]` or `[FAIL]` and, unless the check passed, the command th
 own checks from `GET /v1/admin/doctor`, which needs an admin token: set `MEMORY_ADMIN_TOKEN` in the config file
 or the environment (the device token is tried otherwise, and the section is skipped with a hint when it is
 refused). `make doctor` in the repository runs `mem-hook doctor --server`.
+
+## Ingest
+
+`mem-hook ingest [<path|dir>] [--scope project|global] [--glob PATTERN]... [--dry-run] [--prune]` sends documents
+to the server (`POST /v1/sources`), which splits them by heading into chunks of 600 to 800 tokens and keeps them as
+memories of type `document`. They are searched with `memory_search` and `GET /v1/search` (`types=document`), show
+up in `POST /v1/recall` results as `source: <uri>#<heading>`, rank below facts of equal relevance and are never
+part of the session-start block.
+
+- `path` is a file or a directory (default `.`). A directory is walked for `.md`, `.markdown`, `.txt`, `.text`,
+  `.rst` and `.adoc` files; `--glob` replaces that list (`**` stands for any number of directories, `*` and `?`
+  stay inside a name, and a pattern without `/` matches file names at any depth). `.git`, `node_modules`,
+  `target`, symlinks, binary files, empty files and files over 400 KiB are skipped. A file named on the command
+  line is sent whatever its extension. Markdown files are chunked by heading, everything else by paragraph.
+- `--scope project` (default) files the documents under the project of the directory, with the path relative to
+  the git root as `uri`; `--scope global` keeps them for every project, with the absolute path as `uri`.
+- The command fetches `GET /v1/sources` for the scope and sends only the files whose SHA-256 differs from the
+  stored `content_hash`, so a second run sends what changed. A rate-limited request waits for the `Retry-After`
+  and is tried again.
+- `--prune` (directories only) deletes the sources under the directory whose file is gone, or no longer matches.
+- `--dry-run` prints what would be sent and removed (`+` new, `~` changed, `-` removed) and changes nothing.
+
+Exit status: 0 when every file was handled, 1 when a request failed, the server could not be listed or the
+config is missing, 2 for a bad command line. The `ingest` skill drives it for the current repository.
 
 ## The observer
 

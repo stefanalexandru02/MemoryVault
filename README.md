@@ -147,7 +147,8 @@ cargo run -p memvault -- admin token create --user alex --client laptop-x1 --kin
 The server serves a viewer at `/viewer` (`http://127.0.0.1:8000/viewer` for the compose stack; `/` redirects
 there). Open it, paste a device token (`make token`, or the one in `~/.memory/config`) and you can:
 
-- browse and search observations, summaries, facts and procedures, filtered by kind, project, type and period,
+- browse and search observations, summaries, facts, procedures and ingested documents, filtered by kind, project,
+  type (`document` shows only docs) and period,
   with live updates as new memories arrive (`/` focuses the search box, `j`/`k` step through the list);
 - open any memory to read it in full, see where it came from (session, device, extractor, the observations a
   fact rests on, the audit log) and what was recorded around it; for a fact or procedure, the chain of versions
@@ -244,12 +245,31 @@ Python, `curl` or `jq`.
    Start a new session. `claude --plugin-dir /path/to/clients/claude-code-plugin` loads the plugin for one
    session without installing it.
 
-The plugin brings six skills (`recall`, `remember`, `brief`, `project-history`, `handoff`, `how-it-works`),
-the MCP tools and the hooks. The plugin README lists them.
+The plugin brings seven skills (`recall`, `remember`, `brief`, `project-history`, `handoff`, `ingest`,
+`how-it-works`), the MCP tools and the hooks. The plugin README lists them.
 
 Each hook event runs one `mem-hook` subcommand: `session-start`, `prompt`, `tool`, `tool-failure`, `stop`,
 `subagent-stop`, `session-end` and `file-context`. Hooks exit 0 in every case. Undelivered requests go to
 `~/.memory/spool` and are replayed at the next session start. The plugin README has the full table.
+
+### Searching your docs
+
+ADRs, READMEs and runbooks can be memory too, not only what happened in sessions. From a repository:
+
+```bash
+mem-hook ingest docs --dry-run     # what would be sent
+mem-hook ingest docs --prune       # send what changed, drop the sources whose file is gone
+mem-hook ingest README.md          # one file, or: --glob "**/*.adoc", --scope global
+```
+
+The server splits each file by heading into chunks of 600 to 800 tokens and keeps the heading path with each one.
+`memory_search` with `types: ["document"]` (or `GET /v1/search?types=document`) finds them and `memory_get` reads
+a chunk; `POST /v1/recall` returns them in a `documents` slot as `source: docs/adr/0003.md#Decision`. They rank
+below facts of equal relevance and are never injected at session start. A file that did not change is skipped, a
+changed one replaces its chunks (the old ones are retired and stay visible to an `as_of` search), and
+`DELETE /v1/sources?uri=...&scope=project:<key>` removes a source. `GET /v1/sources` lists them. A file may be at
+most `SOURCE_MAX_BYTES` (400 KiB). The `ingest` skill asks Claude to do this for the current repository. See the
+plugin README for the options.
 
 ### Nightly consolidation runner
 

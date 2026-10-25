@@ -12,6 +12,9 @@ call and failure, and each turn end. The hook posts the event to the user's Memo
 successfully, so it cannot slow or break a session. When the server cannot be reached, events wait in
 `~/.memory/spool` and are replayed at the next session start.
 
+Documents are the one thing sent on request only: `mem-hook ingest` (the `ingest` skill) uploads the repository
+files the user names, which are then searchable as memory of type `document`.
+
 **Extraction.** Raw events are not what gets recalled. After a burst of activity, `mem-hook observe` leases a work
 packet from the server and runs it through `claude -p` on this machine, using the user's own Claude login. The
 model turns the events into short observations (what was learned or built), session summaries and candidate

@@ -72,7 +72,7 @@
     admin: false,
     health: null,
     projects: new Map(), // key -> count seen
-    filters: { q: '', tables: new Set(['observations', 'summaries', 'facts', 'procedures']), project: '', type: '', period: '30d', asOf: '' },
+    filters: { q: '', tables: new Set(['observations', 'summaries', 'facts', 'procedures', 'documents']), project: '', type: '', period: '30d', asOf: '' },
     rows: [],
     offset: 0,
     hasMore: false,
@@ -273,8 +273,9 @@
   window.addEventListener('hashchange', () => { if (state.token) route(); });
 
   // ---------- memory view ----------
-  const TIERS = [['observations', 'Observations'], ['summaries', 'Summaries'], ['facts', 'Facts'], ['procedures', 'Procedures']];
+  const TIERS = [['observations', 'Observations'], ['summaries', 'Summaries'], ['facts', 'Facts'], ['procedures', 'Procedures'], ['documents', 'Documents']];
   const OBS_TYPES = ['bugfix', 'feature', 'refactor', 'change', 'discovery', 'decision', 'security_alert', 'security_note'];
+  const TYPE_FILTERS = [...OBS_TYPES, 'document']; // 'document' narrows the search to ingested docs
   const PERIODS = [['24h', 'Last 24 hours'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['90d', 'Last 90 days'], ['all', 'All time']];
   let $list, $detail, $panes, $memory, $count, searchTimer;
 
@@ -332,7 +333,7 @@
     const projectSel = h('select', { class: 'input', id: 'project', onchange: (e) => { f.project = e.target.value; load(true); } });
     const typeSel = h('select', {
       class: 'input', id: 'type', onchange: (e) => { f.type = e.target.value; load(true); },
-    }, h('option', { value: '', text: 'Any type' }), OBS_TYPES.map((t) => h('option', { value: t, text: t.replace('_', ' ') })));
+    }, h('option', { value: '', text: 'Any type' }), TYPE_FILTERS.map((t) => h('option', { value: t, text: t.replace('_', ' ') })));
     typeSel.value = f.type;
     const periodSel = h('select', { class: 'input', id: 'period', onchange: (e) => { f.period = e.target.value; load(true); } },
       PERIODS.map(([v, l]) => h('option', { value: v, text: l })));
@@ -426,8 +427,8 @@
   }
 
   function tagFor(row) {
-    const type = row.table === 'facts' ? 'fact' : row.table === 'procedures' ? 'procedure' : row.table === 'summaries' ? 'summary' : (row.type || 'change');
-    const label = row.table === 'facts' ? 'fact' : row.table === 'procedures' ? 'procedure' : row.table === 'summaries' ? `${row.type || 'summary'}` : (row.type || 'note').replace('_', ' ');
+    const type = row.table === 'facts' ? 'fact' : row.table === 'procedures' ? 'procedure' : row.table === 'summaries' ? 'summary' : row.table === 'documents' ? 'document' : (row.type || 'change');
+    const label = row.table === 'facts' ? 'fact' : row.table === 'procedures' ? 'procedure' : row.table === 'summaries' ? `${row.type || 'summary'}` : row.table === 'documents' ? 'document' : (row.type || 'note').replace('_', ' ');
     return h('span', { class: `tag t-${type}`, text: label });
   }
 
@@ -562,9 +563,17 @@
           ['worked', `${item.success_count}×`], ['failed', `${item.failure_count}×`], ['last used', item.last_used_at ? fullTime(item.last_used_at) : '']]));
       if (item.trigger_text) body.push(section('When to use it', prose(item.trigger_text)));
       body.push(section('Steps', h('div', { class: 'pre', text: item.body_md })));
+    } else if (item.table === 'documents') {
+      const source = item.heading_path && item.heading_path.length ? `${item.source_uri}#${item.heading_path.join(' > ')}` : item.source_uri;
+      head = h('div', { class: 'detail-head' },
+        h('div', {}, tagFor({ table: 'documents' }), item.retired_at ? h('span', { class: 'mini warn', text: 'retired' }) : null),
+        h('h2', { text: item.title }),
+        kv([['source', source], ['scope', scopeLabel(item.scope)], ['ingested', fullTime(item.created_at)], ['chunk', item.chunk_index + 1],
+          ['~tokens', item.token_estimate || ''], ['retired', item.retired_at ? fullTime(item.retired_at) : '']]));
+      body.push(section('Text', h('div', { class: 'pre', text: item.content })));
     }
 
-    if (item.table !== 'summaries') body.push(feedbackSection(item, feedback || {}));
+    if (item.table !== 'summaries' && item.table !== 'documents') body.push(feedbackSection(item, feedback || {}));
 
     const around = h('div', { class: 'section', hidden: true });
     const versions = item.table === 'facts' || item.table === 'procedures'
@@ -675,7 +684,7 @@
       h('form', { method: 'dialog' },
         h('h3', { id: 'forget-title', text: 'Forget this memory?' }),
         h('div', { class: 'pre', text: label }),
-        h('p', { class: 'muted', text: item.table === 'facts' ? 'The fact is retracted: agents stop using it, and the history stays in the audit log.' : item.table === 'procedures' ? 'The procedure is retired.' : 'The observation is archived: it no longer shows up in searches or context. The viewer cannot undo this.' }),
+        h('p', { class: 'muted', text: item.table === 'facts' ? 'The fact is retracted: agents stop using it, and the history stays in the audit log.' : item.table === 'procedures' ? 'The procedure is retired.' : item.table === 'documents' ? 'This chunk of the document is retired: it no longer shows up in searches. Ingest the file again to bring it back.' : 'The observation is archived: it no longer shows up in searches or context. The viewer cannot undo this.' }),
         h('label', { class: 'field', for: 'reason' }, h('span', { text: 'Why' }), reason),
         h('menu', {}, h('button', { class: 'btn', type: 'submit', value: 'cancel' }, 'Cancel'), go)));
     document.body.append(dlg);

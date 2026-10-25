@@ -240,6 +240,7 @@ str_enum!(MemoryTable {
     Summaries = "summaries",
     Facts = "facts",
     Procedures = "procedures",
+    Documents = "documents",
 });
 
 str_enum!(EmbeddingOwnerTable {
@@ -248,9 +249,15 @@ str_enum!(EmbeddingOwnerTable {
     Facts = "facts",
     Procedures = "procedures",
     Entities = "entities",
+    Documents = "documents",
 });
 
 str_enum!(SummaryGrain { Prompt = "prompt", Session = "session", Day = "day", Week = "week" });
+
+str_enum!(
+    /// How an ingested source is split into chunks: by headings (`markdown`) or by paragraphs (`text`).
+    ContentType { Markdown = "markdown", Text = "text" }
+);
 
 str_enum!(FactStatus {
     Candidate = "candidate",

@@ -16,6 +16,8 @@ pub struct Api {
 pub struct Resp {
     pub status: u16,
     pub body: String,
+    /// Seconds from a `Retry-After` header.
+    pub retry_after: Option<u64>,
 }
 
 impl Resp {
@@ -54,11 +56,22 @@ impl Api {
                 .send(body.to_string()),
         )
     }
+
+    pub fn delete(&self, path: &str, timeout: Duration) -> Result<Resp, String> {
+        let req = self.agent.delete(format!("{}{path}", self.base)).config().timeout_global(Some(timeout)).build();
+        finish(
+            req.header("Authorization", format!("Bearer {}", self.token))
+                .header("X-Memory-Device", &self.device)
+                .call(),
+        )
+    }
 }
 
 fn finish(result: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Result<Resp, String> {
     let mut resp = result.map_err(|e| e.to_string())?;
     let status = resp.status().as_u16();
+    let retry_after =
+        resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok());
     let body = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
-    Ok(Resp { status, body })
+    Ok(Resp { status, body, retry_after })
 }

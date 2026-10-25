@@ -13,8 +13,11 @@ pub const RRF_K: f64 = 60.0;
 pub const MMR_LAMBDA: f64 = 0.7;
 /// Procedures whose `task_class` equals `task_state.intent` (11.2).
 pub const INTENT_BONUS: f64 = 0.3;
+/// Type boost of a document chunk. Ingested docs are reference material, not what the user decided or said, so
+/// at equal relevance they score 0.6 against about 0.73 for a typical fact (importance 0.5, confidence 0.95).
+pub const DOCUMENT_WEIGHT: f64 = 0.8;
 
-/// Half-lives in days (11.4). Facts and procedures do not decay.
+/// Half-lives in days (11.4). Facts, procedures and documents do not decay.
 pub const HALF_LIFE_OBS: f64 = 30.0;
 pub const HALF_LIFE_OBS_LONG: f64 = 90.0;
 pub const HALF_LIFE_SUMMARIES: f64 = 60.0;
@@ -34,7 +37,7 @@ pub fn half_life(table: MemoryTable, obs_type: Option<&str>) -> Option<f64> {
         MemoryTable::Observations if matches!(obs_type, Some("decision" | "bugfix")) => Some(HALF_LIFE_OBS_LONG),
         MemoryTable::Observations => Some(HALF_LIFE_OBS),
         MemoryTable::Summaries => Some(HALF_LIFE_SUMMARIES),
-        MemoryTable::Facts | MemoryTable::Procedures => None,
+        MemoryTable::Facts | MemoryTable::Procedures | MemoryTable::Documents => None,
     }
 }
 
@@ -105,6 +108,7 @@ impl Candidate {
                 let bonus = if intent.is_some_and(|i| i == p.task_class) { INTENT_BONUS } else { 0.0 };
                 final_score(base, 0.5, None, None, 1.0, bonus)
             }
+            Some(TierRow::Doc(_)) => final_score(base, 0.5, None, None, DOCUMENT_WEIGHT, 0.0),
             None => 0.0,
         }
     }

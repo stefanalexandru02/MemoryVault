@@ -265,11 +265,12 @@ pub(crate) fn live_filter(table: EmbeddingOwnerTable) -> &'static str {
         EmbeddingOwnerTable::Observations => "archived_at IS NULL",
         EmbeddingOwnerTable::Facts => "status IN ('candidate', 'active')",
         EmbeddingOwnerTable::Procedures => "status = 'active'",
+        EmbeddingOwnerTable::Documents => "retired_at IS NULL",
         EmbeddingOwnerTable::Summaries | EmbeddingOwnerTable::Entities => "true",
     }
 }
 
-/// Queue `embed` jobs for every live row of the chosen tables (default: all five), optionally in one
+/// Queue `embed` jobs for every live row of the chosen tables (default: all six), optionally in one
 /// space. The payload carries the target `model` for the worker.
 pub async fn reindex(
     conn: &mut PgConnection,

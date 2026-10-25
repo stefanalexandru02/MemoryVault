@@ -283,6 +283,38 @@ pub async fn insert_procedure(w: &World, space: Uuid, name: &str, task_class: &s
     id
 }
 
+/// One live chunk of the source `uri`, embedded from its heading path and content.
+pub async fn insert_document(
+    w: &World,
+    space: Uuid,
+    scope: &Scope,
+    uri: &str,
+    headings: &[&str],
+    content: &str,
+) -> Uuid {
+    let id = new_id();
+    let headings: Vec<String> = headings.iter().map(|h| h.to_string()).collect();
+    sqlx::query(
+        "INSERT INTO documents (id, space_id, scope_kind, scope_key, source_uri, title, content_type, chunk_index,
+                                heading_path, content, content_hash, token_estimate, ingested_by)
+         VALUES ($1, $2, $3, $4, $5, $5, 'markdown', 0, $6, $7, 'h1', $8, $9)",
+    )
+    .bind(id)
+    .bind(space)
+    .bind(scope.kind)
+    .bind(&scope.key)
+    .bind(uri)
+    .bind(&headings)
+    .bind(content)
+    .bind(memvault_core::estimate_tokens(content))
+    .bind(w.alice.client_id)
+    .execute(&w.pool)
+    .await
+    .expect("insert document");
+    embed(w, space, "documents", id, "body:0", scope, &format!("{} {content}", headings.join(" "))).await;
+    id
+}
+
 pub async fn insert_work_state(pool: &PgPool, space: Uuid, scope: &Scope, list: &str, fields: serde_json::Value) {
     sqlx::query(
         "INSERT INTO work_state (id, space_id, scope_kind, scope_key, list_name, fields) VALUES ($1, $2, $3, $4, $5, $6)",

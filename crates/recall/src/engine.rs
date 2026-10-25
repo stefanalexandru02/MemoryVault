@@ -15,14 +15,14 @@ use memvault_core::db::caps;
 use memvault_core::ids::new_id;
 use memvault_core::schemas::common::{InjectionMode, MemoryTable, Scope, ScopeKind, Sensitivity, SummaryGrain};
 use memvault_core::schemas::memories::{
-    AuditEntry, ByFileQuery, EntityRef, EvidenceObservation, ExplainResponse, FactFull, FeedbackCounts, GetResponse,
-    HistoryEntry, HistoryResponse, IndexRow, MAX_GET_IDS, MemoryItem, ObservationFull, ProcedureFull, ProcedureStatus,
-    Provenance, SearchQuery, SearchResponse, SessionInfo, SummaryFull, TimelineQuery, TimelineResponse,
-    procedure_caution,
+    AuditEntry, ByFileQuery, DocumentFull, EntityRef, EvidenceObservation, ExplainResponse, FactFull, FeedbackCounts,
+    GetResponse, HistoryEntry, HistoryResponse, IndexRow, MAX_GET_IDS, MemoryItem, ObservationFull, ProcedureFull,
+    ProcedureStatus, Provenance, SearchQuery, SearchResponse, SessionInfo, SummaryFull, TimelineQuery,
+    TimelineResponse, procedure_caution,
 };
 use memvault_core::schemas::recall::{
-    Budgets, FactItem, FeedbackRequest, FeedbackResponse, ObservationItem, ProcedureItem, ProfileSlot, RecallFormat,
-    RecallRequest, RecallResponse, RecallSlots, SlotItem, SummaryItem, TokenUsage, WorkStateList,
+    Budgets, DocumentItem, FactItem, FeedbackRequest, FeedbackResponse, ObservationItem, ProcedureItem, ProfileSlot,
+    RecallFormat, RecallRequest, RecallResponse, RecallSlots, SlotItem, SummaryItem, TokenUsage, WorkStateList,
 };
 use memvault_core::{ApiError, AppState, Identity, estimate_tokens};
 use serde_json::{Value, json};
@@ -39,11 +39,18 @@ use memvault_core::db::tune_vector_search;
 use memvault_core::user_tx;
 
 /// Tier order of candidate generation and of `selected` in `retrieval_log`.
-const TIER_ORDER: [MemoryTable; 4] =
-    [MemoryTable::Facts, MemoryTable::Procedures, MemoryTable::Observations, MemoryTable::Summaries];
+const TIER_ORDER: [MemoryTable; 5] = [
+    MemoryTable::Facts,
+    MemoryTable::Procedures,
+    MemoryTable::Observations,
+    MemoryTable::Summaries,
+    MemoryTable::Documents,
+];
 /// Fused candidates kept per tier (11.2 `LIMIT 40`) and sent to the reranker across tiers (11.3).
 const FUSED_LIMIT: usize = 40;
 const RERANK_TOP: usize = 40;
+/// Characters of a document chunk sent to the reranker.
+const RERANK_DOCUMENT_CHARS: usize = 1500;
 const NO_QUERY_LIMIT: i64 = 40;
 const NO_QUERY_OBS_LIMIT: i64 = 60;
 const PINNED_LIMIT: i64 = 20;
@@ -106,8 +113,8 @@ pub struct PackOptions {
     pub expand: u32,
     pub rerank: bool,
     pub exclude_sensitivity: Vec<Sensitivity>,
-    /// SessionStart: no query, pinned facts only, subagent observations hidden, session summaries
-    /// only (at most [`CONTEXT_SUMMARIES`]), at most [`CONTEXT_OBS_ROWS`] index rows.
+    /// SessionStart: no query, pinned facts only, no documents, subagent observations hidden, session
+    /// summaries only (at most [`CONTEXT_SUMMARIES`]), at most [`CONTEXT_OBS_ROWS`] index rows.
     pub context: bool,
     /// Rank and filter as of this instant instead of now.
     pub as_of: Option<DateTime<Utc>>,
@@ -135,6 +142,10 @@ fn rerank_text(row: &TierRow) -> String {
         }
         TierRow::Fact(f) => format!("{} {} {}", f.subject_name, f.predicate, f.value_text),
         TierRow::Proc(p) => format!("{} {}", p.name, p.trigger_text),
+        // A chunk is long and the reranker has 250 ms: its opening is what it judges.
+        TierRow::Doc(d) => {
+            format!("{} {}", d.heading_path.join(" "), render::excerpt(&d.content, RERANK_DOCUMENT_CHARS))
+        }
     }
 }
 
@@ -188,6 +199,7 @@ fn budget_of(b: &Budgets, table: MemoryTable) -> u32 {
         MemoryTable::Procedures => b.procedures,
         MemoryTable::Observations => b.observations,
         MemoryTable::Summaries => b.summaries,
+        MemoryTable::Documents => b.documents,
     }
 }
 
@@ -227,7 +239,9 @@ pub async fn build_pack(
     let mut by_tier: BTreeMap<MemoryTable, Vec<Candidate>> = BTreeMap::new();
     for table in TIER_ORDER {
         let mut cands = Vec::new();
-        if budget_of(&budgets, table) > 0 && !(table == MemoryTable::Facts && opts.context) {
+        // The SessionStart block never carries facts beyond the pinned ones, nor documents.
+        let in_context = matches!(table, MemoryTable::Facts | MemoryTable::Documents);
+        if budget_of(&budgets, table) > 0 && !(in_context && opts.context) {
             if query.is_some() {
                 let kw = if terms.is_empty() && entity_terms.is_empty() {
                     Vec::new()
@@ -344,6 +358,12 @@ pub async fn build_pack(
     slots.summaries = summaries;
     by_slot.insert("summaries".into(), used);
 
+    let doc_items: Vec<DocumentItem> =
+        mmr_order(take(MemoryTable::Documents)).iter().filter_map(document_item).collect();
+    let (documents, used) = budget_fill(doc_items, budgets.documents, |d| estimate_tokens(&render::document_line(d)));
+    slots.documents = documents;
+    by_slot.insert("documents".into(), used);
+
     // Work state has no history, so a recall of the past leaves it out.
     if budgets.work_state > 0 && opts.as_of.is_none() {
         let lists = fold_work_state(conn, spaces, scopes).await?;
@@ -360,6 +380,7 @@ pub async fn build_pack(
     selected.extend(slots.procedures.iter().map(|i| entry("procedures", &i.item)));
     selected.extend(slots.observations.iter().map(|i| entry("observations", &i.item)));
     selected.extend(slots.summaries.iter().map(|i| entry("summaries", &i.item)));
+    selected.extend(slots.documents.iter().map(|i| entry("documents", &i.item)));
     selected.extend(profile_fact_ids.iter().map(|id| json!({ "id": id, "slot": "profile" })));
 
     Ok(Pack { slots, by_slot, candidates, selected, reranked })
@@ -670,6 +691,22 @@ fn summary_item(c: &Candidate) -> Option<SummaryItem> {
     })
 }
 
+fn document_item(c: &Candidate) -> Option<DocumentItem> {
+    let row @ TierRow::Doc(r) = c.row.as_ref()? else { return None };
+    let source = r.source();
+    let citation = render::document_tag(&r.id, &source, Some(r.created_at));
+    Some(DocumentItem {
+        item: slot_item(c, row, r.token_estimate, citation),
+        source,
+        uri: r.source_uri.clone(),
+        title: r.title.clone(),
+        heading_path: r.heading_path.clone(),
+        chunk_index: r.chunk_index,
+        content: r.content.clone(),
+        created_at: r.created_at,
+    })
+}
+
 // ---------- POST /v1/recall ----------
 
 /// What a `retrieval_log` row records.
@@ -895,11 +932,12 @@ fn index_row(row: &TierRow, score: Option<f64>, anchor: bool) -> IndexRow {
             let tokens = if r.token_estimate > 0 { r.token_estimate } else { estimate_tokens(&r.body_md) };
             (MemoryTable::Procedures, r.task_class.clone(), r.name.clone(), r.created_at, tokens)
         }
+        TierRow::Doc(r) => (MemoryTable::Documents, "document".to_string(), r.source(), r.created_at, r.token_estimate),
     };
     let caution = match row {
         TierRow::Fact(r) => r.caution(Utc::now()),
         TierRow::Proc(r) => procedure_caution(r.success_count, r.failure_count),
-        TierRow::Obs(_) | TierRow::Sum(_) => None,
+        TierRow::Obs(_) | TierRow::Sum(_) | TierRow::Doc(_) => None,
     };
     IndexRow {
         id: row.id(),
@@ -921,7 +959,14 @@ pub async fn search(state: &AppState, identity: &Identity, query: SearchQuery) -
     let mut tx = user_tx(&state.db.app, identity).await?;
     let spaces = resolve_read_spaces(&mut tx, identity, query.space_ids.as_deref()).await?;
     let scopes = query.scopes.as_deref().map(validate_scopes).transpose()?;
-    let mut tables = query.tables.clone().unwrap_or_else(|| vec![MemoryTable::Observations, MemoryTable::Summaries]);
+    let mut tables = query.tables.clone().unwrap_or_else(|| {
+        let mut tables = vec![MemoryTable::Observations, MemoryTable::Summaries];
+        // Asking for the `document` type is asking for the ingested docs.
+        if query.types.as_ref().is_some_and(|t| t.iter().any(|t| t == "document")) {
+            tables.push(MemoryTable::Documents);
+        }
+        tables
+    });
     if query.files.is_some() {
         tables.retain(|t| *t == MemoryTable::Observations);
     }
@@ -1178,10 +1223,26 @@ fn memory_item(row: TierRow) -> MemoryItem {
             token_estimate: r.token_estimate,
             created_at: r.created_at,
         }),
+        TierRow::Doc(r) => MemoryItem::Documents(DocumentFull {
+            id: r.id,
+            space_id: r.space_id,
+            scope: Scope::new(r.scope_kind, r.scope_key),
+            source_uri: r.source_uri,
+            title: r.title,
+            content_type: r.content_type,
+            chunk_index: r.chunk_index,
+            heading_path: r.heading_path,
+            content: r.content,
+            content_hash: r.content_hash,
+            token_estimate: r.token_estimate,
+            ingested_by: r.ingested_by,
+            created_at: r.created_at,
+            retired_at: r.retired_at,
+        }),
     }
 }
 
-/// Full bodies for ids across the four tiers (whatever RLS lets the caller see).
+/// Full bodies for ids across the five tiers (whatever RLS lets the caller see).
 pub async fn load_items(conn: &mut PgConnection, ids: &[Uuid]) -> Result<HashMap<Uuid, MemoryItem>, sqlx::Error> {
     let mut out = HashMap::new();
     for table in TIER_ORDER {
@@ -1198,6 +1259,7 @@ fn item_space(item: &MemoryItem) -> Uuid {
         MemoryItem::Summaries(s) => s.space_id,
         MemoryItem::Facts(f) => f.space_id,
         MemoryItem::Procedures(p) => p.space_id,
+        MemoryItem::Documents(d) => d.space_id,
     }
 }
 
@@ -1213,8 +1275,8 @@ pub async fn log_access(
 }
 
 /// `access_log` for what a recall or context pack returned: fact values (also the ones rendered in
-/// the profile, found again by their `fact#` tags), procedure bodies, summaries and expanded
-/// observation narratives. Index-only observation lines (titles) are not content reads.
+/// the profile, found again by their `fact#` tags), procedure bodies, summaries, document chunks and
+/// expanded observation narratives. Index-only observation lines (titles) are not content reads.
 pub async fn log_pack_access(
     conn: &mut PgConnection,
     identity: &Identity,
@@ -1225,6 +1287,7 @@ pub async fn log_pack_access(
     targets.extend(slots.facts.iter().map(|f| (f.item.space_id, f.item.id)));
     targets.extend(slots.procedures.iter().map(|p| (p.item.space_id, p.item.id)));
     targets.extend(slots.summaries.iter().map(|s| (s.item.space_id, s.item.id)));
+    targets.extend(slots.documents.iter().map(|d| (d.item.space_id, d.item.id)));
     targets.extend(slots.observations.iter().filter(|o| o.expanded).map(|o| (o.item.space_id, o.item.id)));
     if let Some(profile) = &slots.profile {
         let tags: Vec<String> = profile
@@ -1335,6 +1398,7 @@ pub async fn resolve_refs(
              UNION ALL SELECT id FROM summaries WHERE replace(id::text, '-', '') LIKE '%' || $1
              UNION ALL SELECT id FROM facts WHERE replace(id::text, '-', '') LIKE '%' || $1
              UNION ALL SELECT id FROM procedures WHERE replace(id::text, '-', '') LIKE '%' || $1
+             UNION ALL SELECT id FROM documents WHERE replace(id::text, '-', '') LIKE '%' || $1
              LIMIT 2",
         )
         .bind(&text)
@@ -1409,6 +1473,14 @@ pub async fn explain(state: &AppState, identity: &Identity, id: Uuid) -> Result<
             f.evidence_observation_ids.clone()
         }
         MemoryItem::Procedures(p) => p.source_observation_ids.clone(),
+        MemoryItem::Documents(d) => {
+            let extracted_by = json!({
+                "runner_kind": "ingest", "source_uri": d.source_uri, "chunk_index": d.chunk_index,
+                "content_hash": d.content_hash, "ingested_by": d.ingested_by,
+            });
+            prov = Some(Provenance { extracted_by, ..Provenance::default() });
+            Vec::new()
+        }
     };
     let mut ev_rows = hydrate(&mut tx, MemoryTable::Observations, &evidence_ids).await?;
     for oid in &evidence_ids {
@@ -1475,6 +1547,7 @@ fn history_started(row: &TierRow) -> DateTime<Utc> {
         TierRow::Sum(r) => r.created_at,
         TierRow::Fact(r) => r.valid_from.unwrap_or(r.first_seen_at),
         TierRow::Proc(r) => r.created_at,
+        TierRow::Doc(r) => r.created_at,
     }
 }
 
@@ -1499,6 +1572,10 @@ fn history_entry(row: &TierRow, current: bool) -> HistoryEntry {
         TierRow::Proc(r) => {
             let text = format!("{} (v{}): {}", r.name, r.version, render::excerpt(&r.body_md, 160));
             (MemoryTable::Procedures, r.status.clone(), Some(text), Some(r.created_at), None, r.supersedes_id, None)
+        }
+        TierRow::Doc(r) => {
+            let status = if r.retired_at.is_some() { "retired" } else { "active" };
+            (MemoryTable::Documents, status.to_string(), None, Some(r.created_at), r.retired_at, None, None)
         }
     };
     HistoryEntry {
@@ -1549,7 +1626,7 @@ pub async fn history(state: &AppState, identity: &Identity, id: Uuid) -> Result<
         load_items(&mut tx, &[id]).await?.remove(&id).ok_or_else(|| ApiError::not_found("memory not found"))?.table();
     let ids = match table {
         MemoryTable::Facts | MemoryTable::Procedures => chain_ids(&mut tx, table, id).await?,
-        MemoryTable::Observations | MemoryTable::Summaries => vec![id],
+        MemoryTable::Observations | MemoryTable::Summaries | MemoryTable::Documents => vec![id],
     };
     let mut rows: Vec<TierRow> = hydrate(&mut tx, table, &ids)
         .await?
@@ -1558,7 +1635,7 @@ pub async fn history(state: &AppState, identity: &Identity, id: Uuid) -> Result<
             let secret = match row {
                 TierRow::Obs(r) => r.sensitivity == Sensitivity::Secret,
                 TierRow::Fact(r) => r.sensitivity == Sensitivity::Secret,
-                TierRow::Sum(_) | TierRow::Proc(_) => false,
+                TierRow::Sum(_) | TierRow::Proc(_) | TierRow::Doc(_) => false,
             };
             row.id() == id || !secret
         })

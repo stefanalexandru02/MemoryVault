@@ -45,6 +45,12 @@ pub struct State {
     pub me_status: u16,
     /// Reply of `GET /v1/admin/doctor`.
     pub admin_doctor: (u16, Value),
+    /// What `GET /v1/sources` lists.
+    pub sources: Vec<Value>,
+    /// The next this many `POST /v1/sources` are answered 429 (with `Retry-After: 0`).
+    pub sources_throttled: usize,
+    /// A `POST /v1/sources` whose uri contains this text is answered 413.
+    pub sources_reject: Option<String>,
 }
 
 #[derive(Clone)]
@@ -73,6 +79,9 @@ impl Fake {
                 403,
                 json!({"error": {"code": "insufficient_scope", "message": "admin", "retryable": false}}),
             ),
+            sources: vec![],
+            sources_throttled: 0,
+            sources_reject: None,
         }));
         let shared = state.clone();
         std::thread::spawn(move || {
@@ -115,6 +124,11 @@ impl Fake {
             std::thread::sleep(Duration::from_millis(25));
         }
         panic!("timed out waiting for {what}; requests: {:#?}", self.reqs());
+    }
+
+    /// Bodies of the posted sources in arrival order.
+    pub fn posted_sources(&self) -> Vec<Value> {
+        self.matching("POST", "/v1/sources").into_iter().map(|r| r.body).collect()
     }
 
     pub fn queue_packet(&self, packet: Value) {
@@ -167,9 +181,10 @@ fn handle(mut stream: TcpStream, shared: &Arc<Mutex<State>>) {
     let (status, ctype, reply) = route(&mut shared.lock().unwrap(), req);
     let text = reply.to_string();
     let text = if ctype == "text/markdown" { reply.as_str().unwrap_or_default().to_string() } else { text };
+    let retry_after = if status == 429 { "Retry-After: 0\r\n" } else { "" };
     let _ = write!(
         stream,
-        "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{text}",
+        "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{text}",
         text.len()
     );
 }
@@ -234,6 +249,24 @@ fn route(s: &mut State, req: Req) -> (u16, &'static str, Value) {
             Some(c) => (200, "text/markdown", Value::String(c.clone())),
             None => (404, json, json!({"error": {"code": "not_found", "message": "none", "retryable": false}})),
         },
+        ("GET", ["v1", "sources"]) => (200, json, json!({"sources": s.sources})),
+        ("POST", ["v1", "sources"]) => {
+            if s.sources_throttled > 0 {
+                s.sources_throttled -= 1;
+                return (
+                    429,
+                    json,
+                    json!({"error": {"code": "rate_limited", "message": "slow down", "retryable": true}}),
+                );
+            }
+            let uri = body["uri"].as_str().unwrap_or_default();
+            if s.sources_reject.as_ref().is_some_and(|m| uri.contains(m.as_str())) {
+                let error = json!({"code": "payload_too_large", "message": "content is too big", "retryable": false});
+                return (413, json, json!({ "error": error }));
+            }
+            (201, json, json!({"uri": uri, "status": "created", "chunks": 1, "retired": 0}))
+        }
+        ("DELETE", ["v1", "sources"]) => (200, json, json!({"deleted": 1})),
         ("POST", ["v1", "work", "lease"]) => {
             (200, json, json!({"packets": s.packets.pop_front().into_iter().collect::<Vec<_>>()}))
         }

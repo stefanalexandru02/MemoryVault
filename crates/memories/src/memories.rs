@@ -503,7 +503,8 @@ pub(crate) async fn locate(
         "SELECT 'facts', space_id, scope_kind, scope_key FROM facts WHERE id = $1
          UNION ALL SELECT 'observations', space_id, scope_kind, scope_key FROM observations WHERE id = $1
          UNION ALL SELECT 'procedures', space_id, scope_kind, scope_key FROM procedures WHERE id = $1
-         UNION ALL SELECT 'summaries', space_id, scope_kind, scope_key FROM summaries WHERE id = $1",
+         UNION ALL SELECT 'summaries', space_id, scope_kind, scope_key FROM summaries WHERE id = $1
+         UNION ALL SELECT 'documents', space_id, scope_kind, scope_key FROM documents WHERE id = $1",
     )
     .bind(id)
     .fetch_optional(conn)
@@ -556,6 +557,11 @@ async fn soft_delete(
             "proc.retire",
             ForgetAction::Retired,
         ),
+        MemoryTable::Documents => (
+            "UPDATE documents SET retired_at = now() WHERE id = $1 AND retired_at IS NULL",
+            "doc.retire",
+            ForgetAction::Retired,
+        ),
         MemoryTable::Summaries => {
             return Err(ApiError::invalid("summaries cannot be forgotten; forget the observations they rest on"));
         }
@@ -573,6 +579,12 @@ async fn soft_delete(
             reason: Some(reason.unwrap_or("forgotten explicitly")),
         };
         record_audit(conn, identity, audit).await?;
+        if table == MemoryTable::Documents {
+            sqlx::query("DELETE FROM embeddings WHERE owner_table = 'documents' AND owner_id = $1")
+                .bind(id)
+                .execute(&mut *conn)
+                .await?;
+        }
     }
     Ok(action)
 }
@@ -601,7 +613,7 @@ async fn hard_delete(
             "UPDATE facts SET superseded_by = NULL WHERE superseded_by = $1",
         ],
         MemoryTable::Procedures => &["UPDATE procedures SET supersedes_id = NULL WHERE supersedes_id = $1"],
-        MemoryTable::Summaries => &[],
+        MemoryTable::Summaries | MemoryTable::Documents => &[],
     };
     for sql in cleanup {
         sqlx::query(sql).bind(id).execute(&mut *conn).await?;

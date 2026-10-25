@@ -8,7 +8,8 @@ use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::schemas::common::{
-    Concept, FactStatus, FeedbackVerdict, MemoryTable, ObservationType, Scope, Sensitivity, SummaryGrain, comma_list,
+    Concept, ContentType, FactStatus, FeedbackVerdict, MemoryTable, ObservationType, Scope, ScopeKind, Sensitivity,
+    SummaryGrain, comma_list, opt_from_str,
 };
 
 pub const MAX_GET_IDS: usize = 20;
@@ -40,7 +41,7 @@ pub struct SearchQuery {
     pub scopes: Option<Vec<Scope>>,
     #[serde(default, deserialize_with = "comma_list::deserialize")]
     pub types: Option<Vec<String>>,
-    /// Default: observations and summaries.
+    /// Default: observations and summaries, plus documents when `types` names `document`.
     #[serde(default, deserialize_with = "comma_list::deserialize")]
     pub tables: Option<Vec<MemoryTable>>,
     #[serde(default)]
@@ -92,7 +93,7 @@ impl SearchQuery {
 pub struct IndexRow {
     pub id: Uuid,
     pub table: MemoryTable,
-    /// Observation type, summary grain, fact predicate, procedure task_class.
+    /// Observation type, summary grain, fact predicate, procedure task_class, or `document`.
     #[serde(rename = "type", default)]
     pub row_type: Option<String>,
     pub title: String,
@@ -342,6 +343,43 @@ pub struct ProcedureFull {
     pub created_at: DateTime<Utc>,
 }
 
+/// One chunk of an ingested source (see [`SourcePut`]).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocumentFull {
+    pub id: Uuid,
+    pub space_id: Uuid,
+    pub scope: Scope,
+    pub source_uri: String,
+    pub title: String,
+    pub content_type: ContentType,
+    pub chunk_index: i32,
+    /// Headings above the chunk, outermost first.
+    #[serde(default)]
+    pub heading_path: Vec<String>,
+    pub content: String,
+    pub content_hash: String,
+    #[serde(default)]
+    pub token_estimate: i32,
+    #[serde(default)]
+    pub ingested_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    /// Set when the source was ingested again with other content, or the chunk was forgotten.
+    #[serde(default)]
+    pub retired_at: Option<DateTime<Utc>>,
+}
+
+impl DocumentFull {
+    /// `uri#Heading > Subheading`, the provenance shown next to a recalled chunk.
+    pub fn source(&self) -> String {
+        source_label(&self.source_uri, &self.heading_path)
+    }
+}
+
+/// `uri#Heading > Subheading`, or the bare `uri` for a chunk above the first heading.
+pub fn source_label(uri: &str, heading_path: &[String]) -> String {
+    if heading_path.is_empty() { uri.to_string() } else { format!("{uri}#{}", heading_path.join(" > ")) }
+}
+
 /// A full memory body, tagged by `table`.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "table", rename_all = "lowercase")]
@@ -350,6 +388,7 @@ pub enum MemoryItem {
     Summaries(SummaryFull),
     Facts(FactFull),
     Procedures(ProcedureFull),
+    Documents(DocumentFull),
 }
 
 impl MemoryItem {
@@ -359,6 +398,7 @@ impl MemoryItem {
             MemoryItem::Summaries(s) => s.id,
             MemoryItem::Facts(f) => f.id,
             MemoryItem::Procedures(p) => p.id,
+            MemoryItem::Documents(d) => d.id,
         }
     }
 
@@ -368,6 +408,7 @@ impl MemoryItem {
             MemoryItem::Summaries(_) => MemoryTable::Summaries,
             MemoryItem::Facts(_) => MemoryTable::Facts,
             MemoryItem::Procedures(_) => MemoryTable::Procedures,
+            MemoryItem::Documents(_) => MemoryTable::Documents,
         }
     }
 }
@@ -513,6 +554,149 @@ pub struct HistoryResponse {
     pub id: Uuid,
     pub table: MemoryTable,
     pub entries: Vec<HistoryEntry>,
+}
+
+// ---------- document sources ----------
+
+/// Longest `uri` and `title` of a source, in characters.
+const MAX_SOURCE_URI_CHARS: usize = 1000;
+const MAX_SOURCE_TITLE_CHARS: usize = 300;
+/// Longest `content_hash`: a hex digest, or any opaque version string a client prefers.
+const MAX_SOURCE_HASH_CHARS: usize = 128;
+
+/// `POST /v1/sources` (memories:write): a document to chunk and keep as searchable memory. A source is
+/// `(space, scope, uri)`: posting it again with the same `content_hash` changes nothing, with another one
+/// replaces its chunks.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourcePut {
+    /// `project` (with its key) or `global`.
+    pub scope: Scope,
+    /// Default: the caller's default space.
+    #[serde(default)]
+    pub space_id: Option<Uuid>,
+    /// Where the document lives, e.g. `docs/adr/0003-postgres.md` relative to the project.
+    pub uri: String,
+    /// Default: the first top-level heading, else the last segment of the `uri`.
+    #[serde(default)]
+    pub title: Option<String>,
+    pub content_type: ContentType,
+    pub content: String,
+    /// Identifies this version of `content` (the client's digest of it).
+    pub content_hash: String,
+}
+
+/// A request body over the limit: 413 `payload_too_large` in the standard error shape.
+pub fn payload_too_large(what: &str, max_bytes: usize) -> ApiError {
+    ApiError::new(
+        axum::http::StatusCode::PAYLOAD_TOO_LARGE,
+        "payload_too_large",
+        format!("{what} must be at most {max_bytes} bytes"),
+    )
+}
+
+/// 422 unless `scope` is the global scope or a project with a key.
+pub fn validate_source_scope(scope: &Scope) -> Result<(), ApiError> {
+    match scope.kind {
+        ScopeKind::Global if scope.key.is_empty() => Ok(()),
+        ScopeKind::Project if !scope.key.is_empty() => Ok(()),
+        ScopeKind::Global | ScopeKind::Project => {
+            Err(ApiError::invalid("a project scope needs a key and the global scope has none"))
+        }
+        _ => Err(ApiError::invalid("sources belong to a project or to the global scope")),
+    }
+}
+
+impl SourcePut {
+    /// `max_bytes` is `Settings::source_max_bytes`.
+    pub fn validate(&self, max_bytes: usize) -> Result<(), ApiError> {
+        validate_source_scope(&self.scope)?;
+        char_range("uri", &self.uri, 1, MAX_SOURCE_URI_CHARS)?;
+        if self.uri.chars().any(char::is_control) {
+            return Err(ApiError::invalid("uri must not contain control characters"));
+        }
+        if let Some(t) = &self.title {
+            char_range("title", t, 0, MAX_SOURCE_TITLE_CHARS)?;
+        }
+        char_range("content_hash", &self.content_hash, 1, MAX_SOURCE_HASH_CHARS)?;
+        if self.content_hash.chars().any(char::is_whitespace) {
+            return Err(ApiError::invalid("content_hash must not contain whitespace"));
+        }
+        if self.content.len() > max_bytes {
+            return Err(payload_too_large("content", max_bytes));
+        }
+        if self.content.trim().is_empty() {
+            return Err(ApiError::invalid("content must not be empty"));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum SourceStatus {
+    /// First ingest of the uri in this scope.
+    Created,
+    /// The content hash changed: the old chunks were retired.
+    Replaced,
+    /// The same hash was ingested already: nothing was written.
+    Unchanged,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceResponse {
+    pub uri: String,
+    pub scope: Scope,
+    pub space_id: Uuid,
+    pub status: SourceStatus,
+    /// Live chunks of the source after the call.
+    pub chunks: i64,
+    /// Chunks the call retired.
+    pub retired: i64,
+    pub content_hash: String,
+}
+
+/// `GET /v1/sources?scope=project:github.com/alex/homelab&space_id=…`; without `scope`, every scope, and without
+/// `space_id`, the caller's default space (where `POST /v1/sources` writes).
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+pub struct SourceListQuery {
+    #[serde(default, deserialize_with = "opt_from_str::deserialize")]
+    pub scope: Option<Scope>,
+    #[serde(default)]
+    pub space_id: Option<Uuid>,
+}
+
+/// `DELETE /v1/sources?uri=…&scope=…`: removes every chunk of the source, retired ones included.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceDeleteQuery {
+    pub uri: String,
+    #[serde(deserialize_with = "scope_param")]
+    pub scope: Scope,
+    #[serde(default)]
+    pub space_id: Option<Uuid>,
+}
+
+fn scope_param<'de, D: serde::Deserializer<'de>>(d: D) -> Result<Scope, D::Error> {
+    let text = String::deserialize(d)?;
+    text.parse().map_err(serde::de::Error::custom)
+}
+
+/// One source in `GET /v1/sources`.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceInfo {
+    pub space_id: Uuid,
+    pub scope: Scope,
+    pub uri: String,
+    pub title: String,
+    pub content_type: ContentType,
+    /// Live chunks.
+    pub chunks: i64,
+    pub content_hash: String,
+    pub ingested_at: DateTime<Utc>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct SourceList {
+    pub sources: Vec<SourceInfo>,
 }
 
 // ---------- explicit writes ----------

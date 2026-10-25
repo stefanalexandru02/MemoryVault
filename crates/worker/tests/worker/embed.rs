@@ -196,6 +196,40 @@ async fn reindex_queues_only_rows_lacking_vectors_once(pool: PgPool) {
     assert_eq!(failed, 1);
 }
 
+#[sqlx::test(migrations = "../../migrations")]
+async fn document_chunks_are_embedded_in_windows_and_retired_ones_lose_theirs(pool: PgPool) {
+    let e = env(pool).await;
+    // EMBED_MAX_PART_TOKENS is 512: 3000 characters need two windows, each led by the heading path.
+    let id = e.document(&["Ops", "Runbook"], &"restart ".repeat(375)).await;
+    e.embed_job("documents", id).await;
+    assert_eq!(embed_pass(&e.state, "t").await.unwrap(), 1);
+    assert_eq!(e.parts(id).await, ["body:0", "body:1"]);
+    let (space, kind, key): (uuid::Uuid, String, String) = sqlx::query_as(
+        "SELECT space_id, scope_kind::text, scope_key FROM embeddings WHERE owner_id = $1 AND part = 'body:0'",
+    )
+    .bind(id)
+    .fetch_one(&e.pool)
+    .await
+    .unwrap();
+    assert_eq!((space, kind.as_str(), key.as_str()), (e.who.space_id, "project", "proj-a"));
+    let stored: pgvector::Vector =
+        sqlx::query_scalar("SELECT embedding FROM embeddings WHERE owner_id = $1 AND part = 'body:0'")
+            .bind(id)
+            .fetch_one(&e.pool)
+            .await
+            .unwrap();
+    let lead = "Ops > Runbook\n";
+    let expect = e.tei.vector(&format!("{lead}{}", "restart ".repeat(375)[..2048 - lead.len()].trim_end()));
+    assert!(stored.as_slice().iter().zip(&expect).all(|(a, b)| (a - b).abs() < 1e-5));
+
+    // Retiring the chunk drops its vectors on the next embed, and a reindex does not bring them back.
+    sqlx::query("UPDATE documents SET retired_at = now() WHERE id = $1").bind(id).execute(&e.pool).await.unwrap();
+    e.embed_job("documents", id).await;
+    embed_pass(&e.state, "t").await.unwrap();
+    assert!(e.parts(id).await.is_empty());
+    assert_eq!(embed::reindex(&e.pool, "bge-m3").await.unwrap(), 0);
+}
+
 /// Delegates to FakeTei but rejects any batch containing the text "poison".
 struct PoisonTei(std::sync::Arc<memvault_core::tei::FakeTei>);
 

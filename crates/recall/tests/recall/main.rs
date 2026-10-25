@@ -2,5 +2,6 @@
 
 mod common;
 mod context;
+mod documents;
 mod engine;
 mod routes;

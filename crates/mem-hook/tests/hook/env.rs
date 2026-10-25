@@ -112,6 +112,15 @@ impl TestEnv {
         Self::finish(cmd, None)
     }
 
+    /// Runs `mem-hook ingest <args>` to completion, in the project directory.
+    pub fn ingest(&self, args: &[&str]) -> Out {
+        let mut all = vec!["ingest"];
+        all.extend_from_slice(args);
+        let mut cmd = self.command(&all);
+        cmd.current_dir(&self.cwd);
+        Self::finish(cmd, None)
+    }
+
     /// Writes Claude Code's user settings (`$HOME/.claude/settings.json`).
     pub fn write_claude_settings(&self, settings: &Value) {
         let dir = self.dir.path().join(".claude");

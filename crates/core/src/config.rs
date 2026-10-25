@@ -64,6 +64,10 @@ pub struct Settings {
     pub retention_packets_days: i64,
     pub retention_logs_days: i64,
 
+    // --- document sources ---
+    /// Largest `content` of one `POST /v1/sources`, in bytes.
+    pub source_max_bytes: usize,
+
     // --- consolidation triggers ---
     /// New observations in a scope since it was last planned that queue a planner run; 0 turns the trigger off.
     pub consolidate_observation_threshold: i64,
@@ -112,6 +116,7 @@ impl Default for Settings {
             retention_events_payload_days: 30,
             retention_packets_days: 90,
             retention_logs_days: 180,
+            source_max_bytes: 400 * 1024,
             consolidate_observation_threshold: 25,
             consolidate_min_interval: Duration::from_secs(900),
             host: "0.0.0.0".into(),
@@ -187,6 +192,7 @@ impl Settings {
             retention_events_payload_days: parse("RETENTION_EVENTS_PAYLOAD_DAYS", d.retention_events_payload_days)?,
             retention_packets_days: parse("RETENTION_PACKETS_DAYS", d.retention_packets_days)?,
             retention_logs_days: parse("RETENTION_LOGS_DAYS", d.retention_logs_days)?,
+            source_max_bytes: parse("SOURCE_MAX_BYTES", d.source_max_bytes)?,
             consolidate_observation_threshold: parse(
                 "CONSOLIDATE_OBSERVATION_THRESHOLD",
                 d.consolidate_observation_threshold,

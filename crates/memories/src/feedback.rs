@@ -78,8 +78,14 @@ async fn feedback_in(
     request: &MemoryFeedbackRequest,
 ) -> Result<MemoryFeedbackResponse, ApiError> {
     let (table, space, kind, key) = locate(conn, id).await?;
-    if table == MemoryTable::Summaries {
-        return Err(ApiError::invalid("summaries take no feedback; give it on the observations they rest on"));
+    match table {
+        MemoryTable::Summaries => {
+            return Err(ApiError::invalid("summaries take no feedback; give it on the observations they rest on"));
+        }
+        MemoryTable::Documents => {
+            return Err(ApiError::invalid("documents take no feedback; ingest the source again if it changed"));
+        }
+        _ => {}
     }
     ensure_writable(conn, identity, space).await?;
     // Verdicts on one memory are applied one at a time, so the counts below include every earlier one.
@@ -155,6 +161,7 @@ fn audit_action(table: MemoryTable) -> &'static str {
         MemoryTable::Observations => "obs.feedback",
         MemoryTable::Procedures => "proc.feedback",
         MemoryTable::Summaries => "sum.feedback",
+        MemoryTable::Documents => "doc.feedback",
     }
 }
 
@@ -212,7 +219,7 @@ async fn apply(
                 .await?;
         }
         // Rejected before any verdict is stored.
-        MemoryTable::Summaries => {}
+        MemoryTable::Summaries | MemoryTable::Documents => {}
     }
     Ok(())
 }

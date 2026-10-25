@@ -451,10 +451,10 @@ fn tools() -> Vec<Tool> {
     vec![
         tool(
             "memory_search",
-            "Search shared memory for a compact index of matching observations and summaries (ids, dates, titles, token costs); use it first, then memory_timeline around a hit, then memory_get for full bodies (search → timeline → get).",
+            "Search shared memory for a compact index of matching observations and summaries (ids, dates, titles, token costs), or with types [\"document\"] the ingested repository docs (ADRs, READMEs, runbooks); use it first, then memory_timeline around a hit, then memory_get for full bodies (search → timeline → get).",
             json!({
                 "query": {"type": "string", "description": "What to look for."},
-                "types": {"type": "array", "items": {"type": "string"}, "description": "Observation types, e.g. decision, bugfix."},
+                "types": {"type": "array", "items": {"type": "string"}, "description": "Observation types, e.g. decision, bugfix, or document for ingested docs."},
                 "scope": {"type": "string", "enum": ["project", "global", "all"], "description": "Default: the current project when the client reports one, else all."},
                 "since": {"type": "string", "description": "RFC 3339 time, a date like 2026-10-01, or a span like 7d."},
                 "files": {"type": "array", "items": {"type": "string"}, "description": "Only observations touching these paths."},

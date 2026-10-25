@@ -1,6 +1,6 @@
 //! Project key resolution (spec 8.4).
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::Command;
 
 fn git(cwd: &str, args: &[&str]) -> Option<String> {
@@ -75,6 +75,11 @@ fn local_repo_name(cwd: &str) -> Option<String> {
     }?;
     let name = name.to_string_lossy();
     Some(name.strip_suffix(".git").unwrap_or(&name).to_string())
+}
+
+/// The root of the git work tree that holds `cwd`, if it is in one.
+pub fn toplevel(cwd: &str) -> Option<PathBuf> {
+    git(cwd, &["rev-parse", "--show-toplevel"]).map(PathBuf::from)
 }
 
 pub fn resolve(cwd: &str) -> String {

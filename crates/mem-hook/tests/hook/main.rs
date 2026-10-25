@@ -4,6 +4,7 @@ mod doctor;
 mod env;
 mod events;
 mod fake_server;
+mod ingest;
 mod observe;
 mod session_start;
 mod spool;

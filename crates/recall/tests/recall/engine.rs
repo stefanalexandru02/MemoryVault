@@ -173,7 +173,8 @@ async fn budgets_bound_every_slot(pool: PgPool) {
         .await;
         insert_fact(&w, Fact::new(space, &format!("prefers.tool_{i}"), "kubernetes deploy with helm")).await;
     }
-    let budgets = Budgets { profile: 0, facts: 40, procedures: 0, observations: 120, summaries: 0, work_state: 0 };
+    let budgets =
+        Budgets { profile: 0, facts: 40, procedures: 0, observations: 120, summaries: 0, work_state: 0, documents: 0 };
     let r = RecallRequest { budgets, expand_top_observations: 1, ..req("kubernetes deploy") };
     let resp = engine::recall(&w.state, &w.alice.identity, r).await.unwrap();
     let by = &resp.tokens.by_slot;
@@ -540,7 +541,15 @@ async fn rows_beyond_the_reranked_top_never_outrank_reranked_ones(pool: PgPool) 
         insert_summary(&w, space, &project(), None, SummaryGrain::Session, &format!("quokka survey {i}"), "next", 1.0)
             .await;
     }
-    let budgets = Budgets { profile: 0, facts: 0, procedures: 0, observations: 20000, summaries: 20000, work_state: 0 };
+    let budgets = Budgets {
+        profile: 0,
+        facts: 0,
+        procedures: 0,
+        observations: 20000,
+        summaries: 20000,
+        work_state: 0,
+        documents: 0,
+    };
     let r = RecallRequest { budgets, ..req("quokka") };
     let resp = engine::recall(&w.state, &w.alice.identity, r).await.unwrap();
     assert!(resp.reranked);
@@ -615,7 +624,8 @@ async fn pinned_facts_compete_for_the_budget_by_importance_not_by_id(pool: PgPoo
             .unwrap();
         ids.push(id);
     }
-    let all = Budgets { profile: 0, facts: 1000, procedures: 0, observations: 0, summaries: 0, work_state: 0 };
+    let all =
+        Budgets { profile: 0, facts: 1000, procedures: 0, observations: 0, summaries: 0, work_state: 0, documents: 0 };
     let full = engine::recall(&w.state, &w.alice.identity, RecallRequest { budgets: all, ..req("zzzz nothing") })
         .await
         .unwrap();

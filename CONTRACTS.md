@@ -30,7 +30,7 @@ lock" is normal, wait; never kill cargo or delete `target/`. Build and test only
 | `crates/server` | `memvault` (bin) / `memvault_server` | foundation | CLI, router assembly, `/health`, `/metrics`, `/mcp` mount, migrate |
 | `crates/ingest` | `memvault-ingest` | ingest | sessions, events, windows, work packets (lease/result/fail/heartbeat), prompts route, extract/summary appliers |
 | `crates/recall` | `memvault-recall` | recall | candidates, fusion, rerank, budgets, rendering, context cache + listener, recall/context/search/timeline/get/explain/history/by-file/feedback routes, `me/settings`, `stats/recall` |
-| `crates/memories` | `memvault-memories` | memories | memories (remember/forget/feedback) + work-state routes, MCP server |
+| `crates/memories` | `memvault-memories` | memories | memories (remember/forget/feedback), sources (document ingestion, chunker) and work-state routes, MCP server |
 | `crates/consolidate` | `memvault-consolidate` | consolidation | planner, consolidation appliers, revert, admin routes and admin CLI |
 | `crates/worker` | `memvault-worker` | worker | embedding parts and jobs, worker loop, sweeps, retention |
 | `crates/evals` | `memvault-evals` | evals | record, redact, replay, compare |
@@ -103,7 +103,7 @@ Full DDL of spec 4.1-4.7 plus:
   `memsvc_join(text[], text)`, `memsvc_apply_space_rls(tbl, write_check)`,
   `memsvc_invalidate_context(space uuid, kind text, key text) -> int` (SECURITY DEFINER; kind NULL = whole space).
 - RLS (forced) on: sessions, events, observations, summaries, entities, facts, procedures, work_state, profiles,
-  embeddings, work_packets, memory_audit, procedure_hints (writes need owner/writer); retrieval_log, access_log
+  embeddings, work_packets, memory_audit, procedure_hints, documents (writes need owner/writer); retrieval_log, access_log
   (writes need any membership); context_cache (own rows); user_settings (own row); memberships (own rows,
   read-only for the app role).
   users, spaces, clients, api_tokens, jobs, rate_limits have no RLS.
@@ -141,6 +141,11 @@ Full DDL of spec 4.1-4.7 plus:
   created_at)`, append-only, unique on `(user_id, target_id, verdict)` (a repeat is a no-op), forced space RLS
   (writes need owner/writer); `facts.disputed_at` (the planner's queue of facts whose net negative feedback
   crossed the threshold).
+- **0301 memories**: `documents(id, space_id, scope_kind, scope_key, source_uri, title, content_type 'markdown'|'text',
+  chunk_index, heading_path text[], content, content_hash, token_estimate, ingested_by, created_at, retired_at,
+  search_text, search_tsv)`: one row per chunk of an ingested source `(space, scope, source_uri)`, forced space RLS,
+  a partial unique index on the live chunks, `search_tsv` GIN (and BM25 `doc_bm25` with `pg_search`). The
+  `embeddings.owner_table` check also allows `documents`.
 - **0400 consolidation**: `observations.decayed_at`, `facts.decayed_at` (incremental decay),
   `memory_audit.seq bigserial` (reverse-replay order), `memory_audit.reverts_audit_id`,
   `procedure_hints.consumed_run_id`, index on `work_packets((inputs->>'run_id'))`.
@@ -229,7 +234,7 @@ that login is superuser or BYPASSRLS), `DB_POOL_MAX` (10), `TEI_EMBED_URL`, `TEI
 `WINDOW_IDLE_SECONDS` (90), `LEASE_SECONDS_DEFAULT` (600), `PREFERRED_RUNNER_SECONDS` (600),
 `WORKER_SWEEP_INTERVAL_S` (30), `EMBED_BATCH_SIZE` (64), `EMBED_CONCURRENCY` (2), `EMBED_MAX_PART_TOKENS` (512),
 `CONTEXT_RERENDER_DEBOUNCE_S` (2), `RETENTION_EVENTS_PAYLOAD_DAYS` (30), `RETENTION_PACKETS_DAYS` (90),
-`RETENTION_LOGS_DAYS` (180), `CONSOLIDATE_OBSERVATION_THRESHOLD` (25; 0 = off), `CONSOLIDATE_MIN_INTERVAL_S` (900), `HOST`, `PORT`, `LOG_LEVEL` (EnvFilter directive), `LOG_FORMAT` (`json`|`text`),
+`RETENTION_LOGS_DAYS` (180), `CONSOLIDATE_OBSERVATION_THRESHOLD` (25; 0 = off), `CONSOLIDATE_MIN_INTERVAL_S` (900), `SOURCE_MAX_BYTES` (409600, the largest `content` of `POST /v1/sources`), `HOST`, `PORT`, `LOG_LEVEL` (EnvFilter directive), `LOG_FORMAT` (`json`|`text`),
 `TEI_EMBED_BATCH_TIMEOUT_S` (60, worker embed batches), `WORKER_METRICS_ADDR` (default `HOST:PORT`).
 `serve` and `admin` refuse to start with an empty `TOKEN_PEPPER` (`Settings::require_token_pepper`).
 Durations are `std::time::Duration` fields (`tei_rerank_timeout`, ...). Handlers read `state.settings`.
@@ -287,7 +292,9 @@ RecallRequest, RecallResponse, slot items with flattened `SlotItem`, ContextQuer
 (6.4/12.5: SearchQuery (comma-separated list params), IndexRow, SearchResponse, Timeline*, ByFileQuery, GetRequest,
 GetResponse with `MemoryItem` tagged by `table`, ExplainResponse, HistoryResponse and HistoryEntry, `MemoryFeedbackRequest`/`MemoryFeedbackResponse`/`FeedbackCounts` and the
 caution helpers `fact_caution`/`procedure_caution`, `RememberRequest` tagged by `kind`
-(fact|observation|procedure), RememberResponse, ForgetQuery, ForgetResponse), `work_state` (6.5), `work` (6.6:
+(fact|observation|procedure), RememberResponse, ForgetQuery, ForgetResponse, and the document sources `SourcePut` (with
+`validate(max_bytes)`), SourceResponse, SourceListQuery, SourceDeleteQuery, SourceInfo, SourceList, DocumentFull),
+`work_state` (6.5), `work` (6.6:
 LeaseRequest, LeasedPacket with `prompt{system,user_template,user}`, ResultRequest, ResultResponse, Fail*,
 HeartbeatResponse, `PacketRecord` = a `work_packets` row, `sqlx::FromRow`), `packets` (9.2 inputs: ExtractInputs,
 SummarizePromptInputs, SummarizeSessionInputs), `outputs` (typed LLM outputs ObserverV1, SummaryV1,

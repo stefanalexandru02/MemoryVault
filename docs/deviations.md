@@ -103,6 +103,9 @@ and repeated items are merged. The last section lists the gaps that are still op
   `0099`.
 - **No migration needed** in the ranges 0100 (kept as it was), 0300 to 0399, 0500 to 0599 (beyond `0500`) and
   0600 to 0699. The existing jobs table, unique `idempotency_key` and embeddings schema were enough.
+- **Migration 0301 (documents).** The `documents` table and the `documents` value of the `embeddings.owner_table`
+  check, for ingested files. It is a fifth memory table (`MemoryTable::Documents`, `EmbeddingOwnerTable::Documents`),
+  not observations, so decay, consolidation and the context index never see it. See "Document sources" in section 9.
 - **Entities.** Entities have no scope columns, so their vectors are stored with
   `scope_kind = 'global'` and `scope_key = ''`.
 - **Response additions.** `POST /v1/sessions` returns `next_seq`. `POST /v1/sessions/{id}/end` accepts
@@ -233,6 +236,10 @@ and repeated items are merged. The last section lists the gaps that are still op
   `musl-tools`.
 - **Undefined modes.** The `--final` flag and the "loop up to 3 packets" were undefined for the other modes. The
   decisions are above (session 3, final 10, all 50).
+- **`mem-hook ingest`.** A hand-run subcommand like `doctor`: it bypasses the exit-0 guard and the `MEMORY_OBSERVER`
+  guard, prints to the terminal and exits 1 when a file or the listing failed, 2 for a bad command line. It walks
+  with `std::fs` and matches `--glob` itself (no glob dependency), hashes with SHA-256, compares with
+  `GET /v1/sources` and retries a 429 after `Retry-After`. Details are in the plugin README.
 
 ## 8. Recall and context
 
@@ -350,6 +357,25 @@ and repeated items are merged. The last section lists the gaps that are still op
 - **Promotion.** `promote_scope` supports only `to: global`. Promotion to project, device or agent is rejected,
   because a decision carries no scope key to derive it from.
 - **Explain.** `explain` is implemented in the API and the tool. Its output is capped as in section 8.
+- **Document sources.** `POST /v1/sources` (memories:write), `GET /v1/sources` and `DELETE /v1/sources` ingest files
+  as memory of a new kind `document`; the spec has nothing like it. A source is `(space, scope, uri)` with a
+  project or the global scope. `content` is chunked in `memvault_memories::chunk` (markdown by heading, text by
+  paragraph, 600 to 800 tokens, a heading stays with the block after it, the heading path in effect at the chunk's
+  first line is stored) and each chunk is a `documents` row with an embed job. The same `content_hash` is a no-op
+  (200 `unchanged`); another hash retires the old chunks (`retired_at`, their embeddings deleted) and writes new ones
+  in one transaction under an advisory lock per source (201 `replaced`). Retired chunks stay for `as_of` searches;
+  `DELETE` removes every chunk of the source, retired ones too, and is a 404 when there is none. `GET` lists the
+  default space unless `space_id` is given. `content` over `SOURCE_MAX_BYTES` (400 KiB) is 413 `payload_too_large`.
+  Not signalled to the context cache: documents are not in the session-start block.
+- **Documents in search and recall.** `types` containing `document` adds the documents table to a search whose
+  `tables` is not given (the default stays observations and summaries); `as_of` searches take all tables. `POST
+  /v1/recall` has a `documents` slot and budget (default 400 tokens, 0 in the context budgets and skipped when
+  building the session-start block) rendered as an excerpt with `[doc#id · source: uri#Heading > Sub · date]`. A
+  document scores with a 0.8 multiplier and no decay, so it ranks below a fact of equal relevance. Documents take no
+  feedback; `DELETE /v1/memories/{id}` retires one chunk. The worker embeds a chunk as `body:i` windows of
+  `EMBED_MAX_PART_TOKENS`, each led by the heading path, and none for a retired chunk (reindex skips those too).
+  `memory_search` has no ingest tool: files are sent by `mem-hook ingest`. A project remap (`admin project remap`)
+  does not move documents; ingest again under the new key and delete the old sources.
 
 ## 10. Consolidation
 
@@ -546,7 +572,7 @@ and repeated items are merged. The last section lists the gaps that are still op
   the token as an environment reference. The plugin now ships `.mcp.json` and takes the URL and token from its own
   `userConfig` (token in the keychain, or `~/.claude/.credentials.json` where there is none), so no shell profile
   is involved and IDE and desktop apps connect too. Tool names become `mcp__plugin_memory_memory__*`. The plugin
-  also ships six skills (`recall`, `remember`, `brief`, `project-history`, `handoff`, `how-it-works`), which the
+  also ships seven skills (`recall`, `remember`, `brief`, `project-history`, `handoff`, `ingest`, `how-it-works`), which the
   spec does not list. `make connect-local`, `make connect-remote` and `make disconnect` wrap the setup.
 - **File-context hook is informational.** Phase 4's file-context hook is built as a `PreToolUse` hook on `Read`
   (`mem-hook file-context`). It adds earlier observations for the file as context, once per file per session, and

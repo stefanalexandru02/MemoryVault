@@ -4,4 +4,5 @@ mod common;
 mod feedback;
 mod mcp;
 mod rest;
+mod sources;
 mod work_state;

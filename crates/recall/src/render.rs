@@ -11,10 +11,10 @@ use chrono::{DateTime, Utc};
 use memvault_core::ids::short_id;
 use memvault_core::schemas::common::{MemoryTable, Scope, ScopeKind};
 use memvault_core::schemas::memories::{
-    ExplainResponse, HistoryResponse, IndexRow, MemoryItem, Provenance, procedure_caution,
+    DocumentFull, ExplainResponse, HistoryResponse, IndexRow, MemoryItem, Provenance, procedure_caution,
 };
 use memvault_core::schemas::recall::{
-    FactItem, ObservationItem, ProcedureItem, RecallSlots, SummaryItem, WorkStateList,
+    DocumentItem, FactItem, ObservationItem, ProcedureItem, RecallSlots, SummaryItem, WorkStateList,
 };
 use serde_json::Value;
 use uuid::Uuid;
@@ -35,6 +35,7 @@ pub const DEFAULT_GLYPH: &str = "•";
 pub const INDEX_HEADER: &str = "| id | when | t | title | ~tok |\n|---|---|---|---|---|";
 const EXCERPT_CHARS: usize = 160;
 const NARRATIVE_CHARS: usize = 600;
+const DOCUMENT_EXCERPT_CHARS: usize = 480;
 
 /// `_Legend: ⚖ decision · ● bugfix · … · § summary_`.
 pub fn legend() -> String {
@@ -50,6 +51,7 @@ pub fn glyph(table: MemoryTable, obs_type: Option<&str>) -> &'static str {
         MemoryTable::Summaries => "§",
         MemoryTable::Facts => "≡",
         MemoryTable::Procedures => "¶",
+        MemoryTable::Documents => "▤",
     }
 }
 
@@ -126,6 +128,12 @@ pub fn procedure_tag(id: &Uuid, version: i32, created_at: Option<DateTime<Utc>>,
     tag("proc", id, &[Some(format!("v{version}")), Some(fmt_date(created_at)), caution.map(String::from)])
 }
 
+/// `[doc#a1b2c3 · source: docs/adr/0003.md#Decision · 2026-10-02]`: `source` is `uri#Heading > Subheading` and the
+/// date is when the chunk was ingested.
+pub fn document_tag(id: &Uuid, source: &str, ingested_at: Option<DateTime<Utc>>) -> String {
+    tag("doc", id, &[Some(format!("source: {source}")), Some(fmt_date(ingested_at))])
+}
+
 fn with_citation(line: String, citation: &Option<String>) -> String {
     match citation {
         Some(c) => format!("{line} {c}"),
@@ -154,6 +162,10 @@ pub fn procedure_line(p: &ProcedureItem) -> String {
         format!("- **{}** ({usage}): {}", one_line(&p.name), excerpt(&p.body_md, EXCERPT_CHARS)),
         &p.item.citation,
     )
+}
+
+pub fn document_line(d: &DocumentItem) -> String {
+    with_citation(format!("- {}", excerpt(&d.content, DOCUMENT_EXCERPT_CHARS)), &d.item.citation)
 }
 
 pub fn observation_block(o: &ObservationItem) -> String {
@@ -327,6 +339,7 @@ pub fn recall_markdown(slots: &RecallSlots) -> String {
         section("Relevant procedures", &lines(&slots.procedures, procedure_line)),
         section("Observations", &obs_parts.join("\n")),
         section("Summaries", &lines(&slots.summaries, summary_line)),
+        section("Documents", &lines(&slots.documents, document_line)),
     ]);
     if body.is_empty() { "## Memory\n_No relevant memories._".into() } else { format!("## Memory\n{body}") }
 }
@@ -497,7 +510,29 @@ pub fn memory_item_markdown(item: &MemoryItem) -> String {
             p.body_md.trim().to_string(),
         ]
         .join("\n"),
+        MemoryItem::Documents(d) => document_markdown(d),
     }
+}
+
+fn document_markdown(d: &DocumentFull) -> String {
+    let retired = d.retired_at.map(|at| format!(" · retired {}", fmt_when(Some(at)))).unwrap_or_default();
+    [
+        format!(
+            "#### {} {} {}",
+            glyph(MemoryTable::Documents, None),
+            one_line(&d.title),
+            document_tag(&d.id, &d.source(), Some(d.created_at))
+        ),
+        format!(
+            "`{}` · {} · chunk {} · ingested {}{retired}",
+            d.id,
+            d.scope.as_text(),
+            d.chunk_index,
+            fmt_when(Some(d.created_at))
+        ),
+        d.content.trim().to_string(),
+    ]
+    .join("\n")
 }
 
 pub fn memory_items_markdown(items: &[MemoryItem]) -> String {

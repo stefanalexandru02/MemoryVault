@@ -26,11 +26,18 @@ use memvault_core::user_tx;
 
 /// Small budgets for a ~1k-token block (architecture 6.2): `/v1/recall` without a query and with
 /// `expand_top_observations = 0`. The facts budget only carries pinned facts (shown in Profile).
-pub const CONTEXT_BUDGETS: Budgets =
-    Budgets { profile: 300, facts: 150, procedures: 200, observations: 700, summaries: 200, work_state: 150 };
+pub const CONTEXT_BUDGETS: Budgets = Budgets {
+    profile: 300,
+    facts: 150,
+    procedures: 200,
+    observations: 700,
+    summaries: 200,
+    work_state: 150,
+    documents: 0,
+};
 /// The lean block: a short profile, pinned facts and open work around the ~140-token rubric, ~400 tokens in all.
 pub const LEAN_BUDGETS: Budgets =
-    Budgets { profile: 120, facts: 60, procedures: 0, observations: 0, summaries: 0, work_state: 80 };
+    Budgets { profile: 120, facts: 60, procedures: 0, observations: 0, summaries: 0, work_state: 80, documents: 0 };
 const SINCE_LIMIT: i64 = 8;
 /// A session of this device started this recently is the one asking for context (the hook creates
 /// it first), so it does not count as the previous visit.

@@ -477,3 +477,26 @@ async fn feedback_tool_records_a_verdict_once_and_explains_the_outcome(pool: PgP
     let (err, missing) = call(&app, alice, "memory_feedback", json!({"id": "zzzz", "verdict": "helpful"})).await;
     assert!(err && missing.contains("not_found"), "{missing}");
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn documents_are_found_by_type_and_read_with_their_source(pool: PgPool) {
+    let w = world(pool).await;
+    let app = mcp_app(&w);
+    let source = json!({
+        "scope": {"kind": "project", "key": PROJECT}, "uri": "docs/runbook.md", "content_type": "markdown",
+        "content_hash": "h1", "content": "# Runbook\n\n## Rollback\n\nRoll back the migration with the down script first.",
+    });
+    assert_eq!(w.post(&w.alice.token, "/sources", source).await.status, StatusCode::CREATED);
+
+    let (is_error, found) =
+        call(&app, &w.alice, "memory_search", json!({"query": "roll back migration", "types": ["document"]})).await;
+    assert!(!is_error, "{found}");
+    assert!(found.contains("docs/runbook.md#Runbook"), "{found}");
+    let (_, other) = call(&app, &w.alice, "memory_search", json!({"query": "roll back migration"})).await;
+    assert!(!other.contains("runbook.md"), "documents are searched on request: {other}");
+
+    let id: String = sqlx::query_scalar("SELECT id::text FROM documents").fetch_one(&w.pool).await.unwrap();
+    let (is_error, body) = call(&app, &w.alice, "memory_get", json!({"ids": [id]})).await;
+    assert!(!is_error, "{body}");
+    assert!(body.contains("source: docs/runbook.md#Runbook") && body.contains("down script"), "{body}");
+}

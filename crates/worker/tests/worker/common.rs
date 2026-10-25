@@ -43,6 +43,24 @@ impl Env {
         id
     }
 
+    pub async fn document(&self, headings: &[&str], content: &str) -> Uuid {
+        let id = new_id();
+        let headings: Vec<String> = headings.iter().map(|h| h.to_string()).collect();
+        sqlx::query(
+            "INSERT INTO documents (id, space_id, scope_kind, scope_key, source_uri, title, content_type, chunk_index,
+                                    heading_path, content, content_hash)
+             VALUES ($1, $2, 'project', 'proj-a', 'docs/a.md', 'A', 'markdown', 0, $3, $4, 'h1')",
+        )
+        .bind(id)
+        .bind(self.who.space_id)
+        .bind(&headings)
+        .bind(content)
+        .execute(&self.pool)
+        .await
+        .unwrap();
+        id
+    }
+
     pub async fn embed_job(&self, table: &str, id: Uuid) {
         let mut conn = self.pool.acquire().await.unwrap();
         memvault_worker::embed::enqueue_embed(&mut conn, table, id).await.unwrap();

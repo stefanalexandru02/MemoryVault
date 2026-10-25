@@ -28,11 +28,21 @@ pub struct Budgets {
     pub observations: u32,
     pub summaries: u32,
     pub work_state: u32,
+    /// Ingested documents; never part of the SessionStart block.
+    pub documents: u32,
 }
 
 impl Default for Budgets {
     fn default() -> Self {
-        Self { profile: 400, facts: 300, procedures: 400, observations: 600, summaries: 300, work_state: 200 }
+        Self {
+            profile: 400,
+            facts: 300,
+            procedures: 400,
+            observations: 600,
+            summaries: 300,
+            work_state: 200,
+            documents: 400,
+        }
     }
 }
 
@@ -224,6 +234,22 @@ pub struct SummaryItem {
     pub device_id: Option<String>,
 }
 
+/// A chunk of an ingested document. The text is the whole chunk; the rendered markdown shows an excerpt.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct DocumentItem {
+    #[serde(flatten)]
+    pub item: SlotItem,
+    /// Where it comes from, `uri#Heading > Subheading` (the bare uri above the first heading).
+    pub source: String,
+    pub uri: String,
+    pub title: String,
+    #[serde(default)]
+    pub heading_path: Vec<String>,
+    pub chunk_index: i32,
+    pub content: String,
+    pub created_at: DateTime<Utc>,
+}
+
 /// A folded work-state list (last write per key wins), spec 6.5.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkStateList {
@@ -250,6 +276,8 @@ pub struct RecallSlots {
     pub summaries: Vec<SummaryItem>,
     #[serde(default)]
     pub work_state: Vec<WorkStateList>,
+    #[serde(default)]
+    pub documents: Vec<DocumentItem>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
