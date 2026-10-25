@@ -65,7 +65,7 @@ take turns on sqlx's advisory lock; migrations the binary does not know are igno
 |---|---|
 | 0001-0099 | foundation (0099 = grants) |
 | 0100-0199 | ingest (0100 exists: `session_windows`, lease bookkeeping) |
-| 0200-0299 | recall (0200-0203 exist: context cache columns, invalidations, injection modes) |
+| 0200-0299 | recall (0200-0204 exist: context cache columns, invalidations, injection modes, index size and types) |
 | 0300-0399 | memories / mcp |
 | 0400-0499 | consolidation (0400 exists: decay and revert bookkeeping) |
 | 0500-0599 | worker |
@@ -128,6 +128,9 @@ Full DDL of spec 4.1-4.7 plus:
 - **0203 recall**: `user_settings`; `retrieval_log.tokens`, `.hits`, `.injection` (`full`|`lean`, context calls only)
   and an index on `(client_id, created_at)`; `context_cache.mode`, `.hit_count`; `memsvc_recall_invalidate` is
   recreated returning `mode` as well (same grants). The cache key is `v2` and includes the mode.
+- **0204 recall**: `context_cache.obs_rows` (default 12) and `.obs_types` (text[]): the size and types of a full block's
+  observation index (`GET /v1/context?rows=&types=`); `memsvc_recall_invalidate` returns both. The cache key is `v3`
+  and includes them (`cache::Variant`; lean blocks ignore them).
 - **0401 consolidation**: `scope_planning(space_id, scope_kind, scope_key, last_planned_at)` (when the planner last
   processed a scope), `planner_runs(run_id, space_id, scope_kind?, scope_key?, trigger, packets, actions, created_at)`
   (one row per run and space; trigger `nightly|session_end|threshold|manual`), both with forced space RLS, and the
@@ -203,8 +206,8 @@ Full DDL of spec 4.1-4.7 plus:
   ingest must use the core path).
 - **Job types** (`jobs`, worker lanes): `embed` `{owner_table, owner_id, model?}` (`model` set by reindex; a job
   for another model than `EMBED_MODEL` fails permanently); `render_context` = `memvault_recall::cache::
-  RenderContextJob {cache_key, user_id, client_id, project_key, device_id, source, mode}` (`mode` defaults to `full`
-  for jobs queued before it existed), queued by the API's cache
+  RenderContextJob {cache_key, user_id, client_id, project_key, device_id, source, mode, obs_rows, obs_types}` (`mode`
+  defaults to `full` and `obs_rows`/`obs_types` to 12/all for jobs queued before they existed), queued by the API's cache
   listener with `run_after = now() + CONTEXT_RERENDER_DEBOUNCE_S`, coalesced per `cache_key`, run by
   `memvault_recall::cache::rerender(&state, &payload) -> Result<bool, ApiError>` (false: user or client gone; the
   job is done either way); `plan` = `memvault_core::jobs::PlanJob {space_id, scope, trigger}`, queued by
@@ -373,7 +376,7 @@ CLI `memvault`: `serve [--host] [--port]` (graceful shutdown on SIGINT/SIGTERM),
 | `engine::get_memories(&AppState, &Identity, &[Uuid]) -> Result<GetResponse, ApiError>` | recall | 6.4 |
 | `engine::explain(&AppState, &Identity, Uuid) -> Result<ExplainResponse, ApiError>` | recall | 12.5 |
 | `engine::history(&AppState, &Identity, Uuid) -> Result<HistoryResponse, ApiError>` | recall | 6.4 |
-| `context::render_context(&AppState, &Identity, project_key: Option<&str>, device_id: Option<&str>, source: &str) -> Result<String, ApiError>` | recall | 6.3, 11.5-11.7 |
+| `context::render_context(&AppState, &Identity, project_key: Option<&str>, device_id: Option<&str>, source: &str, mode: Option<InjectionMode>) -> Result<String, ApiError>` (`render_context_with(.., &ContextOptions { mode, rows, types })` adds the index size and types) | recall | 6.3, 11.5-11.7 |
 | `cache::spawn_listener(AppState, CancellationToken) -> JoinHandle<()>` | recall | 11.6 |
 | `cache::rerender(&AppState, &RenderContextJob) -> Result<bool, ApiError>` | recall | 11.6 |
 | `mcp::service(AppState) -> axum::Router` (applies its own bearer auth; mount with `nest_service("/mcp", ..)`) | memories | 7 |

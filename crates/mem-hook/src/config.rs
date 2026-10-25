@@ -12,9 +12,28 @@ pub struct Config {
     /// `MEM_INJECTION`: `lean` or `full`, sent as `mode` with the SessionStart request. Unset (or anything
     /// else) leaves the choice to the user's default on the server.
     pub injection: Option<String>,
+    /// `MEM_CONTEXT_ROWS` (1 to 30): rows of the observation index of the full block, sent as `rows`. Unset (or
+    /// anything else) leaves the choice to the server.
+    pub context_rows: Option<u32>,
+    /// `MEM_CONTEXT_TYPES`: the observation types the index is limited to, sent as `types`; names the server does
+    /// not know are dropped, so a typo cannot make the context request fail.
+    pub context_types: Vec<String>,
     /// `MEM_FILE_CONTEXT_BUDGET`: estimated tokens the file-context hook may add to one session; 0 turns it off.
     pub file_context_budget: u32,
 }
+
+/// The observation types the server knows (`GET /v1/context?types=`).
+const OBSERVATION_TYPES: [&str; 9] = [
+    "bugfix",
+    "feature",
+    "refactor",
+    "change",
+    "discovery",
+    "decision",
+    "security_alert",
+    "security_note",
+    "sensitive",
+];
 
 /// Default of `MEM_FILE_CONTEXT_BUDGET`.
 pub const DEFAULT_FILE_CONTEXT_BUDGET: u32 = 1200;
@@ -96,6 +115,8 @@ impl Config {
             device: get("DEVICE_ID").unwrap_or_else(hostname),
             claude_bin: get("CLAUDE_BIN").unwrap_or_else(|| "claude".into()),
             injection: get("MEM_INJECTION").filter(|m| matches!(m.as_str(), "lean" | "full")),
+            context_rows: get("MEM_CONTEXT_ROWS").and_then(|v| v.parse().ok()).filter(|r| (1..=30).contains(r)),
+            context_types: get("MEM_CONTEXT_TYPES").map(|v| known_types(&v)).unwrap_or_default(),
             file_context_budget: get("MEM_FILE_CONTEXT_BUDGET")
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(DEFAULT_FILE_CONTEXT_BUDGET),
@@ -103,9 +124,29 @@ impl Config {
     }
 }
 
+/// The known observation types of a comma-separated list, in the order given, once each.
+fn known_types(list: &str) -> Vec<String> {
+    let mut out: Vec<String> = Vec::new();
+    for name in list.split(',').map(|n| n.trim().to_lowercase()) {
+        if OBSERVATION_TYPES.contains(&name.as_str()) && !out.contains(&name) {
+            out.push(name);
+        }
+    }
+    out
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn keeps_known_observation_types_only() {
+        assert_eq!(
+            known_types("Decision, bugfix,decision,opinion,,security_alert"),
+            ["decision", "bugfix", "security_alert"]
+        );
+        assert!(known_types("everything").is_empty());
+    }
 
     #[test]
     fn parses_shell_style_lines() {

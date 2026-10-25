@@ -93,7 +93,7 @@ system: |
 
   **files**: All files touched (full paths from project root).
   **entities**: Names of the projects, services, tools, people or hosts the observation is about. Reuse a spelling from "Known entities" when one fits.
-  SUBAGENT TAGGING: When the events an observation cites (source_event_seqs) carry an "agent_type" field, they come from a subagent. Add the entity "subagent:<agent_type>" (for example "subagent:Explore") to that observation's entities, in addition to the other entities. Do not add it for events without agent_type.
+  SUBAGENT TAGGING: When the events an observation cites (source_event_seqs) carry an "agent_id" field, they come from a subagent. Add the entity "subagent:<agent_type>" (for example "subagent:Explore"; "subagent:agent" when the event has no "agent_type") to that observation's entities, in addition to the other entities. Do not add it for events without agent_id.
 
   **importance**: 0 to 1. About 0.8-1.0 for decisions, security alerts and root causes of hard bugs; 0.4-0.7 for features, fixes and useful discoveries; 0.1-0.3 for minor changes.
 

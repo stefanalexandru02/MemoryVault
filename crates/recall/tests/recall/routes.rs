@@ -174,6 +174,35 @@ async fn context_route_is_markdown_with_etag(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn context_route_takes_index_rows_and_types(pool: PgPool) {
+    let w = world(pool).await;
+    let mut decision = Obs::new(w.alice.space_id, "Chose pgvector over Chroma", "one database");
+    decision.obs_type = "decision";
+    insert_obs(&w, decision).await;
+    insert_obs(&w, Obs::new(w.alice.space_id, "Webhook retries arrive every fifteen minutes", "provider")).await;
+    let app = app(w.state.clone(), memvault_recall::router());
+    let token = w.alice.token.as_str();
+    let get = |query: &'static str| {
+        let app = &app;
+        async move {
+            let uri = format!("/v1/context?project_key={PROJECT}{query}");
+            send(app, Method::GET, &uri, Some(token), None).await
+        }
+    };
+
+    let all = get("").await.text();
+    assert!(all.contains("Chose pgvector") && all.contains("Webhook retries"), "{all}");
+    let one = get("&rows=1").await.text();
+    assert_eq!(one.matches("\n| ").count(), 2, "the header row and one: {one}");
+    let decisions = get("&types=decision").await.text();
+    assert!(decisions.contains("Chose pgvector") && !decisions.contains("Webhook retries"), "{decisions}");
+    for bad in ["&rows=0", "&rows=31", "&rows=many", "&types=opinion"] {
+        let resp = get(bad).await;
+        assert_eq!((resp.status.as_u16(), resp.error_code().as_deref()), (422, Some("invalid_request")), "{bad}");
+    }
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn context_mode_query_and_user_settings(pool: PgPool) {
     let w = world(pool).await;
     insert_obs(&w, Obs::new(w.alice.space_id, "Chose pgvector", "one database")).await;

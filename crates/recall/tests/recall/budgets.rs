@@ -12,27 +12,57 @@ use sqlx::PgPool;
 
 use crate::common::*;
 
-/// The full SessionStart block, with 250 observations behind it.
-const FULL_BLOCK_TOKENS: i32 = 1_000;
+/// The full SessionStart block, with 250 observations behind it and the default 12 index rows (the 28 rows it showed
+/// before cost about 980 on the same kind of project).
+const FULL_BLOCK_TOKENS: i32 = 560;
+/// What one more index row adds, at most (the fixture's titles are 5-10 words, like the observer's).
+const INDEX_ROW_TOKENS: i32 = 22;
 /// The lean block: profile, open work and the tool rubric.
 const LEAN_BLOCK_TOKENS: i32 = 250;
 /// Five rows of `memory_search`.
 const SEARCH_5_ROWS_TOKENS: i32 = 170;
 
-const TITLES: [&str; 5] = [
-    "Invoice totals double-counted tax on discounted line items in module",
-    "Store money as integer minor units end to end in module",
-    "Staging database URL was logged at debug level in module",
-    "Webhook retries come from the payment provider every 15 minutes for 24 hours in module",
-    "Added idempotency table for webhook events in module",
+const VERBS: [&str; 10] =
+    ["Fixed", "Added", "Removed", "Renamed", "Cached", "Retried", "Validated", "Split", "Logged", "Batched"];
+const WHAT: [&str; 10] = [
+    "invoice totals",
+    "webhook retries",
+    "the staging database URL",
+    "money amounts",
+    "idempotency keys",
+    "the ledger export",
+    "tax rounding",
+    "customer emails",
+    "the payment provider client",
+    "audit log entries",
+];
+const WHERE: [&str; 10] = [
+    "discounted line items",
+    "the billing module",
+    "the nightly job",
+    "the checkout flow",
+    "the admin dashboard",
+    "debug builds",
+    "the retry queue",
+    "the CSV importer",
+    "the signup page",
+    "test fixtures",
 ];
 const TYPES: [&str; 6] = ["decision", "bugfix", "feature", "refactor", "change", "discovery"];
+
+/// Title `i` of 250 distinct observations: a verb, a thing and a place, each of the 1,000 combinations at most
+/// once, so neighbours share a word or two but are not the same note worded twice.
+fn title(i: usize) -> String {
+    let n = i * 37 % 1000;
+    format!("{} {} in {}", VERBS[n % 10], WHAT[n / 10 % 10], WHERE[n / 100])
+}
 
 async fn seed(w: &World) {
     let space = w.alice.space_id;
     for i in 0..250_usize {
-        let mut o = Obs::new(space, &format!("{} {}", TITLES[i % TITLES.len()], i / TITLES.len() + 1), "narrative");
+        let mut o = Obs::new(space, &title(i), "narrative");
         o.obs_type = TYPES[i % TYPES.len()];
+        o.importance = 0.3 + 0.1 * (i % 7) as f32;
         o.age_days = 0.1 + i as f64 * 0.045;
         o.embed = false;
         insert_obs(w, o).await;
@@ -99,6 +129,15 @@ async fn block(w: &World, mode: InjectionMode) -> String {
     context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", Some(mode)).await.unwrap()
 }
 
+async fn block_with_rows(w: &World, rows: u32) -> String {
+    let options = context::ContextOptions { mode: Some(InjectionMode::Full), rows: Some(rows), types: Vec::new() };
+    context::render_context_with(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", &options).await.unwrap()
+}
+
+fn index_rows(block: &str) -> usize {
+    block.lines().filter(|l| l.starts_with("| ") && !l.starts_with("| id ")).count()
+}
+
 #[sqlx::test(migrations = "../../migrations")]
 async fn session_start_blocks_stay_within_budget(pool: PgPool) {
     let w = world(pool).await;
@@ -108,8 +147,30 @@ async fn session_start_blocks_stay_within_budget(pool: PgPool) {
     assert!(full_tokens < FULL_BLOCK_TOKENS, "full block is {full_tokens} estimated tokens:\n{full}");
     assert!(lean_tokens < LEAN_BLOCK_TOKENS, "lean block is {lean_tokens} estimated tokens:\n{lean}");
     // A real index, not an empty one: the guard is about cost per row.
-    assert!(full.matches("\n| ").count() >= 20, "{full}");
+    assert_eq!(index_rows(&full), 12, "{full}");
     assert!(full.contains("### Since you were here") && full.contains("### Relevant procedures"), "{full}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn index_rows_are_distinct_mixed_and_cost_a_few_tokens_each(pool: PgPool) {
+    let w = world(pool).await;
+    seed(&w).await;
+    let (six, twelve, thirty) =
+        (block_with_rows(&w, 6).await, block_with_rows(&w, 12).await, block_with_rows(&w, 30).await);
+    assert_eq!([index_rows(&six), index_rows(&twelve), index_rows(&thirty)], [6, 12, 30]);
+    let tokens = |b: &str| estimate_tokens(b);
+    assert!(tokens(&twelve) - tokens(&six) <= 6 * INDEX_ROW_TOKENS, "{} vs {}", tokens(&twelve), tokens(&six));
+    assert!(tokens(&thirty) - tokens(&twelve) <= 18 * INDEX_ROW_TOKENS, "{} vs {}", tokens(&thirty), tokens(&twelve));
+    // No title appears twice, and no type fills more than a third of the rows (the fixture has six types).
+    let titles: Vec<&str> = twelve.lines().filter(|l| l.starts_with("| ") && !l.starts_with("| id ")).collect();
+    let mut seen: Vec<&str> = titles.iter().filter_map(|l| l.split(" | ").nth(3)).collect();
+    seen.sort_unstable();
+    seen.dedup();
+    assert_eq!(seen.len(), 12, "{twelve}");
+    for glyph in ["⚖", "●", "◆", "↻", "✓", "○"] {
+        let n = titles.iter().filter(|l| l.contains(&format!(" | {glyph} | "))).count();
+        assert!(n <= 4, "{n} rows of {glyph}:\n{twelve}");
+    }
 }
 
 #[sqlx::test(migrations = "../../migrations")]

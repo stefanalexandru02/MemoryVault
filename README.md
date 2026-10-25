@@ -179,7 +179,7 @@ Every session start fetches `GET /v1/context`. Two modes trade tokens against re
 
 | Mode | What the session starts with | About |
 |---|---|---|
-| `full` (default) | profile, open work, procedures, an index of recent observations, recent sessions and what other devices did since your last visit here | under 1,000 tokens, paid at every session start, `clear` and `compact` |
+| `full` (default) | profile, open work, procedures, an index of 12 recent observations, recent sessions and what other devices did since your last visit here | about 400 to 550 tokens, paid at every session start, `clear` and `compact` |
 | `lean` | profile, open work and a short rubric saying when to call `memory_search`, `memory_timeline`, `memory_get` and `memory_remember` | up to about 350 tokens |
 
 Lean starts cheaper but the agent has to ask: it sees recent work only if it searches, and it searches only
@@ -192,6 +192,13 @@ The mode is the first of these that is set: the `mode=lean|full` query parameter
 in `~/.memory/config`, which `mem-hook` sends as that parameter; the user's default on the server, set with
 `PUT /v1/me/settings` (`{"injection_mode": "lean"}`, read back with `GET`) or the selector in the viewer's
 header; then `full`. A cached block is kept per mode, so changing the default needs no invalidation.
+
+The index of the full block holds 12 rows by default. They are the observations with the best importance and
+recency (a decision of last month can beat a minor change of today), without near-duplicate titles and with no
+type taking more than a third of the rows; each row is about 20 tokens. `GET /v1/context?rows=` (1 to 30) sets how
+many and `types=decision,bugfix` limits them to some observation types; `mem-hook` sends `MEM_CONTEXT_ROWS` and
+`MEM_CONTEXT_TYPES` from `~/.memory/config`. Observations made by subagents are left out of the index (search
+finds them).
 `make connect-local INJECTION=lean` writes `MEM_INJECTION`. A `resume` start returns nothing in either mode.
 
 `GET /v1/stats/recall?days=7` returns, for your own calls, the count and the average, median and 95th percentile
@@ -226,6 +233,8 @@ Python, `curl` or `jq`.
    # DEVICE_ID=laptop-x1
    # CLAUDE_BIN=/usr/local/bin/claude
    # MEM_INJECTION=lean
+   # MEM_CONTEXT_ROWS=12
+   # MEM_CONTEXT_TYPES=decision,bugfix
    # MEM_FILE_CONTEXT_BUDGET=1200
    ```
 

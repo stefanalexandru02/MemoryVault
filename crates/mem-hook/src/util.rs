@@ -280,10 +280,13 @@ pub fn normalize_title(title: &str) -> String {
     kept.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
-/// Whether two titles are the same note worded twice: the words they share are at least three quarters of the
+/// Whether two titles are the same note worded twice (the server's rule for its index): the words they share are at least three quarters of the
 /// words they use between them (equal titles, or ones that differ in a number or a word).
 pub fn similar_titles(a: &str, b: &str) -> bool {
     let (a, b) = (normalize_title(a), normalize_title(b));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
     let (wa, wb): (HashSet<&str>, HashSet<&str>) = (a.split(' ').collect(), b.split(' ').collect());
     let shared = wa.intersection(&wb).count();
     shared * 4 >= wa.union(&wb).count() * 3

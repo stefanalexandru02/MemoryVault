@@ -49,6 +49,31 @@ fn tool_event_creates_session_then_posts_event() {
 }
 
 #[test]
+fn calls_inside_a_subagent_carry_its_type_and_the_main_thread_of_an_agent_session_does_not() {
+    let (fake, env) = TestEnv::with_fake();
+    let call = |extra: serde_json::Value| {
+        let mut v = json!({"tool_name": "Read", "tool_input": {"file_path": "a.rs"}, "tool_response": {}});
+        v.as_object_mut().unwrap().extend(extra.as_object().cloned().unwrap());
+        env.hook("tool", &env.input("PostToolUse", v));
+    };
+    call(json!({"agent_id": "a1", "agent_type": "Explore"}));
+    call(json!({"agent_type": "code-reviewer"}));
+    call(json!({}));
+    env.hook(
+        "tool-failure",
+        &env.input(
+            "PostToolUseFailure",
+            json!({"tool_name": "Bash", "error": "exit 1", "agent_id": "a2", "agent_type": "Plan"}),
+        ),
+    );
+    let field = |e: &serde_json::Value, k: &str| e["payload"][k].as_str().unwrap_or("-").to_string();
+    let seen: Vec<(String, String)> =
+        fake.events().iter().map(|e| (field(e, "agent_id"), field(e, "agent_type"))).collect();
+    let want = [("a1", "Explore"), ("-", "-"), ("-", "-"), ("a2", "Plan")].map(|(a, t)| (a.to_string(), t.to_string()));
+    assert_eq!(seen, want);
+}
+
+#[test]
 fn prompt_failure_stop_and_subagent_payloads() {
     let (fake, env) = TestEnv::with_fake();
     env.hook("prompt", &env.input("UserPromptSubmit", json!({"prompt": "fix the bug"})));

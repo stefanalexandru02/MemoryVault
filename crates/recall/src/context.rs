@@ -2,20 +2,21 @@
 //!
 //! The cached portion (profile, open work, procedures, observation index, recent sessions) comes
 //! from `context_cache` ([`crate::cache`]); the health banner and since-you-were-here are computed
-//! live on every request and spliced in. In `lean` mode the block is only the profile, open work
+//! live on every request and spliced in. The observation index is sized (`rows`) and limited (`types`) by the
+//! request; both are part of the cache key. In `lean` mode the block is only the profile, open work
 //! and a rubric for the pull tools ([`render::LEAN_RUBRIC`]), with no since-you-were-here.
 
 use std::time::Instant;
 
 use chrono::{DateTime, Utc};
 use memvault_core::auth::resolve_read_spaces;
-use memvault_core::schemas::common::{InjectionMode, Scope, ScopeKind, Sensitivity};
-use memvault_core::schemas::recall::Budgets;
+use memvault_core::schemas::common::{InjectionMode, ObservationType, Scope, ScopeKind, Sensitivity};
+use memvault_core::schemas::recall::{Budgets, DEFAULT_CONTEXT_ROWS, MAX_CONTEXT_ROWS};
 use memvault_core::{ApiError, AppState, Identity, estimate_tokens};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
-use crate::cache::{self, CacheEntry};
+use crate::cache::{self, CacheEntry, Variant};
 use crate::engine::{
     Pack, PackOptions, RetrievalRecord, build_pack, log_cached_retrieval, log_pack_access, log_retrieval,
     record_metrics,
@@ -24,17 +25,22 @@ use crate::render::{self, SinceRow};
 use crate::settings;
 use memvault_core::user_tx;
 
-/// Small budgets for a ~1k-token block (architecture 6.2): `/v1/recall` without a query and with
-/// `expand_top_observations = 0`. The facts budget only carries pinned facts (shown in Profile).
-pub const CONTEXT_BUDGETS: Budgets = Budgets {
-    profile: 300,
-    facts: 150,
-    procedures: 200,
-    observations: 700,
-    summaries: 200,
-    work_state: 150,
-    documents: 0,
-};
+/// Small budgets for the full block (architecture 6.2): `/v1/recall` without a query and with
+/// `expand_top_observations = 0`. The facts budget only carries pinned facts (shown in Profile). The
+/// observation budget is a ceiling of [`INDEX_ROW_TOKENS`] per index row, not the thing that sizes the index.
+fn context_budgets(rows: u32) -> Budgets {
+    Budgets {
+        profile: 300,
+        facts: 150,
+        procedures: 200,
+        observations: rows * INDEX_ROW_TOKENS,
+        summaries: 200,
+        work_state: 150,
+        documents: 0,
+    }
+}
+/// Estimated tokens an index row may cost at most (a title is cut at 200 characters).
+const INDEX_ROW_TOKENS: u32 = 60;
 /// The lean block: a short profile, pinned facts and open work around the ~120-token rubric, ~360 tokens at most.
 pub const LEAN_BUDGETS: Budgets =
     Budgets { profile: 120, facts: 60, procedures: 0, observations: 0, summaries: 0, work_state: 80, documents: 0 };
@@ -62,10 +68,19 @@ enum Served {
     Render(Box<Pack>),
 }
 
-/// The SessionStart markdown block: profile, since-you-were-here (live), open work, procedures,
-/// recent observation index with legend; or, in lean mode, profile, open work and the tool rubric.
-/// `mode` is the request's choice; without one the user's default applies (full when they set none).
-/// `source = "resume"` returns an empty string.
+/// What a context request asks for besides where it comes from.
+#[derive(Debug, Clone, Default)]
+pub struct ContextOptions {
+    /// The request's choice; without one the user's default applies (full when they set none).
+    pub mode: Option<InjectionMode>,
+    /// Rows of the observation index of a full block (default [`DEFAULT_CONTEXT_ROWS`], at most
+    /// [`MAX_CONTEXT_ROWS`]).
+    pub rows: Option<u32>,
+    /// Observation types the index is limited to; empty = all.
+    pub types: Vec<ObservationType>,
+}
+
+/// [`render_context_with`] with the default index: the mode is the request's or the user's default.
 pub async fn render_context(
     state: &AppState,
     identity: &Identity,
@@ -73,6 +88,21 @@ pub async fn render_context(
     device_id: Option<&str>,
     source: &str,
     mode: Option<InjectionMode>,
+) -> Result<String, ApiError> {
+    let options = ContextOptions { mode, ..ContextOptions::default() };
+    render_context_with(state, identity, project_key, device_id, source, &options).await
+}
+
+/// The SessionStart markdown block: profile, since-you-were-here (live), open work, procedures,
+/// recent observation index with legend; or, in lean mode, profile, open work and the tool rubric.
+/// `source = "resume"` returns an empty string.
+pub async fn render_context_with(
+    state: &AppState,
+    identity: &Identity,
+    project_key: Option<&str>,
+    device_id: Option<&str>,
+    source: &str,
+    options: &ContextOptions,
 ) -> Result<String, ApiError> {
     if source == "resume" {
         return Ok(String::new());
@@ -85,16 +115,17 @@ pub async fn render_context(
     if spaces.is_empty() {
         return Ok(render::assemble_context(&[], "", ""));
     }
-    let mode = match mode {
+    let mode = match options.mode {
         Some(mode) => mode,
         None => settings::injection_mode(&mut tx).await?,
     };
+    let variant = variant_of(mode, options);
     let budgets = match mode {
-        InjectionMode::Full => CONTEXT_BUDGETS,
+        InjectionMode::Full => context_budgets(variant.rows),
         InjectionMode::Lean => LEAN_BUDGETS,
     };
     let scopes = context_scopes(project_key, device);
-    let key = cache::cache_key(identity.user_id, &spaces, &scopes, device, source, mode);
+    let key = cache::cache_key(identity.user_id, &spaces, &scopes, device, source, &variant);
     let (body, served) = match cache::lookup(&mut tx, &key).await? {
         Some(cached) => {
             metrics::counter!("memsvc_context_cache_hit_total").increment(1);
@@ -112,6 +143,8 @@ pub async fn render_context(
                 rerank: false,
                 exclude_sensitivity: vec![Sensitivity::Secret],
                 context: true,
+                index_rows: variant.rows as usize,
+                index_types: variant.types.clone(),
                 as_of: None,
             };
             let pack = build_pack(state, &mut tx, &spaces, &scopes, &opts).await?;
@@ -127,7 +160,7 @@ pub async fn render_context(
                 project_key,
                 device_id: device,
                 source,
-                mode,
+                variant: &variant,
                 hits: hits_of(&pack),
                 rendered_at,
             };
@@ -165,6 +198,17 @@ pub async fn render_context(
     }
     tx.commit().await?;
     Ok(out)
+}
+
+/// The index only exists in the full block: the other modes ignore its size and types, so they share a cache entry.
+fn variant_of(mode: InjectionMode, options: &ContextOptions) -> Variant {
+    if mode != InjectionMode::Full {
+        return Variant { mode, rows: DEFAULT_CONTEXT_ROWS, types: Vec::new() };
+    }
+    let mut types: Vec<String> = options.types.iter().map(|t| t.as_str().to_string()).collect();
+    types.sort();
+    types.dedup();
+    Variant { mode, rows: options.rows.unwrap_or(DEFAULT_CONTEXT_ROWS).clamp(1, MAX_CONTEXT_ROWS), types }
 }
 
 fn hits_of(pack: &Pack) -> i32 {

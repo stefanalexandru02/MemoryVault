@@ -1,6 +1,6 @@
 use chrono::{Duration, Utc};
 use memvault_core::schemas::common::InjectionMode;
-use memvault_core::schemas::common::{FeedbackVerdict, OutputSchemaName, Scope};
+use memvault_core::schemas::common::{FeedbackVerdict, ObservationType, OutputSchemaName, Scope};
 use memvault_core::schemas::memories::{
     DISPUTE_THRESHOLD, FeedbackCounts, GetRequest, MemoryFeedbackRequest, MemoryItem, RememberRequest, SearchQuery,
     fact_caution, procedure_caution,
@@ -253,6 +253,20 @@ fn cautions_for_stale_and_disputed_memories() {
     assert_eq!(caution(0.1, 400, true, true), None, "pinned facts carry none");
     assert_eq!(procedure_caution(3, 1), None);
     assert_eq!(procedure_caution(1, 2).as_deref(), Some("disputed"));
+}
+
+#[test]
+fn context_query_rows_and_types() {
+    let q: ContextQuery = serde_urlencoded::from_str("project_key=p&rows=8&types=decision,bugfix").unwrap();
+    assert!(q.validate().is_ok());
+    assert_eq!((q.rows, q.types), (Some(8), Some(vec![ObservationType::Decision, ObservationType::Bugfix])));
+    let q: ContextQuery = serde_urlencoded::from_str("project_key=p").unwrap();
+    assert_eq!((q.rows, q.types), (None, None));
+    for rows in ["0", "31"] {
+        let q: ContextQuery = serde_urlencoded::from_str(&format!("rows={rows}")).unwrap();
+        assert!(q.validate().is_err(), "rows={rows}");
+    }
+    assert!(serde_urlencoded::from_str::<ContextQuery>("types=opinion").is_err());
 }
 
 #[test]

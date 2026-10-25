@@ -5,6 +5,7 @@
 //! `.bind(PacketKind::Extract)` and `row.try_get::<PacketKind, _>("kind")` work. [`ScopeKind`] maps to the
 //! Postgres enum type `scope_kind`.
 
+use std::collections::HashSet;
 use std::fmt;
 use std::str::FromStr;
 
@@ -368,6 +369,17 @@ pub fn normalize_title(title: &str) -> String {
     kept.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
+/// Whether two titles are the same note worded twice: the words they share are at least three quarters of the words
+/// they use between them (equal titles, or ones that differ in a number or a word).
+pub fn similar_titles(a: &str, b: &str) -> bool {
+    let (a, b) = (normalize_title(a), normalize_title(b));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let (wa, wb): (HashSet<&str>, HashSet<&str>) = (a.split(' ').collect(), b.split(' ').collect());
+    wa.intersection(&wb).count() * 4 >= wa.union(&wb).count() * 3
+}
+
 /// Serde helpers for list query parameters given comma-separated (`types=decision,bugfix`) or as a
 /// JSON array. Use with `#[serde(default, deserialize_with = "comma_list::deserialize")]` on an
 /// `Option<Vec<T>>` where `T: FromStr`.
@@ -417,6 +429,11 @@ mod tests {
         assert_eq!(estimate_tokens("ééé"), 1);
         assert_eq!(normalize_title("  Fixed: the BUG!! in  `auth.rs` 🚀 "), "fixed the bug in auth rs");
         assert_eq!(normalize_title("🚀 !!"), "");
+        assert!(similar_titles(
+            "Webhook retries come every 15 minutes in module 3",
+            "webhook retries come every 15 minutes in module 12"
+        ));
+        assert!(!similar_titles("Webhook retries come every 15 minutes", "Money is stored as integer minor units"));
     }
 
     #[test]

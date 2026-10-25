@@ -86,6 +86,7 @@ pub fn run(event: &str) {
                 "error": hook.field("error"),
                 "is_interrupt": hook.field("is_interrupt"),
                 "agent_id": hook.field("agent_id"),
+                "agent_type": agent_type(&hook.input),
             });
             observe_if_window_closed(&hook, record(&hook, "tool_failure", payload, false));
         }
@@ -192,6 +193,13 @@ pub fn run_generic(client: &str) {
     }
 }
 
+/// The `agent_type` of a call made inside a subagent. Claude Code sets `agent_id` only there; the main thread of a
+/// session started with `--agent` has an `agent_type` too, but it is not a subagent, so it is not recorded.
+fn agent_type(input: &Value) -> Value {
+    let in_subagent = text_of(input, &["agent_id"]).is_some();
+    input.get("agent_type").filter(|_| in_subagent).cloned().unwrap_or(Value::Null)
+}
+
 fn tool_payload(input: &Value) -> Value {
     let field = |key: &str| input.get(key).cloned().unwrap_or(Value::Null);
     json!({
@@ -201,6 +209,7 @@ fn tool_payload(input: &Value) -> Value {
         "tool_use_id": field("tool_use_id"),
         "duration_ms": field("duration_ms"),
         "agent_id": field("agent_id"),
+        "agent_type": agent_type(input),
     })
 }
 
@@ -274,9 +283,15 @@ fn session_start(hook: &mut Hook) {
         util::encode(key),
         util::encode(&hook.app.cfg.device)
     );
-    if let Some(mode) = &hook.app.cfg.injection {
-        query.push_str("&mode=");
-        query.push_str(mode);
+    let cfg = &hook.app.cfg;
+    if let Some(mode) = &cfg.injection {
+        query.push_str(&format!("&mode={mode}"));
+    }
+    if let Some(rows) = cfg.context_rows {
+        query.push_str(&format!("&rows={rows}"));
+    }
+    if !cfg.context_types.is_empty() {
+        query.push_str(&format!("&types={}", cfg.context_types.join(",")));
     }
     let fetched = hook.app.api.get(&query, CONTEXT_TIMEOUT).ok().filter(|r| r.ok());
     let block = match fetched {

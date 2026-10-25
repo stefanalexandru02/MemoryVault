@@ -6,7 +6,9 @@ use memvault_core::auth::admin::ensure_client;
 use memvault_core::auth::scopes::TokenKind;
 use memvault_core::ids::short_id;
 use memvault_core::invalidate::notify_invalidate;
-use memvault_core::schemas::common::{ClientKind, InjectionMode, Scope, ScopeKind, Sensitivity, SummaryGrain};
+use memvault_core::schemas::common::{
+    ClientKind, InjectionMode, ObservationType, Scope, ScopeKind, Sensitivity, SummaryGrain,
+};
 use memvault_core::schemas::recall::UserSettings;
 use memvault_core::system_tx;
 use memvault_core::test_support::seed_identity;
@@ -94,7 +96,7 @@ async fn context_block_has_every_section(pool: PgPool) {
     assert!(md.contains("- todo/homelab: api deploy ☐ · migrations ✓"), "{md}");
     assert!(md.contains("- **Deploy memory-api** (v1): run migrations Job first"), "{md}");
     assert!(md.contains(render::INDEX_HEADER));
-    assert!(md.contains(&render::legend()));
+    assert!(md.contains("\n_Legend: ⚖ decision · ● bugfix_"), "only the glyphs shown: {md}");
     // Index: newest first, glyphs, short ids; subagent and secret observations hidden.
     let b = pos(&format!("| {} |", short_id(&s.bugfix)));
     let d = pos(&format!("| {} |", short_id(&s.decision)));
@@ -269,9 +271,10 @@ async fn render_racing_with_invalidation_is_not_served(pool: PgPool) {
     let id = &w.alice.identity;
     let spaces = vec![w.alice.space_id];
     let scopes = context::context_scopes(Some(PROJECT), &id.device_id);
-    let key = cache::cache_key(id.user_id, &spaces, &scopes, &id.device_id, "startup", InjectionMode::Full);
+    let variant = cache::Variant { mode: InjectionMode::Full, rows: 12, types: vec![] };
+    let key = cache::cache_key(id.user_id, &spaces, &scopes, &id.device_id, "startup", &variant);
     let store = |rendered_at| {
-        let (key, spaces, scopes) = (key.clone(), spaces.clone(), scopes.clone());
+        let (key, spaces, scopes, variant) = (key.clone(), spaces.clone(), scopes.clone(), variant.clone());
         let w = &w;
         async move {
             let mut tx = memvault_core::user_tx(&w.pool, &w.alice.identity).await.unwrap();
@@ -283,7 +286,7 @@ async fn render_racing_with_invalidation_is_not_served(pool: PgPool) {
                 project_key: Some(PROJECT),
                 device_id: &w.alice.identity.device_id,
                 source: "startup",
-                mode: InjectionMode::Full,
+                variant: &variant,
                 hits: 0,
                 rendered_at,
             };
@@ -417,4 +420,122 @@ async fn injection_mode_precedence_and_per_mode_rerender(pool: PgPool) {
     let modes: Vec<String> =
         sqlx::query_scalar("SELECT mode FROM context_cache ORDER BY mode").fetch_all(&w.pool).await.unwrap();
     assert_eq!(modes, ["full", "lean"]);
+}
+
+const FAMILIES: [(&str, &str); 6] = [
+    ("decision", "Chose pgvector over Chroma for the server"),
+    ("bugfix", "Fixed off-by-one in window close"),
+    ("feature", "Added idempotency table for webhook events"),
+    ("refactor", "Split the invoice module into builder and renderer"),
+    ("change", "Moved staging to a smaller Fly machine"),
+    ("discovery", "Webhook retries arrive every fifteen minutes"),
+];
+
+/// Two observations of each family, the second a variant of the first, newest first.
+async fn seed_families(w: &World) {
+    for (i, (kind, title)) in FAMILIES.iter().enumerate() {
+        for variant in 0..2 {
+            let mut o = Obs::new(w.alice.space_id, &format!("{title} (take {})", variant + 1), "narrative");
+            o.obs_type = kind;
+            o.age_days = 0.1 + i as f64 * 0.1 + f64::from(variant) * 0.01;
+            o.embed = false;
+            insert_obs(w, o).await;
+        }
+    }
+}
+
+fn index_rows(md: &str) -> usize {
+    md.lines().filter(|l| l.starts_with("| ") && !l.starts_with("| id ")).count()
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn index_rows_and_types_shape_the_block_and_the_cache(pool: PgPool) {
+    let w = world(pool).await;
+    seed_families(&w).await;
+    let id = &w.alice.identity;
+    let state = &w.state;
+    let render = |rows: Option<u32>, types: Vec<ObservationType>| async move {
+        let options = context::ContextOptions { mode: Some(InjectionMode::Full), rows, types };
+        context::render_context_with(state, id, Some(PROJECT), None, "startup", &options).await
+    };
+
+    // The second take of a family is a near-duplicate of the first, so six families make six rows however many are
+    // asked; asking for none is the default size.
+    for rows in [None, Some(30)] {
+        assert_eq!(index_rows(&render(rows, vec![]).await.unwrap()), 6);
+    }
+    // Fewer rows keep the best, at most one of a type per third; the cache holds one block per size.
+    assert_eq!(index_rows(&render(Some(2), vec![]).await.unwrap()), 2);
+    assert_eq!(cache_rows(&w.pool).await, 3, "a block per size: the default, 30 and 2");
+    let decisions = render(None, vec![ObservationType::Decision, ObservationType::Decision]).await.unwrap();
+    assert_eq!(index_rows(&decisions), 1);
+    assert!(decisions.contains("pgvector") && !decisions.contains("off-by-one"), "{decisions}");
+    let both = render(None, vec![ObservationType::Bugfix, ObservationType::Decision]).await.unwrap();
+    assert_eq!(index_rows(&both), 2);
+    // The same request again is a cache hit, in any order of its types; each variant has its own block.
+    let before = cache_rows(&w.pool).await;
+    assert_eq!(render(None, vec![ObservationType::Decision, ObservationType::Bugfix]).await.unwrap(), both);
+    assert_eq!(cache_rows(&w.pool).await, before);
+
+    // An invalidated block is re-rendered as it was: the job carries its rows and types.
+    let space = w.alice.space_id;
+    cache::handle_payload(&w.state, &format!("{space}:project:{PROJECT}")).await.unwrap();
+    let jobs: Vec<Value> =
+        sqlx::query_scalar("SELECT payload FROM jobs WHERE type = 'render_context'").fetch_all(&w.pool).await.unwrap();
+    let job = jobs.iter().find(|j| j["obs_types"] == json!(["bugfix", "decision"])).expect("a job with the types");
+    assert_eq!(job["obs_rows"], 12);
+    assert!(cache::rerender(&w.state, job).await.unwrap());
+    let stored: (i32, Vec<String>) =
+        sqlx::query_as("SELECT obs_rows, obs_types FROM context_cache").fetch_one(&w.pool).await.unwrap();
+    assert_eq!(stored, (12, vec!["bugfix".to_string(), "decision".to_string()]));
+    // A job queued before the index was configurable renders the default one.
+    let mut legacy = job.clone();
+    legacy.as_object_mut().unwrap().retain(|k, _| !k.starts_with("obs_"));
+    assert!(cache::rerender(&w.state, &legacy).await.unwrap());
+
+    // The lean block has no index, so rows and types do not split its cache.
+    let lean = |rows: Option<u32>| async move {
+        let options =
+            context::ContextOptions { mode: Some(InjectionMode::Lean), rows, types: vec![ObservationType::Bugfix] };
+        context::render_context_with(state, id, Some(PROJECT), None, "startup", &options).await
+    };
+    sqlx::query("DELETE FROM context_cache").execute(&w.pool).await.unwrap();
+    assert_eq!(lean(Some(3)).await.unwrap(), lean(None).await.unwrap());
+    assert_eq!(cache_rows(&w.pool).await, 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn the_index_mixes_types_instead_of_filling_up_with_one(pool: PgPool) {
+    let w = world(pool).await;
+    // Ten distinct bug fixes, newer than three other notes: by recency alone the index would be all bug fixes.
+    let words = ["alpha", "bravo", "charlie", "delta", "echo", "foxtrot", "golf", "hotel", "india", "juliet"];
+    for (i, word) in words.iter().enumerate() {
+        let mut o =
+            Obs::new(w.alice.space_id, &format!("Fixed {word} crash in the {} parser {i}", words[(i + 3) % 10]), "n");
+        o.obs_type = "bugfix";
+        o.age_days = 0.1 + i as f64 * 0.01;
+        o.embed = false;
+        insert_obs(&w, o).await;
+    }
+    for (kind, title) in [
+        ("decision", "Chose Postgres for storage"),
+        ("feature", "Added a CSV export"),
+        ("discovery", "Cache misses spike at noon"),
+    ] {
+        let mut o = Obs::new(w.alice.space_id, title, "n");
+        o.obs_type = kind;
+        o.age_days = 2.0;
+        o.embed = false;
+        insert_obs(&w, o).await;
+    }
+    let options = context::ContextOptions { mode: Some(InjectionMode::Full), rows: Some(8), types: vec![] };
+    let md = context::render_context_with(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", &options)
+        .await
+        .unwrap();
+    assert_eq!(index_rows(&md), 8);
+    // Three bug fixes (a third of the rows), the other types, then the bug fixes the limit held back.
+    for title in ["Chose Postgres", "Added a CSV export", "Cache misses"] {
+        assert!(md.contains(title), "{title} missing:\n{md}");
+    }
+    assert_eq!(md.matches("| ● |").count(), 5, "{md}");
 }

@@ -948,3 +948,46 @@ async fn a_procedure_that_failed_more_than_it_worked_is_flagged(pool: PgPool) {
     assert!(tag(flaky).ends_with("· disputed]"), "{md}");
     assert!(!tag(solid).contains("disputed"));
 }
+
+/// The SQL order of the SessionStart pool is the final score of 11.4, not just the newest rows.
+#[sqlx::test(migrations = "../../migrations")]
+async fn context_pool_is_ordered_by_importance_and_recency(pool: PgPool) {
+    use memvault_core::user_tx;
+    use memvault_recall::candidates::{Filters, hydrate, ranked_observation_leg};
+    use memvault_recall::scoring::Candidate;
+
+    let w = world(pool).await;
+    // (type, importance, age in days): a month-old decision beats a minor change of today, a fresh minor one loses
+    // to a fresh important one, and a bug fix outlives the same age as a change.
+    let rows = [
+        ("decision", 0.95, 30.0),
+        ("change", 0.2, 0.1),
+        ("change", 0.9, 0.2),
+        ("bugfix", 0.6, 20.0),
+        ("change", 0.6, 20.0),
+        ("discovery", 0.5, 2.0),
+        ("security_alert", 0.9, 60.0),
+        ("feature", 0.1, 90.0),
+    ];
+    for (i, (kind, importance, age)) in rows.iter().enumerate() {
+        let mut o = Obs::new(w.alice.space_id, &format!("Observation number {i}"), "n");
+        (o.obs_type, o.importance, o.age_days, o.embed) = (kind, *importance, *age, false);
+        insert_obs(&w, o).await;
+    }
+    let mut tx = user_tx(&w.pool, &w.alice.identity).await.unwrap();
+    let f = Filters { spaces: vec![w.alice.space_id], scopes: Some(vec![project()]), ..Filters::default() };
+    let ids = ranked_observation_leg(&mut tx, &f, 60).await.unwrap();
+    let mut hydrated = hydrate(&mut tx, MemoryTable::Observations, &ids).await.unwrap();
+    let mut scored: Vec<Candidate> = ids
+        .iter()
+        .map(|id| {
+            let c = Candidate { rrf: 1.0, row: hydrated.remove(id), ..Candidate::new(*id, MemoryTable::Observations) };
+            Candidate { score: c.compute_score(Utc::now(), None), ..c }
+        })
+        .collect();
+    assert_eq!(scored.len(), rows.len());
+    let sql_order: Vec<Uuid> = scored.iter().map(|c| c.id).collect();
+    scored.sort_by(memvault_recall::scoring::by_score);
+    assert_eq!(sql_order, scored.iter().map(|c| c.id).collect::<Vec<_>>());
+    assert_eq!(ranked_observation_leg(&mut tx, &f, 3).await.unwrap(), sql_order[..3]);
+}

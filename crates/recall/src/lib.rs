@@ -74,13 +74,15 @@ async fn context(
     Query(q): Query<ContextQuery>,
 ) -> Result<Response, ApiError> {
     require_scope(&state, &identity, MEMORIES_READ).await?;
-    let body = context::render_context(
+    q.validate()?;
+    let options = context::ContextOptions { mode: q.mode, rows: q.rows, types: q.types.unwrap_or_default() };
+    let body = context::render_context_with(
         &state,
         &identity,
         q.project_key.as_deref(),
         q.device_id.as_deref(),
         q.source.as_str(),
-        q.mode,
+        &options,
     )
     .await?;
     let etag = cache::etag(&body);

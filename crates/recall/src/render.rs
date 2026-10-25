@@ -41,10 +41,15 @@ const EXCERPT_CHARS: usize = 160;
 const NARRATIVE_CHARS: usize = 600;
 const DOCUMENT_EXCERPT_CHARS: usize = 480;
 
-/// `_Legend: ⚖ decision · ● bugfix · … · § summary_`.
-pub fn legend() -> String {
-    let items: Vec<String> = GLYPHS.iter().map(|(t, g)| format!("{g} {t}")).collect();
-    format!("_Legend: {} · § summary_", items.join(" · "))
+/// `_Legend: ⚖ decision · ● bugfix · § summary_`: the glyphs of the rows shown, in legend order; empty when none of
+/// them needs one.
+pub fn legend(entries: &[IndexEntry]) -> String {
+    let used = |glyph: &str| entries.iter().any(|e| e.glyph == glyph);
+    let mut items: Vec<String> = GLYPHS.iter().filter(|(_, g)| used(g)).map(|(t, g)| format!("{g} {t}")).collect();
+    if used("§") {
+        items.push("§ summary".into());
+    }
+    if items.is_empty() { String::new() } else { format!("_Legend: {}_", items.join(" · ")) }
 }
 
 pub fn glyph(table: MemoryTable, obs_type: Option<&str>) -> &'static str {
@@ -334,7 +339,10 @@ pub fn index_table(entries: &[IndexEntry]) -> String {
 /// [`index_table`] and the glyph legend, for the blocks that start a session.
 fn index_with_legend(entries: &[IndexEntry]) -> String {
     let table = index_table(entries);
-    if table.is_empty() { table } else { format!("{table}\n{}", legend()) }
+    match legend(entries) {
+        legend if table.is_empty() || legend.is_empty() => table,
+        legend => format!("{table}\n{legend}"),
+    }
 }
 
 fn row_entries(rows: &[IndexRow], collapse: bool) -> Vec<IndexEntry> {
@@ -832,8 +840,11 @@ mod tests {
     fn legend_closes_the_session_start_index_only() {
         let o = observation(0xa1b2c3, "Chose pgvector", "decision", "2026-10-22T14:03:00Z");
         let entries = [IndexEntry::from_observation(&o)];
-        assert_eq!(index_with_legend(&entries), format!("{}\n{}", index_table(&entries), legend()));
-        assert!(legend().starts_with("_Legend: ⚖ decision · ● bugfix · ◆ feature"));
+        assert_eq!(index_with_legend(&entries), format!("{}\n_Legend: ⚖ decision_", index_table(&entries)));
+        let more = ["feature", "decision", "bugfix"]
+            .map(|t| IndexEntry::from_observation(&observation(0xa1b2c3, "Chose pgvector", t, "2026-10-22T14:03:00Z")));
+        assert_eq!(legend(&more), "_Legend: ⚖ decision · ● bugfix · ◆ feature_");
+        assert_eq!(legend(&[]), "");
         assert_eq!(index_with_legend(&[]), "");
         let rows = [row(0xa1b2c3, MemoryTable::Observations, "decision", "Chose pgvector", "2026-10-22T14:03:00Z")];
         assert!(!search_rows_markdown(&rows).contains("Legend") && !timeline_rows_markdown(&rows).contains("Legend"));

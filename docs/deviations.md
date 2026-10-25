@@ -152,8 +152,13 @@ and repeated items are merged. The last section lists the gaps that are still op
   to candidate. Candidates with no stored embedding are embedded on the fly through TEI. Active facts the worker has
   not embedded yet are not found. Clusters are capped at 25 rows, candidates first.
 - **Subagent tagging in code.** `extract::tag_subagent_observations` adds `subagent:<agent_type>` to an
-  observation's entities when its `source_event_seqs` point at packet input events that carry `agent_type`. It does
-  not rely on the model following the prompt rule.
+  observation's entities when its `source_event_seqs` point at packet input events that carry an `agent_id` (`agent`
+  stands for a missing `agent_type`). It does not rely on the model following the prompt rule. Claude Code sets
+  `agent_id` only for hooks that fire inside a subagent; `agent_type` alone also appears on the main thread of a
+  session started with `--agent`, so `agent_id` is the signal. `mem-hook` records both on `tool_use` and
+  `tool_failure` events (`agent_type` only together with an `agent_id`), where it used to record the id alone and so
+  never tagged anything but a `subagent_stop`. The SessionStart index hides tagged observations; search and
+  `memory_get` still return them.
 - **Writes to unknown ids.** Ids may be full UUIDs or 6-hex short ids, optionally prefixed `fact#`. They must belong
   to the packet's `inputs.fact_ids`. Rejected decisions are counted under `rejected` in the applied counts and logged
   with `tracing::warn`. They write no audit row.
@@ -246,14 +251,24 @@ and repeated items are merged. The last section lists the gaps that are still op
 
 ## 8. Recall and context
 
-- **Context budgets are constants.** Profile 300, facts 150 (pinned facts only), procedures 200, observations 700 (at
-  most 30 rows), summaries 200, work_state 150. `expand` is 0, and rerank is off.
+- **Context budgets are constants.** Profile 300, facts 150 (pinned facts only), procedures 200, observations 60
+  per index row (a ceiling; the rows asked for size the index), summaries 200, work_state 150. `expand` is 0, and
+  rerank is off.
 - **Profile slot.** Profile rows are joined in scope order, then space order, until the budget is used. The first
   scope with a row is not the only one used. With no `profiles` row, the top active facts are rendered instead, and
   those facts are left out of the facts slot.
 - **Budget costs.** Facts, procedures, summaries and index rows cost the token estimate of their rendered line.
   Expanded observations cost their stored `token_estimate`.
-- **Index.** The index (progressive disclosure) rows are picked by score, then shown newest first.
+- **Index.** The index (progressive disclosure) holds 12 rows by default (`rows=` 1 to 30, `types=` limits it to
+  some observation types; `mem-hook` sends `MEM_CONTEXT_ROWS` and `MEM_CONTEXT_TYPES`). The pool is the 60 live
+  observations with the best final score for a candidate without a query (11.4 with the observer's importance and
+  the recency half-lives, so an important decision of last month can beat a minor change of today), then MMR.
+  Rows are chosen from that order so the index tells something new: a title that is a near-duplicate of one
+  already chosen (three quarters of the words shared) is skipped, and no type takes more than a third of the rows
+  while other types are available (rows the limit held back fill what is left). They are shown newest first, and the
+  legend lists only the glyphs shown. The default was 28 rows by budget (700 tokens); the budgets test measures
+  about 20 estimated tokens per row, so 12 rows are about 510 tokens of a 510-token block where 28 undiversified rows
+  were about 980. A request for fewer or more rows keeps the same order.
 - **Type boosts (11.4 left these open).** Decision 1.2, `security_alert` 1.2, `bugfix` 1.1. Summaries score with
   importance 0.5.
 - **SessionStart extras.** The block adds two things the spec layout lacks. There is a "Recent sessions" section (up
@@ -263,9 +278,11 @@ and repeated items are merged. The last section lists the gaps that are still op
   this client's newest session on the project, but only if it started within the last 10 minutes. The line shows the
   session summary, or the latest prompt summary while the session is still running. agentic-os clients are labelled
   `assistant`.
-- **Cache key (11.6).** The key is sha256 of `(user_id, sorted space_ids, sorted scopes, device_id, source, mode)`. Spec
-  11.6 has no `user_id`. It is added because `context_cache` rows are per user (RLS), and `cache_key` is the primary
-  key. `mode` is the injection mode (below).
+- **Cache key (11.6).** The key is sha256 of `(user_id, sorted space_ids, sorted scopes, device_id, source, mode, rows,
+  types)`. Spec 11.6 has no `user_id`. It is added because `context_cache` rows are per user (RLS), and `cache_key`
+  is the primary key. `mode` is the injection mode (below); `rows` and `types` are the size and types of the
+  index of a full block (other modes ignore them and share one entry). They are columns of `context_cache`
+  (`obs_rows`, `obs_types`, migration 0204), so a re-render job renders the block it replaces.
 - **Injection modes.** `GET /v1/context` takes `mode=full|lean`; without it the user's default from `user_settings`
   (`GET`/`PUT /v1/me/settings`), else `full`. `mem-hook` sends `MEM_INJECTION` from `~/.memory/config` as `mode`. The
   lean block is the Profile and Open work sections (budgets 120/60/80 for profile, pinned facts and work state) plus a

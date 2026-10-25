@@ -1,9 +1,10 @@
 //! Pure ranking math (spec 11.2-11.5): RRF, recency, final score, MMR and greedy budget fill.
 
 use std::cmp::Ordering;
+use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use memvault_core::schemas::common::MemoryTable;
+use memvault_core::schemas::common::{MemoryTable, similar_titles};
 use serde_json::{Value, json};
 use uuid::Uuid;
 
@@ -204,6 +205,40 @@ pub fn mmr_order(mut cands: Vec<Candidate>) -> Vec<Candidate> {
     order.into_iter().map(|i| slots[i].take().expect("each index once")).collect()
 }
 
+/// The SessionStart index: from observations best first, up to `rows` that tell the reader something new. A
+/// title that is a near-duplicate of one already chosen is skipped (see `similar_titles`), and no type takes more
+/// than a third of the rows while others are available; the rows the type limit held back fill what is
+/// left, best first. Order is kept.
+pub fn diversify(ordered: Vec<Candidate>, rows: usize) -> Vec<Candidate> {
+    let cap = rows.div_ceil(3).max(1);
+    let key = |c: &Candidate| match &c.row {
+        Some(TierRow::Obs(o)) => (o.obs_type.clone(), o.title.clone()),
+        _ => (String::new(), String::new()),
+    };
+    let mut chosen: Vec<Candidate> = Vec::new();
+    let mut held: Vec<Candidate> = Vec::new();
+    let mut per_type: HashMap<String, usize> = HashMap::new();
+    for c in ordered {
+        if chosen.len() >= rows {
+            break;
+        }
+        let (kind, title) = key(&c);
+        let repeats = chosen.iter().chain(&held).any(|k| similar_titles(&key(k).1, &title));
+        if repeats {
+            continue;
+        }
+        if per_type.get(&kind).copied().unwrap_or(0) < cap {
+            *per_type.entry(kind).or_default() += 1;
+            chosen.push(c);
+        } else {
+            held.push(c);
+        }
+    }
+    let room = rows.saturating_sub(chosen.len());
+    chosen.extend(held.into_iter().take(room));
+    chosen
+}
+
 /// Greedy in order (11.5): take an item when it still fits, skip it otherwise. Returns the items and
 /// the tokens used.
 pub fn budget_fill<T>(items: Vec<T>, budget: u32, cost: impl Fn(&T) -> i32) -> (Vec<T>, i32) {
@@ -222,6 +257,10 @@ pub fn budget_fill<T>(items: Vec<T>, budget: u32, cost: impl Fn(&T) -> i32) -> (
 
 #[cfg(test)]
 mod tests {
+    use memvault_core::schemas::common::{ScopeKind, Sensitivity};
+
+    use crate::candidates::ObsRow;
+
     use super::*;
 
     fn id(n: u128) -> Uuid {
@@ -271,6 +310,59 @@ mod tests {
         let mk = |n: u128, score: f64| Candidate { score, ..Candidate::new(id(n), MemoryTable::Facts) };
         let order: Vec<Uuid> = mmr_order(vec![mk(2, 0.5), mk(1, 0.5), mk(3, 0.9)]).into_iter().map(|c| c.id).collect();
         assert_eq!(order, vec![id(3), id(1), id(2)]);
+    }
+
+    fn obs(n: u128, obs_type: &str, title: &str) -> Candidate {
+        let row = ObsRow {
+            id: id(n),
+            space_id: id(0),
+            scope_kind: ScopeKind::Global,
+            scope_key: String::new(),
+            session_id: None,
+            window_no: None,
+            obs_type: obs_type.into(),
+            title: title.into(),
+            subtitle: None,
+            narrative: None,
+            facts: vec![],
+            concepts: vec![],
+            entities: vec![],
+            files: vec![],
+            importance: 0.5,
+            sensitivity: Sensitivity::Normal,
+            source_event_ids: vec![],
+            extracted_by: Value::Null,
+            written_by_client_id: None,
+            token_estimate: 10,
+            created_at: Utc::now(),
+            archived_at: None,
+            superseded_by: None,
+            device_id: None,
+        };
+        Candidate { row: Some(TierRow::Obs(row)), ..Candidate::new(id(n), MemoryTable::Observations) }
+    }
+
+    fn ids(cands: &[Candidate]) -> Vec<u128> {
+        cands.iter().map(|c| c.id.as_u128()).collect()
+    }
+
+    #[test]
+    fn diversify_skips_repeated_titles_and_caps_a_type() {
+        let ordered = vec![
+            obs(1, "bugfix", "Invoice totals double-counted tax on discounted line items in module 1"),
+            obs(2, "bugfix", "Invoice totals double-counted tax on discounted line items in module 2"),
+            obs(3, "bugfix", "Webhook retries come from the provider every 15 minutes"),
+            obs(4, "bugfix", "Staging database URL was logged at debug level"),
+            obs(5, "decision", "Store money as integer minor units end to end"),
+            obs(6, "feature", "Added an idempotency table for webhook events"),
+        ];
+        // 5 rows: at most 2 per type (a third, rounded up). Row 2 repeats row 1; row 4 is held back by the bugfix cap while 5 and 6 fit.
+        assert_eq!(ids(&diversify(ordered.clone(), 5)), [1, 3, 5, 6, 4]);
+        assert_eq!(ids(&diversify(ordered.clone(), 3)), [1, 5, 6]);
+        // The cap relaxes when nothing else is left.
+        let same: Vec<Candidate> =
+            (1..=4).map(|n| obs(n, "bugfix", &format!("Fix {} {}", "a".repeat(n as usize), n))).collect();
+        assert_eq!(ids(&diversify(same, 4)), [1, 2, 3, 4]);
     }
 
     #[test]

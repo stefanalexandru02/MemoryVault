@@ -6,7 +6,7 @@ use std::collections::BTreeMap;
 use uuid::Uuid;
 
 use crate::error::ApiError;
-use crate::schemas::common::{InjectionMode, Scope, Sensitivity, SummaryGrain};
+use crate::schemas::common::{InjectionMode, ObservationType, Scope, Sensitivity, SummaryGrain, comma_list};
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct TaskState {
@@ -320,6 +320,10 @@ impl ContextSource {
     }
 }
 
+/// Rows of the observation index in the full SessionStart block when the request names no number.
+pub const DEFAULT_CONTEXT_ROWS: u32 = 12;
+pub const MAX_CONTEXT_ROWS: u32 = 30;
+
 /// `GET /v1/context` query params; the response is `text/markdown` with an ETag.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ContextQuery {
@@ -332,6 +336,21 @@ pub struct ContextQuery {
     /// Overrides the user's default injection mode for this request.
     #[serde(default)]
     pub mode: Option<InjectionMode>,
+    /// Rows of the observation index in the full block, 1 to [`MAX_CONTEXT_ROWS`] (default [`DEFAULT_CONTEXT_ROWS`]).
+    #[serde(default)]
+    pub rows: Option<u32>,
+    /// Observation types the index is limited to, comma-separated (`decision,bugfix`); default all.
+    #[serde(default, deserialize_with = "comma_list::deserialize")]
+    pub types: Option<Vec<ObservationType>>,
+}
+
+impl ContextQuery {
+    pub fn validate(&self) -> Result<(), ApiError> {
+        if self.rows.is_some_and(|r| !(1..=MAX_CONTEXT_ROWS).contains(&r)) {
+            return Err(ApiError::invalid(format!("rows must be 1-{MAX_CONTEXT_ROWS}")));
+        }
+        Ok(())
+    }
 }
 
 /// `GET`/`PUT /v1/me/settings`: the caller's server-side defaults.

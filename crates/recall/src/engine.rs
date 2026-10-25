@@ -31,10 +31,10 @@ use uuid::Uuid;
 
 use crate::candidates::{
     Filters, KEYWORD_LIMIT, TierRow, VECTOR_LIMIT, VECTOR_PART_FANOUT, best_part_embeddings, hydrate, keyword_leg,
-    query_terms, recent_leg, vector_leg,
+    query_terms, ranked_observation_leg, recent_leg, vector_leg,
 };
 use crate::render;
-use crate::scoring::{Candidate, budget_fill, by_score, mmr_order, rrf_fuse};
+use crate::scoring::{Candidate, budget_fill, by_score, diversify, mmr_order, rrf_fuse};
 use memvault_core::db::tune_vector_search;
 use memvault_core::user_tx;
 
@@ -114,13 +114,15 @@ pub struct PackOptions {
     pub rerank: bool,
     pub exclude_sensitivity: Vec<Sensitivity>,
     /// SessionStart: no query, pinned facts only, no documents, subagent observations hidden, session
-    /// summaries only (at most [`CONTEXT_SUMMARIES`]), at most [`CONTEXT_OBS_ROWS`] index rows.
+    /// summaries only (at most [`CONTEXT_SUMMARIES`]), observations chosen by importance and recency with
+    /// [`scoring::diversify`] into `index_rows` index rows of `index_types` (empty = all).
     pub context: bool,
+    pub index_rows: usize,
+    pub index_types: Vec<String>,
     /// Rank and filter as of this instant instead of now.
     pub as_of: Option<DateTime<Utc>>,
 }
 
-pub const CONTEXT_OBS_ROWS: usize = 30;
 pub const CONTEXT_SUMMARIES: usize = 5;
 
 /// Slots plus what `retrieval_log` records.
@@ -235,6 +237,9 @@ pub async fn build_pack(
         as_of: opts.as_of,
         ..Filters::default()
     };
+    // `types` of the index limit the observations only: summaries and procedures have other kinds.
+    let obs_filters =
+        Filters { types: Some(opts.index_types.clone()).filter(|t| opts.context && !t.is_empty()), ..filters.clone() };
 
     let mut by_tier: BTreeMap<MemoryTable, Vec<Candidate>> = BTreeMap::new();
     for table in TIER_ORDER {
@@ -242,24 +247,26 @@ pub async fn build_pack(
         // The SessionStart block never carries facts beyond the pinned ones, nor documents.
         let in_context = matches!(table, MemoryTable::Facts | MemoryTable::Documents);
         if budget_of(&budgets, table) > 0 && !(in_context && opts.context) {
+            let f = if table == MemoryTable::Observations { &obs_filters } else { &filters };
             if query.is_some() {
                 let kw = if terms.is_empty() && entity_terms.is_empty() {
                     Vec::new()
                 } else {
-                    keyword_leg(conn, db_caps.pg_search, table, &filters, &terms, &entity_terms, KEYWORD_LIMIT).await?
+                    keyword_leg(conn, db_caps.pg_search, table, f, &terms, &entity_terms, KEYWORD_LIMIT).await?
                 };
                 let vec = match &qvec {
-                    Some(v) => vector_leg(conn, table, &filters, v, &model, true, VECTOR_LIMIT).await?,
+                    Some(v) => vector_leg(conn, table, f, v, &model, true, VECTOR_LIMIT).await?,
                     None => Vec::new(),
                 };
                 cands = rrf_fuse(table, &kw, &vec, FUSED_LIMIT);
             } else {
-                let limit = if table == MemoryTable::Observations { NO_QUERY_OBS_LIMIT } else { NO_QUERY_LIMIT };
-                cands = recent_leg(conn, table, &filters, limit, 0)
-                    .await?
-                    .into_iter()
-                    .map(|id| Candidate { rrf: 1.0, ..Candidate::new(id, table) })
-                    .collect();
+                let ids = if opts.context && table == MemoryTable::Observations {
+                    ranked_observation_leg(conn, f, NO_QUERY_OBS_LIMIT).await?
+                } else {
+                    let limit = if table == MemoryTable::Observations { NO_QUERY_OBS_LIMIT } else { NO_QUERY_LIMIT };
+                    recent_leg(conn, table, f, limit, 0).await?
+                };
+                cands = ids.into_iter().map(|id| Candidate { rrf: 1.0, ..Candidate::new(id, table) }).collect();
             }
         }
         by_tier.insert(table, cands);
@@ -339,9 +346,12 @@ pub async fn build_pack(
     slots.procedures = procedures;
     by_slot.insert("procedures".into(), used);
 
-    let max_rows = opts.context.then_some(CONTEXT_OBS_ROWS);
-    let (mut observations, used) =
-        fill_observations(mmr_order(take(MemoryTable::Observations)), budgets.observations, opts.expand, max_rows);
+    let mut obs_order = mmr_order(take(MemoryTable::Observations));
+    if opts.context {
+        obs_order = diversify(obs_order, opts.index_rows);
+    }
+    let max_rows = opts.context.then_some(opts.index_rows);
+    let (mut observations, used) = fill_observations(obs_order, budgets.observations, opts.expand, max_rows);
     if opts.context {
         // The SessionStart index reads newest first, like claude-mem's.
         observations.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.item.id.cmp(&b.item.id)));
@@ -808,6 +818,8 @@ pub async fn recall(state: &AppState, identity: &Identity, req: RecallRequest) -
         rerank: req.rerank,
         exclude_sensitivity: req.exclude_sensitivity.clone(),
         context: false,
+        index_rows: 0,
+        index_types: Vec::new(),
         as_of: req.as_of,
     };
     let pack = build_pack(state, &mut tx, &spaces, &scopes, &opts).await?;

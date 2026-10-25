@@ -48,6 +48,25 @@ fn config_injection_is_sent_as_mode() {
 }
 
 #[test]
+fn config_index_size_and_types_are_sent() {
+    let (fake, env) = TestEnv::with_fake();
+    fake.state().context = Some(BLOCK.into());
+    let want = "/v1/context?project_key=local%2Fproj&device_id=laptop-x1&source=startup";
+    for (setting, suffix) in [
+        ("MEM_CONTEXT_ROWS=8", "&rows=8"),
+        ("MEM_CONTEXT_ROWS=0\nMEM_CONTEXT_TYPES=Decision,bugfix,opinion", "&types=decision,bugfix"),
+        ("MEM_CONTEXT_ROWS=31\nMEM_CONTEXT_TYPES=everything", ""),
+        ("MEM_CONTEXT_ROWS=6\nMEM_CONTEXT_TYPES=decision\nMEM_INJECTION=full", "&mode=full&rows=6&types=decision"),
+    ] {
+        env.write_config(&fake.url);
+        env.append_config(setting);
+        start(&env, "startup");
+        let path = fake.matching("GET", "/v1/context").last().unwrap().path.clone();
+        assert_eq!(path, format!("{want}{suffix}"), "{setting}");
+    }
+}
+
+#[test]
 fn resume_posts_the_event_but_returns_no_context() {
     let (fake, env) = TestEnv::with_fake();
     fake.state().context = Some(BLOCK.into());

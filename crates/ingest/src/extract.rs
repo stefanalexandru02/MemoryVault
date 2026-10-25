@@ -408,7 +408,9 @@ impl PacketApplier for ExtractApplier {
 }
 
 /// Spec 8.3: observations citing events a subagent produced carry `subagent:<agent_type>` in
-/// `entities`, whatever the model wrote. The agent types come from the packet's immutable
+/// `entities`, whatever the model wrote. A subagent's events are the ones with an `agent_id` (Claude Code sets it
+/// only there; `agent_type` alone also marks the main thread of a session started with `--agent`); their type is
+/// `agent_type`, `agent` when the hook did not record one. The events come from the packet's immutable
 /// `inputs.events` (see [`crate::builders::packet_event`]).
 pub fn tag_subagent_observations(observations: &[ObservedObservation], inputs: &Value) -> Vec<ObservedObservation> {
     let agent_types: HashMap<i64, &str> = inputs
@@ -416,8 +418,11 @@ pub fn tag_subagent_observations(observations: &[ObservedObservation], inputs: &
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
-        .filter_map(|e| Some((e.get("seq")?.as_i64()?, e.get("agent_type")?.as_str()?)))
-        .filter(|(_, t)| !t.is_empty())
+        .filter(|e| e.get("agent_id").and_then(Value::as_str).is_some_and(|id| !id.is_empty()))
+        .filter_map(|e| {
+            let agent_type = e.get("agent_type").and_then(Value::as_str).filter(|t| !t.is_empty());
+            Some((e.get("seq")?.as_i64()?, agent_type.unwrap_or("agent")))
+        })
         .collect();
     observations
         .iter()
@@ -605,14 +610,26 @@ mod tests {
             {"seq": 1, "kind": "tool_use"},
             {"seq": 2, "kind": "tool_use", "agent_id": "a1", "agent_type": "Explore"},
             {"seq": 3, "kind": "subagent_stop", "agent_id": "a1", "agent_type": "Explore"},
+            // The main thread of a session started with --agent has a type but no agent id.
+            {"seq": 4, "kind": "tool_use", "agent_type": "code-reviewer"},
+            // A hook that recorded the id only.
+            {"seq": 5, "kind": "tool_use", "agent_id": "a2"},
         ]});
         let tagged = tag_subagent_observations(
-            &[obs(vec![1], vec!["x"]), obs(vec![2, 3], vec!["x"]), obs(vec![2], vec!["subagent:Explore"])],
+            &[
+                obs(vec![1], vec!["x"]),
+                obs(vec![2, 3], vec!["x"]),
+                obs(vec![2], vec!["subagent:Explore"]),
+                obs(vec![4], vec!["x"]),
+                obs(vec![5], vec!["x"]),
+            ],
             &inputs,
         );
         assert_eq!(tagged[0].entities, vec!["x"]);
         assert_eq!(tagged[1].entities, vec!["x", "subagent:Explore"]);
         assert_eq!(tagged[2].entities, vec!["subagent:Explore"]);
+        assert_eq!(tagged[3].entities, vec!["x"]);
+        assert_eq!(tagged[4].entities, vec!["x", "subagent:agent"]);
     }
 
     #[test]
