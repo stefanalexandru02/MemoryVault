@@ -2,8 +2,9 @@
 #
 # Quick start:
 #   make up                       # full stack with TEI (or `make up-lite` without the models)
-#   make bootstrap                # first user + device token, prints the client config
-#   make install-plugin           # build mem-hook and set up ~/.memory on this machine
+#   make connect-local            # wire Claude Code on this machine to the stack (token, hooks, MCP)
+#   make disconnect               # undo that
+#   make connect-remote URL=https://memory.example.ts.net TOKEN=mem_...   # wire it to another server
 
 COMPOSE ?= docker compose
 HANDLE  ?= $(shell whoami)
@@ -29,11 +30,12 @@ export TEI_IMAGE
 API_HOST      := $(if $(filter 0.0.0.0,$(BIND_ADDR)),127.0.0.1,$(BIND_ADDR))
 MEMORY_URL    ?= http://$(API_HOST):$(MEMVAULT_PORT)
 
-ADMIN := $(COMPOSE) exec -T -e LOG_LEVEL=warn api memvault admin
+ADMIN   := $(COMPOSE) exec -T -e LOG_LEVEL=warn api memvault admin
+CONNECT := ./clients/claude-code-plugin/connect.sh
 
 .DEFAULT_GOAL := help
 .PHONY: help env build up up-lite down restart ps logs migrate bootstrap user token tokens admin \
-        consolidate reindex psql install-plugin mcp-add test clean
+        consolidate reindex psql connect-local connect-remote connect-status disconnect install-plugin mcp-add test clean
 
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -105,6 +107,41 @@ reindex: ## Re-embed everything with the current model (after leaving FAKE_TEI)
 
 psql: ## Open psql on the memsvc database as the superuser
 	$(COMPOSE) exec postgres psql -U postgres -d memsvc
+
+connect-local: .env ## One step: mint a token for this machine, install the hooks and MCP server in Claude Code
+	@curl -fsS -o /dev/null -m 5 "$(MEMORY_URL)/health" \
+	  || { echo "the API is not answering at $(MEMORY_URL): run 'make up' (or 'make up-lite') first" >&2; exit 1; }
+	@set -e; tok=""; \
+	if $(CONNECT) probe --url "$(MEMORY_URL)"; then \
+	  echo "keeping the token already in ~/.memory/config"; \
+	else \
+	  $(ADMIN) user create "$(HANDLE)" --display-name "$(NAME)" >/dev/null 2>&1 || true; \
+	  out=$$($(ADMIN) token create --user "$(HANDLE)" --client "$(CLIENT)" --kind "$(KIND)" 2>&1); \
+	  tok=$$(printf '%s' "$$out" | sed -n 's/.*"token": *"\(mem_[^"]*\)".*/\1/p'); \
+	  [ -n "$$tok" ] || { echo "$$out" >&2; exit 1; }; \
+	  echo "minted a token for $(HANDLE) on $(CLIENT)"; \
+	fi; \
+	$(CONNECT) connect --url "$(MEMORY_URL)" $${tok:+--token "$$tok"} --device "$(CLIENT)"
+
+connect-remote: ## Same, for a server somewhere else: make connect-remote URL=https://... TOKEN=mem_...
+	@[ "$(origin URL)" = "command line" ] && [ "$(origin TOKEN)" = "command line" ] \
+	  || { echo "usage: make connect-remote URL=https://memory.example.ts.net TOKEN=mem_... [CLIENT=device-name]" >&2; exit 2; }
+	@$(CONNECT) connect --url "$(URL)" --token "$(TOKEN)" --device "$(CLIENT)"
+
+connect-status: ## Show what Claude Code is connected to and whether it works
+	@$(CONNECT) status
+
+disconnect: ## Remove the hooks, MCP server and token from this machine (PURGE=1 also deletes ~/.memory)
+	@# A token minted by this stack is revoked too. Tokens of other servers are left to their admins.
+	@cfg="$${MEMORY_HOME:-$$HOME/.memory}/config"; \
+	tok=$$(sed -n 's/^MEMORY_TOKEN=//p' "$$cfg" 2>/dev/null | tail -n 1); \
+	url=$$(sed -n 's/^MEMORY_URL=//p' "$$cfg" 2>/dev/null | tail -n 1); \
+	prefix=$$(printf '%s' "$$tok" | cut -d_ -f2); \
+	revoked=""; \
+	if [ -n "$$prefix" ] && [ "$$url" = "$(MEMORY_URL)" ] && $(ADMIN) token revoke "$$prefix" >/dev/null 2>&1; then \
+	  revoked=1; echo "revoked token $$prefix on the local stack"; fi; \
+	$(CONNECT) disconnect $(if $(PURGE),--purge); \
+	if [ -n "$$prefix" ] && [ -z "$$revoked" ]; then echo "The token ($$url) still works on its server until an admin revokes it."; fi
 
 install-plugin: ## Build mem-hook and set up ~/.memory on this machine
 	./clients/claude-code-plugin/install.sh

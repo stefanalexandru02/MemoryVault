@@ -39,10 +39,24 @@ planning pass once a day. The `Makefile` wraps it; `make` lists every target.
 
 ```bash
 make up              # creates .env with fresh secrets, builds the image, starts everything
-make bootstrap       # user $(whoami) + a device token for this host; prints the client config
-make install-plugin  # builds mem-hook and sets up ~/.memory (see below)
-make mcp-add         # claude mcp add ... with ${MEMORY_URL}/${MEMORY_TOKEN} references
+make connect-local   # connects Claude Code on this machine to it: token, hooks, MCP server, permissions
 ```
+
+`make connect-local` mints a device token for `$(whoami)` (or reuses the one in `~/.memory/config` while it
+works), builds `mem-hook`, writes `~/.memory/config`, installs the hook plugin through a local plugin
+marketplace (`.claude-plugin/marketplace.json`), registers the MCP server `memory` in user scope with the URL
+and token written in, and allows `mcp__memory__*` in `~/.claude/settings.json`. Start a new Claude Code session
+afterwards. It needs the `claude` CLI, `cargo` and `curl`, and `python3` or `jq` for the settings edit.
+
+```bash
+make connect-status                                         # what is connected, and does the token work
+make disconnect                                             # remove all of it and revoke the local token
+make connect-remote URL=https://memory.<tailnet>.ts.net TOKEN=mem_...   # the same, for a server elsewhere
+```
+
+`make disconnect` keeps `~/.memory/spool` and `sessions` (add `PURGE=1` to delete them). Tokens of a
+remote server stay valid until its admin revokes them. All three targets call
+`clients/claude-code-plugin/connect.sh`, which you can also run directly.
 
 The first `make up` downloads the TEI models (about 4.5 GB) into a volume. `make up-lite` skips TEI and
 uses the fake deterministic embedder: the plumbing works, recall quality does not. Run `make reindex` after
@@ -121,6 +135,8 @@ cargo run -p memvault -- admin token create --user alex --client laptop-x1 --kin
 `token create` prints the raw token once. Store it when it appears.
 
 ## Installing the Claude Code plugin
+
+`make connect-local` and `make connect-remote` (above) do all of this in one step. The manual route is below.
 
 The plugin is in `clients/claude-code-plugin`. It needs the `claude` CLI and `git`. It does not need Node,
 Python, `curl` or `jq`.
