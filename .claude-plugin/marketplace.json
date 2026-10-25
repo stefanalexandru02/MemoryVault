@@ -1,0 +1,11 @@
+{
+  "name": "memoryvault",
+  "owner": { "name": "MemoryVault" },
+  "plugins": [
+    {
+      "name": "memory",
+      "source": "./clients/claude-code-plugin",
+      "description": "MemoryVault for Claude Code: hooks, the memory MCP server and skills for recall, hand-off and briefings."
+    }
+  ]
+}

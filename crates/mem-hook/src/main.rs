@@ -1,5 +1,5 @@
 //! mem-hook: the Claude Code hook binary (spec 8). One subcommand per hook event
-//! (`session-start`, `prompt`, `tool`, `tool-failure`, `stop`, `subagent-stop`, `session-end`)
+//! (`session-start`, `prompt`, `tool`, `tool-failure`, `stop`, `subagent-stop`, `session-end`, `file-context`)
 //! plus `observe` (the observer runner; `observe --all` is the nightly runner).
 //!
 //! Blocking HTTP with `ureq`, no async runtime, no dependency on memvault-core. A hook never
@@ -27,7 +27,9 @@ fn main() {
         Some("observe") => observe::run(&args[1..]),
         Some(event) => hooks::run(event),
         None => {
-            eprintln!("usage: mem-hook <session-start|prompt|tool|tool-failure|stop|subagent-stop|session-end|observe>")
+            eprintln!(
+                "usage: mem-hook <session-start|prompt|tool|tool-failure|stop|subagent-stop|session-end|file-context|observe>"
+            )
         }
     }
 }
