@@ -479,3 +479,7 @@ and repeated items are merged. The last section lists the gaps that are still op
   candidates until consolidation resolves them.
 - **Eval replay and checks not run here.** The acceptance checks in spec section 17 need a live environment. The
   Windows hook has not been run.
+- **`make connect-*` writes the token into the MCP entry.** The manual route registers
+  `Authorization: Bearer ${MEMORY_TOKEN}` as a reference, which only works when the shell profile exports the
+  variable. `connect.sh` writes the literal token into `~/.claude.json` instead, so apps that do not read the
+  profile (IDEs, the desktop app) connect too. `~/.memory/config` (mode 0600) holds the same token.

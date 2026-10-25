@@ -1,0 +1,11 @@
+{
+  "name": "memoryvault",
+  "owner": { "name": "MemoryVault" },
+  "plugins": [
+    {
+      "name": "memory",
+      "source": "./clients/claude-code-plugin",
+      "description": "MemoryVault for Claude Code: records session events and injects recalled context at session start."
+    }
+  ]
+}

@@ -6,6 +6,7 @@
 #   MEM_HOOK_STATIC=0 ./install.sh   build dynamically linked instead
 #   MEM_HOOK_BIN=/path/mem-hook ./install.sh   install a prebuilt binary instead of building
 #   MEMORY_HOME=/other/dir ./install.sh        use another memory home (default ~/.memory)
+#   MEM_INSTALL_QUIET=1 ./install.sh           skip the "Next steps" text (connect.sh does that)
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -54,9 +55,11 @@ else
 fi
 chmod 600 "$memory_home/config"
 
+[ "${MEM_INSTALL_QUIET:-0}" = 1 ] && exit 0
+
 cat <<NEXT
 
-Next steps
+Next steps (or run "make connect-local" / "make connect-remote URL=... TOKEN=..." from the repo root, which does all of this)
 
 1. Edit $memory_home/config, then add to your shell profile:
      set -a; . $memory_home/config; set +a
