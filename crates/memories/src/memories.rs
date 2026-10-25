@@ -47,10 +47,12 @@ pub(crate) async fn delete(
     Query(query): Query<ForgetQuery>,
 ) -> Result<impl IntoResponse, ApiError> {
     require_scope(&state, &identity, MEMORIES_WRITE).await?;
+    query.validate()?;
     if query.hard {
         identity.ensure(ADMIN)?;
     }
-    Ok(Json(forget(&state, &identity, id, query.hard, None).await?))
+    let reason = query.reason.as_deref().map(str::trim).filter(|r| !r.is_empty());
+    Ok(Json(forget(&state, &identity, id, query.hard, reason).await?))
 }
 
 // ---------- shared helpers ----------

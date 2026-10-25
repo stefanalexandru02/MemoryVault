@@ -258,6 +258,43 @@ async fn forget_is_soft_audited_and_idempotent(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn forget_records_the_reason_in_the_audit_log(pool: PgPool) {
+    let w = world(pool).await;
+    let id = uuid_of(&ok(&w.post(&w.alice.token, "/memories", fact_body("prefs.shell", "fish")).await), "/id");
+    ok(&w.delete(&w.alice.token, &format!("/memories/{id}?reason=%20no%20longer%20true%20")).await);
+    let reason: Option<String> = sqlx::query_scalar("SELECT reason FROM memory_audit WHERE action = 'fact.retract'")
+        .fetch_one(&w.pool)
+        .await
+        .unwrap();
+    assert_eq!(reason.as_deref(), Some("no longer true"));
+
+    let other = uuid_of(&ok(&w.post(&w.alice.token, "/memories", fact_body("prefs.os", "linux")).await), "/id");
+    let long = "x".repeat(501);
+    assert_status(
+        &w.delete(&w.alice.token, &format!("/memories/{other}?reason={long}")).await,
+        StatusCode::UNPROCESSABLE_ENTITY,
+        "invalid_request",
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn me_reports_the_token_and_needs_one(pool: PgPool) {
+    let w = world(pool).await;
+    let me = ok(&w.get(&w.alice.token, "/me").await);
+    assert_eq!(me["device_id"], w.alice.device_id);
+    assert_eq!(me["token_kind"], "device");
+    assert!(!me["scopes"].as_array().unwrap().iter().any(|s| s == "admin"), "{me}");
+    let admin = seed_identity_with(&w.pool, TokenKind::Admin, SeedOptions::default()).await;
+    let me = ok(&w.get(&admin.token, "/me").await);
+    assert!(me["scopes"].as_array().unwrap().iter().any(|s| s == "admin"), "{me}");
+    assert_status(
+        &w.get("mem_aaaaaaaa_bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb", "/me").await,
+        StatusCode::UNAUTHORIZED,
+        "invalid_token",
+    );
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn forget_respects_visibility_and_roles(pool: PgPool) {
     let w = world(pool).await;
     let bob = seed_identity(&w.pool, TokenKind::Device).await;

@@ -617,11 +617,22 @@ pub struct RememberResponse {
     pub rendered: String,
 }
 
-/// `DELETE /v1/memories/{id}?hard=true` (hard requires admin).
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+/// `DELETE /v1/memories/{id}?hard=true&reason=...` (hard requires admin; the reason lands in the audit log).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ForgetQuery {
     #[serde(default)]
     pub hard: bool,
+    #[serde(default)]
+    pub reason: Option<String>,
+}
+
+impl ForgetQuery {
+    pub fn validate(&self) -> Result<(), ApiError> {
+        if self.reason.as_deref().is_some_and(|r| r.chars().count() > 500) {
+            return Err(ApiError::invalid("reason must be at most 500 characters"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

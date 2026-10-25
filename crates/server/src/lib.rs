@@ -1,5 +1,7 @@
 //! Router assembly and process wiring for the `memvault` binary.
 
+pub mod viewer;
+
 use std::time::Duration;
 
 use axum::Router;
@@ -38,6 +40,7 @@ pub fn build_router(state: AppState) -> Router {
         .merge(memvault_consolidate::router());
     let mcp = memvault_memories::mcp::service(state.clone()).layer(RequestBodyLimitLayer::new(BODY_LIMIT_BYTES));
     api_router(v1)
+        .merge(viewer::router())
         .route("/health", get(health))
         .route("/metrics", get(metrics))
         .nest_service("/mcp", mcp)

@@ -473,7 +473,7 @@ and repeated items are merged. The last section lists the gaps that are still op
   Python foundation suite. That is a history note and can be reworded.
 - **Unverified deployment pieces.** The CNPG role setup, the TEI image tag and user, the kustomize symlinks, and the
   Postgres image build have not been run against a live cluster.
-- **Phase 4 items not built.** The admin viewer UI, OAuth for more users, KEDA scaling and
+- **Phase 4 items not built.** OAuth for more users, KEDA scaling and
   export and import per space. The base manifests include no ScaledObject.
 - **Embedding cosine check.** The same-value check does not use embeddings (section 6). Near-duplicates become conflict
   candidates until consolidation resolves them.
@@ -489,3 +489,9 @@ and repeated items are merged. The last section lists the gaps that are still op
   (`mem-hook file-context`). It adds earlier observations for the file as context, once per file per session, and
   never blocks or replaces the read. claude-mem's file-read gate can replace a read of a large unchanged file with
   its timeline; this one does not, because a wrong block costs the agent the file.
+- **Web viewer.** Phase 4's admin viewer is a static page at `/viewer` that signs in with a bearer token. It lists,
+  searches and forgets memories, shows provenance and work state, and for admin tokens lists and revokes tokens and
+  shows failed packets and jobs. It adds `GET /v1/me` (who the token is, used to hide admin pages) and a `reason` query
+  parameter on `DELETE /v1/memories/{id}` (the audit log already had a reason column). Not built: sessions and raw
+  events, editing a memory, undoing a forget, user and space administration, and server-side sign-in (cookies,
+  OAuth), so a token is typed or pasted per browser.

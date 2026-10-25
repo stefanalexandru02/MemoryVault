@@ -37,6 +37,37 @@ async fn health_metrics_and_fallbacks(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn viewer_is_served_with_a_strict_content_security_policy(pool: PgPool) {
+    let app = build_router(test_state(pool));
+    let r = send(&app, Method::GET, "/", None, None).await;
+    assert_eq!(r.status, StatusCode::TEMPORARY_REDIRECT);
+    assert_eq!(r.headers["location"], "/viewer");
+
+    for (path, content_type, needle) in [
+        ("/viewer", "text/html", "/viewer/app.js"),
+        ("/viewer/", "text/html", "/viewer/app.css"),
+        ("/viewer/app.js", "text/javascript", "MemoryVault viewer"),
+        ("/viewer/app.css", "text/css", "--accent"),
+    ] {
+        let r = send(&app, Method::GET, path, None, None).await;
+        assert_eq!(r.status, StatusCode::OK, "{path}");
+        assert!(r.headers["content-type"].to_str().unwrap().starts_with(content_type), "{path}");
+        assert!(r.text().contains(needle), "{path}");
+        let csp = r.headers["content-security-policy"].to_str().unwrap();
+        assert!(csp.contains("script-src 'self'") && csp.contains("default-src 'none'"), "{path}: {csp}");
+        assert!(!csp.contains("unsafe-inline"), "{path}: {csp}");
+        assert_eq!(r.headers["x-content-type-options"], "nosniff");
+    }
+
+    // The page ships no inline script or style, which is what the policy relies on.
+    let page = send(&app, Method::GET, "/viewer", None, None).await.text();
+    assert!(!page.contains("<script>") && !page.contains("style="), "{page}");
+    // And the script never writes markup.
+    let js = send(&app, Method::GET, "/viewer/app.js", None, None).await.text();
+    assert!(!js.contains(".innerHTML") && !js.contains("insertAdjacentHTML(") && !js.contains("document.write("));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn health_degraded_when_tei_down(pool: PgPool) {
     let (state, tei) = test_state_with(pool, test_settings(), AppliersRegistry::default());
     tei.set_down(true);
