@@ -12,8 +12,9 @@
 #   connect.sh status
 #
 # Everything is idempotent. Settings touched: ~/.claude.json (MCP server "memory", user scope),
-# ~/.claude/settings.json (plugin, marketplace and the mcp__memory__* allow rule, through the claude CLI
-# and a JSON edit) and ~/.memory/config. Set MEMORY_HOME to use another memory home.
+# ~/.claude/settings.json (plugin, marketplace and the allow rule for the plugin's MCP tools, through the
+# claude CLI and a JSON edit), the plugin's own settings (URL in settings.json, token in the keychain or
+# ~/.claude/.credentials.json) and ~/.memory/config. Set MEMORY_HOME to use another memory home.
 set -euo pipefail
 
 here=$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)
@@ -23,7 +24,10 @@ config=$memory_home/config
 claude_settings=${CLAUDE_CONFIG_DIR:-$HOME/.claude}/settings.json
 marketplace=memoryvault
 plugin=memory
-allow_rule='mcp__memory__*'
+# The plugin's MCP server is mcp__plugin_<plugin>_<server>. The legacy rule belongs to the user-scope entry
+# that earlier versions of this script (and the README's manual steps) registered.
+allow_rule='mcp__plugin_memory_memory__*'
+legacy_allow_rule='mcp__memory__*'
 
 die() { echo "error: $*" >&2; exit 1; }
 note() { echo "  $*"; }
@@ -69,7 +73,7 @@ normalize_url() {
 # Adds ($1 = add) or removes ($1 = remove) the allow rule in the Claude Code user settings. Other keys are kept.
 # Exit 0 done, 3 the file is not the JSON this expects, 4 neither python3 nor jq is installed.
 edit_allow_rule() {
-  local action=$1 tmp
+  local action=$1 allow_rule=$2 tmp
   mkdir -p "$(dirname "$claude_settings")"
   if have python3; then
     python3 -I - "$claude_settings" "$action" "$allow_rule" <<'PY'
@@ -116,8 +120,8 @@ PY
 }
 
 allow_rule_step() {
-  local action=$1 rc=0
-  edit_allow_rule "$action" || rc=$?
+  local action=$1 allow_rule=$2 rc=0
+  edit_allow_rule "$action" "$allow_rule" || rc=$?
   case $rc in
     0) if [ "$action" = add ]; then note "allowed $allow_rule without prompts"; else note "cleared the $allow_rule allow rule"; fi ;;
     3) echo "warning: $claude_settings is not the JSON object I expected; edit it by hand: permissions.allow $action \"$allow_rule\"" >&2 ;;
@@ -168,15 +172,19 @@ cmd_connect() {
   claude plugin marketplace remove "$marketplace" >/dev/null 2>&1 || true
   claude plugin marketplace add "$repo" >/dev/null || die "claude plugin marketplace add $repo failed"
   claude plugin install "$plugin@$marketplace" >/dev/null || die "claude plugin install $plugin@$marketplace failed"
-  note "installed the hook plugin $plugin@$marketplace (loads from $here)"
+  note "installed the plugin $plugin@$marketplace: hooks, skills and the MCP server (loads from $here)"
 
-  # MCP: the URL and token are written into the entry, so apps that do not read the shell profile work too.
-  claude mcp remove -s user memory >/dev/null 2>&1 || true
-  claude mcp add -s user -t http memory "$url/mcp" -H "Authorization: Bearer $token" >/dev/null \
-    || die "claude mcp add failed"
-  note "registered the MCP server 'memory' (user scope)"
+  # MCP: the plugin bundles the server (.mcp.json) and reads the URL and token from its own settings, so apps
+  # that do not read the shell profile work too. The token goes to the keychain, not into ~/.claude.json.
+  case $url$token in *\"*|*\\*) die "the URL and token must not contain quotes or backslashes" ;; esac
+  printf '{"memory_url":"%s","memory_token":"%s"}' "$url" "$token" \
+    | claude plugin configure "$plugin@$marketplace" --values-stdin >/dev/null \
+    || die "claude plugin configure $plugin@$marketplace failed"
+  claude mcp remove -s user memory >/dev/null 2>&1 && note "removed the old user-scope MCP entry 'memory'" || true
+  note "configured the plugin's MCP server (token kept out of ~/.claude.json)"
 
-  allow_rule_step add
+  allow_rule_step remove "$legacy_allow_rule" >/dev/null
+  allow_rule_step add "$allow_rule"
 
   echo
   echo "Done. Start a new Claude Code session (running ones keep the old setup)."
@@ -193,14 +201,15 @@ cmd_disconnect() {
   done
   echo "Disconnecting Claude Code from MemoryVault"
   if have claude; then
-    claude mcp remove -s user memory >/dev/null 2>&1 && note "removed the MCP server 'memory'" || note "no MCP server 'memory' registered"
-    claude plugin uninstall "$plugin@$marketplace" >/dev/null 2>&1 && note "uninstalled the hook plugin" || note "hook plugin was not installed"
+    claude mcp remove -s user memory >/dev/null 2>&1 && note "removed the old user-scope MCP entry 'memory'" || true
+    claude plugin uninstall "$plugin@$marketplace" >/dev/null 2>&1 && note "uninstalled the plugin (hooks, skills, MCP server and its saved token)" || note "the plugin was not installed"
     claude plugin marketplace remove "$marketplace" >/dev/null 2>&1 || true
   else
     echo "warning: the claude CLI is not on PATH; the MCP server and the plugin were left alone" >&2
   fi
   if [ -f "$claude_settings" ]; then
-    allow_rule_step remove
+    allow_rule_step remove "$allow_rule"
+    allow_rule_step remove "$legacy_allow_rule" >/dev/null
   fi
   if [ "$purge" = 1 ]; then
     rm -rf "$memory_home"
@@ -252,10 +261,14 @@ cmd_status() {
     esac
   fi
   if have claude; then
-    claude mcp get memory >/dev/null 2>&1 && echo "mcp      'memory' registered (claude mcp get memory)" || echo "mcp      not registered"
+    if [ "$(claude plugin configure "$plugin@$marketplace" 2>/dev/null | grep -c ', set)')" = 2 ]; then
+      echo "mcp      the plugin's MCP server has its URL and token"
+    else
+      echo "mcp      the plugin's MCP server is not configured"
+    fi
     claude plugin list 2>/dev/null | grep -q "$plugin@$marketplace" && echo "plugin   $plugin@$marketplace installed" || echo "plugin   not installed"
   fi
-  if [ -f "$claude_settings" ] && grep -q "mcp__memory__" "$claude_settings"; then
+  if [ -f "$claude_settings" ] && grep -q "mcp__plugin_memory_memory__" "$claude_settings"; then
     echo "allow    $allow_rule"
   else
     echo "allow    no allow rule (tool calls will prompt)"

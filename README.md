@@ -152,7 +152,7 @@ Python, `curl` or `jq`.
    It creates `~/.memory` (mode 0700) and a `config` template (mode 0600). Set `MEM_HOOK_BIN` to install a
    prebuilt binary instead. On Linux the build is static. A musl build is described in the plugin README.
 
-2. Fill in `~/.memory/config`:
+2. Fill in `~/.memory/config`, which the hooks read:
 
    ```
    MEMORY_URL=https://memory.<tailnet>.ts.net
@@ -161,28 +161,32 @@ Python, `curl` or `jq`.
    # CLAUDE_BIN=/usr/local/bin/claude
    ```
 
-   Export it from the shell profile so Claude Code can expand the variables:
-   `set -a; . ~/.memory/config; set +a`. Do not name the token `ANTHROPIC_API_KEY` or
-   `ANTHROPIC_AUTH_TOKEN`, because Claude Code blanks those in MCP headers.
+   Export it in the shell where you run the commands below: `set -a; . ~/.memory/config; set +a`.
 
-3. Register the MCP server in user scope. The token stays a reference, not a value:
+3. Install the plugin from the local marketplace and give its MCP server the URL and token. The token goes to
+   the keychain, not into a file:
 
    ```bash
-   claude mcp add -s user -t http memory '${MEMORY_URL}/mcp' -H 'Authorization: Bearer ${MEMORY_TOKEN}'
-   claude mcp list    # warns when a variable is unset
+   claude plugin marketplace add "$PWD"
+   claude plugin install memory@memoryvault
+   printf '{"memory_url":"%s","memory_token":"%s"}' "$MEMORY_URL" "$MEMORY_TOKEN" \
+     | claude plugin configure memory@memoryvault --values-stdin
    ```
 
 4. Allow the MCP tools in `~/.claude/settings.json` so they run without prompts:
 
    ```json
-   { "permissions": { "allow": ["mcp__memory__*"] } }
+   { "permissions": { "allow": ["mcp__plugin_memory_memory__*"] } }
    ```
 
-5. Load the plugin for hooks: `claude --plugin-dir /path/to/clients/claude-code-plugin`, or install it from
-   a marketplace that lists the directory.
+   Start a new session. `claude --plugin-dir /path/to/clients/claude-code-plugin` loads the plugin for one
+   session without installing it.
+
+The plugin brings six skills (`recall`, `remember`, `brief`, `project-history`, `handoff`, `how-it-works`),
+the MCP tools and the hooks. The plugin README lists them.
 
 Each hook event runs one `mem-hook` subcommand: `session-start`, `prompt`, `tool`, `tool-failure`, `stop`,
-`subagent-stop` and `session-end`. Hooks exit 0 in every case. Undelivered requests go to
+`subagent-stop`, `session-end` and `file-context`. Hooks exit 0 in every case. Undelivered requests go to
 `~/.memory/spool` and are replayed at the next session start. The plugin README has the full table.
 
 ### Nightly consolidation runner

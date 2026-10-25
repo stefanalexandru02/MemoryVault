@@ -5,7 +5,7 @@
     {
       "name": "memory",
       "source": "./clients/claude-code-plugin",
-      "description": "MemoryVault for Claude Code: records session events and injects recalled context at session start."
+      "description": "MemoryVault for Claude Code: hooks, the memory MCP server and skills for recall, hand-off and briefings."
     }
   ]
 }

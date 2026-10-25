@@ -1,9 +1,28 @@
 # MemoryVault Claude Code plugin
 
-Hooks that record a Claude Code session into MemoryVault and inject recalled context when a session
-starts. All behavior lives in one Rust binary, `bin/mem-hook`, with one subcommand per hook event
-(spec section 8). The MCP tools (`memory_search`, `memory_get`, ...) are registered separately with
-`claude mcp add`.
+A Claude Code plugin with four parts:
+
+- **Hooks** that record a session into MemoryVault, inject recalled context when it starts, and mention earlier
+  work on a file the first time it is read. All behavior lives in one Rust binary, `bin/mem-hook`, with one
+  subcommand per hook event (spec section 8).
+- **The MCP server** `memory` (`.mcp.json`), with the tools `memory_search`, `memory_timeline`, `memory_get`,
+  `memory_explain`, `memory_remember`, `memory_forget` and `work_state_write`. It reads its URL and token from the
+  plugin's own settings (`userConfig`); the token is kept in the keychain, not in a file you edit.
+- **Skills**, invoked as `/memory:<name>` or picked up by Claude from the description:
+
+  | Skill | Use it to |
+  |---|---|
+  | `recall` | search earlier work (search, then timeline, then get), and trace where a memory came from |
+  | `remember` | store a fact, note or procedure on request, or forget one after confirming it |
+  | `brief` | compile a sourced briefing on a topic from facts, procedures and past work |
+  | `project-history` | write a narrative of a project over a period from the recorded timeline |
+  | `handoff` | leave the goal, state and next steps as work state for the next session, on any machine |
+  | `how-it-works` | explain what is captured, where it lives, and how to inspect or delete it |
+
+- **Install and wiring scripts**: `install.sh` builds the binary, `connect.sh` wires a machine up in one step.
+
+The quick way, from the repository root: `make connect-local` (this machine's own stack) or
+`make connect-remote URL=... TOKEN=...`; `make disconnect` undoes it. The manual steps follow.
 
 Requirements on the machine: the `claude` CLI (the observer runs `claude -p`) and `git` (project
 detection). No Node, Python, `curl` or `jq`.
@@ -28,7 +47,7 @@ process-group kills; it type-checks for `x86_64-pc-windows-gnu`, but nobody has 
 
 Then:
 
-1. Fill in `~/.memory/config`:
+1. Fill in `~/.memory/config`, which the hooks read:
 
    ```
    MEMORY_URL=https://memory.<tailnet>.ts.net
@@ -37,27 +56,28 @@ Then:
    # CLAUDE_BIN=/usr/local/bin/claude   (default: claude from PATH; useful under cron)
    ```
 
-   Export it from your shell profile so Claude Code can expand the variables in the MCP entry:
-   `set -a; . ~/.memory/config; set +a`. Do not name the token `ANTHROPIC_API_KEY` or
-   `ANTHROPIC_AUTH_TOKEN`; Claude Code blanks those in MCP headers.
-
-2. Register the MCP server (user scope, token by reference):
+2. Install the plugin from the local marketplace in this repository, then give it the same URL and token for its
+   MCP server:
 
    ```bash
-   claude mcp add -s user -t http memory '${MEMORY_URL}/mcp' -H 'Authorization: Bearer ${MEMORY_TOKEN}'
-   claude mcp list    # warns if a variable is unset
+   claude plugin marketplace add /path/to/MemoryVault
+   claude plugin install memory@memoryvault
+   printf '{"memory_url":"%s","memory_token":"%s"}' "$MEMORY_URL" "$MEMORY_TOKEN" \
+     | claude plugin configure memory@memoryvault --values-stdin
    ```
+
+   Or run `claude plugin install memory@memoryvault` and fill in the two values in `/plugin`.
 
 3. Pre-approve the tools in `~/.claude/settings.json`:
 
    ```json
-   { "permissions": { "allow": ["mcp__memory__*"] } }
+   { "permissions": { "allow": ["mcp__plugin_memory_memory__*"] } }
    ```
 
-4. Load the plugin: `claude --plugin-dir /path/to/clients/claude-code-plugin`, or install it from a
-   marketplace that lists this directory.
+   Start a new session afterwards. For a one-off test without installing, use
+   `claude --plugin-dir /path/to/clients/claude-code-plugin`.
 
-Headless runs that should use memory pass `--allowedTools "mcp__memory__*"`.
+Headless runs that should use memory pass `--allowedTools "mcp__plugin_memory_memory__*"`.
 
 ## What each hook does
 
@@ -67,6 +87,7 @@ Headless runs that should use memory pass `--allowedTools "mcp__memory__*"`.
 | `prompt` | UserPromptSubmit | Posts `user_prompt`. Returns nothing. |
 | `tool` | PostToolUse | Posts `tool_use`. When the server answers `window_closed: true`, starts the observer. |
 | `tool-failure` | PostToolUseFailure | Posts `tool_failure`; same observer rule. |
+| `file-context` | PreToolUse (`Read`) | Looks up observations that touched the file (`GET /v1/observations/by-file`, 1.5 s) and, the first time a file is read in a session, prints up to five of them (date, type, title, id) as `additionalContext`. It never blocks or changes the read, and prints nothing when there is nothing to say. |
 | `stop` | Stop | Posts `assistant_message` and starts the observer. Nothing is posted while `stop_hook_active` is true. |
 | `subagent-stop` | SubagentStop | Posts `subagent_stop`. |
 | `session-end` | SessionEnd | `POST /v1/sessions/{id}/end` within a 1 s budget, then starts the observer with `--final`. |

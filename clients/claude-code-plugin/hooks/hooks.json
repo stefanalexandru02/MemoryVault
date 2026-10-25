@@ -3,26 +3,29 @@
     "SessionStart": [
       {
         "matcher": "startup|resume|clear|compact",
-        "hooks": [ { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/mem-hook session-start", "timeout": 10 } ]
+        "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/mem-hook\" session-start", "timeout": 10 } ]
       }
     ],
     "UserPromptSubmit": [
-      { "hooks": [ { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/mem-hook prompt", "timeout": 5 } ] }
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/mem-hook\" prompt", "timeout": 5 } ] }
+    ],
+    "PreToolUse": [
+      { "matcher": "Read", "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/mem-hook\" file-context", "timeout": 3 } ] }
     ],
     "PostToolUse": [
-      { "matcher": "*", "hooks": [ { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/mem-hook tool", "async": true } ] }
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/mem-hook\" tool", "async": true } ] }
     ],
     "PostToolUseFailure": [
-      { "matcher": "*", "hooks": [ { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/mem-hook tool-failure", "async": true } ] }
+      { "matcher": "*", "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/mem-hook\" tool-failure", "async": true } ] }
     ],
     "Stop": [
-      { "hooks": [ { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/mem-hook stop", "async": true } ] }
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/mem-hook\" stop", "async": true } ] }
     ],
     "SubagentStop": [
-      { "hooks": [ { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/mem-hook subagent-stop", "async": true } ] }
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/mem-hook\" subagent-stop", "async": true } ] }
     ],
     "SessionEnd": [
-      { "hooks": [ { "type": "command", "command": "${CLAUDE_PLUGIN_ROOT}/bin/mem-hook session-end", "timeout": 2 } ] }
+      { "hooks": [ { "type": "command", "command": "\"${CLAUDE_PLUGIN_ROOT}/bin/mem-hook\" session-end", "timeout": 2 } ] }
     ]
   }
 }

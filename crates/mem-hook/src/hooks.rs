@@ -13,6 +13,8 @@ const LIVE_BUDGET: Duration = Duration::from_secs(3);
 const DRAIN_BUDGET: Duration = Duration::from_millis(1500);
 const CONTEXT_TIMEOUT: Duration = Duration::from_secs(3);
 const END_BUDGET: Duration = Duration::from_secs(1);
+const FILE_CONTEXT_TIMEOUT: Duration = Duration::from_millis(1500);
+const FILE_CONTEXT_ROWS: usize = 5;
 
 /// Claude Code's hook input plus everything derived from it.
 struct Hook {
@@ -108,6 +110,7 @@ pub fn run(event: &str) {
             record(&hook, "subagent_stop", payload, false);
         }
         "session-end" => session_end(&hook),
+        "file-context" => file_context(&hook),
         _ => eprintln!("mem-hook: unknown event {event:?}"),
     }
 }
@@ -195,6 +198,55 @@ fn session_start(hook: &mut Hook) {
         return;
     }
     let out = json!({ "hookSpecificOutput": { "hookEventName": "SessionStart", "additionalContext": block } });
+    println!("{out}");
+}
+
+/// `PreToolUse` on `Read`: tells the agent what earlier sessions learned about the file it is about to read.
+/// It never blocks or rewrites the read, and speaks at most once per file per session.
+fn file_context(hook: &Hook) {
+    if hook.str("tool_name") != Some("Read") {
+        return;
+    }
+    let Some(path) = hook.input.get("tool_input").and_then(|i| i.get("file_path")).and_then(Value::as_str) else {
+        return;
+    };
+    if path.is_empty() || !store::first_surface(hook.app.home(), &hook.target.claude_session_id, path) {
+        return;
+    }
+    let query = format!(
+        "/v1/observations/by-file?path={}&project_key={}&limit={FILE_CONTEXT_ROWS}",
+        encode(path),
+        encode(&hook.target.project_key)
+    );
+    let Some(rows) = hook
+        .app
+        .api
+        .get(&query, FILE_CONTEXT_TIMEOUT)
+        .ok()
+        .filter(|r| r.ok())
+        .and_then(|r| r.json())
+        .and_then(|v| v.get("rows").and_then(Value::as_array).cloned())
+    else {
+        return;
+    };
+    let lines: Vec<String> = rows
+        .iter()
+        .filter_map(|row| {
+            let id = row.get("id")?.as_str()?;
+            let title = row.get("title")?.as_str()?;
+            let day = row.get("created_at").and_then(Value::as_str).map(|t| &t[..t.len().min(10)]).unwrap_or("");
+            let kind = row.get("type").and_then(Value::as_str).unwrap_or("note");
+            Some(format!("- {day} [{kind}] {title} (id {id})"))
+        })
+        .collect();
+    if lines.is_empty() {
+        return;
+    }
+    let block = format!(
+        "memory: earlier sessions touched {path}, newest first. Fetch details with memory_get when one matters:\n{}",
+        lines.join("\n")
+    );
+    let out = json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": block } });
     println!("{out}");
 }
 
