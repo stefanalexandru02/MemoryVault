@@ -37,6 +37,9 @@ pub struct MemorySearchArgs {
     pub since: Option<String>,
     #[serde(default)]
     pub files: Option<Vec<String>>,
+    /// RFC 3339 time: search the memory as it stood then.
+    #[serde(default)]
+    pub as_of: Option<String>,
     /// <= 30.
     #[serde(default = "twenty")]
     pub limit: i64,
@@ -61,6 +64,11 @@ pub struct MemoryGetArgs {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryExplainArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryHistoryArgs {
     pub id: String,
 }
 

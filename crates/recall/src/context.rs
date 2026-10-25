@@ -80,6 +80,7 @@ pub async fn render_context(
                 rerank: false,
                 exclude_sensitivity: vec![Sensitivity::Secret],
                 context: true,
+                as_of: None,
             };
             let pack = build_pack(state, &mut tx, &spaces, &scopes, &opts).await?;
             let body = render::context_body(&pack.slots);

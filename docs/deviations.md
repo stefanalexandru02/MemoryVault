@@ -500,3 +500,16 @@ and repeated items are merged. The last section lists the gaps that are still op
   parameter on `DELETE /v1/memories/{id}` (the audit log already had a reason column). Not built: sessions and raw
   events, editing a memory, undoing a forget, user and space administration, and server-side sign-in (cookies,
   OAuth), so a token is typed or pasted per browser.
+- **Point-in-time queries.** `as_of` (RFC 3339) on `GET /v1/search`, `POST /v1/recall` and the MCP `memory_search`
+  (which then also searches facts and procedures) replaces the "live" filter with what held at that instant. A fact
+  counts from `valid_from` (else `first_seen_at`) until `valid_to`, so a superseded fact is back in force before it was
+  replaced; candidates and duplicates merged into another fact (superseded without an end) never count. A procedure
+  counts from `created_at` until it was retired, taken from the `proc.retire` audit entry (else when its successor was
+  created). Observations and summaries count from `created_at`, observations until `archived_at`. Recall ranks relative to
+  `as_of`, rebuilds the profile from the facts valid then instead of the rendered `profiles` row, and leaves work state
+  out. `/v1/context`, the timeline and by-file do not take `as_of`; the context cache is not time-aware.
+- **History endpoint.** `GET /v1/memories/{id}/history` and the MCP `memory_history` follow `supersedes_id` in both
+  directions (at most 50 links each way) under the caller's RLS, so links in spaces the caller cannot read drop out and
+  an invisible id is a 404. Only facts and procedures chain; an observation or summary is a chain of one. Other
+  `secret` rows in a chain are left out. Procedures have no `superseded_by` or end time columns, so both are derived
+  from the chain and the audit log.

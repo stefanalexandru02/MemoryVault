@@ -6,16 +6,16 @@ A Claude Code plugin with four parts:
   work on a file the first time it is read. All behavior lives in one Rust binary, `bin/mem-hook`, with one
   subcommand per hook event (spec section 8).
 - **The MCP server** `memory` (`.mcp.json`), with the tools `memory_search`, `memory_timeline`, `memory_get`,
-  `memory_explain`, `memory_remember`, `memory_forget` and `work_state_write`. It reads its URL and token from the
+  `memory_explain`, `memory_history`, `memory_remember`, `memory_forget` and `work_state_write`. It reads its URL and token from the
   plugin's own settings (`userConfig`); the token is kept in the keychain, not in a file you edit.
 - **Skills**, invoked as `/memory:<name>` or picked up by Claude from the description:
 
   | Skill | Use it to |
   |---|---|
-  | `recall` | search earlier work (search, then timeline, then get), and trace where a memory came from |
+  | `recall` | search earlier work (search, then timeline, then get), look at it as of an earlier date, and trace where a memory came from |
   | `remember` | store a fact, note or procedure on request, or forget one after confirming it |
   | `brief` | compile a sourced briefing on a topic from facts, procedures and past work |
-  | `project-history` | write a narrative of a project over a period from the recorded timeline |
+  | `project-history` | write a narrative of a project over a period from the recorded timeline, using `as_of` and `memory_history` for what changed |
   | `handoff` | leave the goal, state and next steps as work state for the next session, on any machine |
   | `how-it-works` | explain what is captured, where it lives, and how to inspect or delete it |
 

@@ -297,3 +297,61 @@ pub async fn insert_work_state(pool: &PgPool, space: Uuid, scope: &Scope, list: 
     .await
     .expect("insert work_state");
 }
+
+/// A fact chain: `vim` held from `2026-01-01` (no `valid_from`, so `first_seen_at` counts) until it was
+/// superseded on `2026-03-01` by `helix`; `dup` is a merged duplicate candidate that never held.
+pub struct EditorHistory {
+    pub vim: Uuid,
+    pub helix: Uuid,
+    pub dup: Uuid,
+}
+
+pub async fn insert_editor_history(w: &World) -> EditorHistory {
+    let space = w.alice.space_id;
+    let vim = insert_fact(w, Fact::new(space, "prefers.editor", "vim")).await;
+    sqlx::query(
+        "UPDATE facts SET status = 'superseded', first_seen_at = '2026-01-01T00:00:00Z',
+                          valid_to = '2026-03-01T00:00:00Z' WHERE id = $1",
+    )
+    .bind(vim)
+    .execute(&w.pool)
+    .await
+    .expect("end the first fact");
+    let dup = insert_fact(w, Fact::new(space, "prefers.editor", "vim again")).await;
+    sqlx::query(
+        "UPDATE facts SET status = 'superseded', superseded_by = $2, first_seen_at = '2026-01-15T00:00:00Z'
+          WHERE id = $1",
+    )
+    .bind(dup)
+    .bind(vim)
+    .execute(&w.pool)
+    .await
+    .expect("merge the duplicate");
+    let helix = insert_fact(w, Fact::new(space, "prefers.editor", "helix")).await;
+    sqlx::query("UPDATE facts SET valid_from = '2026-03-01T00:00:00Z', supersedes_id = $2 WHERE id = $1")
+        .bind(helix)
+        .bind(vim)
+        .execute(&w.pool)
+        .await
+        .expect("link the new fact");
+    sqlx::query("UPDATE facts SET superseded_by = $2 WHERE id = $1")
+        .bind(vim)
+        .bind(helix)
+        .execute(&w.pool)
+        .await
+        .expect("link the old fact");
+    sqlx::query(
+        "INSERT INTO memory_audit (id, space_id, actor, action, target_table, target_id, reason, model, run_id,
+                                   created_at)
+         VALUES ($1, $2, 'planner', 'fact.supersede', 'facts', $3, 'switched in March', 'sonnet', $4,
+                 '2026-03-01T00:00:00Z')",
+    )
+    .bind(new_id())
+    .bind(space)
+    .bind(vim)
+    .bind(new_id())
+    .execute(&w.pool)
+    .await
+    .expect("audit the supersession");
+    EditorHistory { vim, helix, dup }
+}

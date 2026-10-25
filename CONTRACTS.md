@@ -29,7 +29,7 @@ lock" is normal, wait; never kill cargo or delete `target/`. Build and test only
 | `crates/core` | `memvault-core` / `memvault_core` | foundation | config, db + RLS tx, ids, auth, schemas, TEI + FakeTei, prompts, appliers, invalidation, errors, AppState, test-support |
 | `crates/server` | `memvault` (bin) / `memvault_server` | foundation | CLI, router assembly, `/health`, `/metrics`, `/mcp` mount, migrate |
 | `crates/ingest` | `memvault-ingest` | ingest | sessions, events, windows, work packets (lease/result/fail/heartbeat), prompts route, extract/summary appliers |
-| `crates/recall` | `memvault-recall` | recall | candidates, fusion, rerank, budgets, rendering, context cache + listener, recall/context/search/timeline/get/explain/by-file/feedback routes |
+| `crates/recall` | `memvault-recall` | recall | candidates, fusion, rerank, budgets, rendering, context cache + listener, recall/context/search/timeline/get/explain/history/by-file/feedback routes |
 | `crates/memories` | `memvault-memories` | memories | memories (remember/forget) + work-state routes, MCP server |
 | `crates/consolidate` | `memvault-consolidate` | consolidation | planner, consolidation appliers, revert, admin routes and admin CLI |
 | `crates/worker` | `memvault-worker` | worker | embedding parts and jobs, worker loop, sweeps, retention |
@@ -265,7 +265,7 @@ header), `invalid_token`, `token_revoked`, `token_expired`, `user_disabled`; 403
 and `opt_from_str` for query strings), `sessions` (6.1), `events` (6.2, clamp constants), `recall` (6.3:
 RecallRequest, RecallResponse, slot items with flattened `SlotItem`, ContextQuery, Feedback*), `memories`
 (6.4/12.5: SearchQuery (comma-separated list params), IndexRow, SearchResponse, Timeline*, ByFileQuery, GetRequest,
-GetResponse with `MemoryItem` tagged by `table`, ExplainResponse, `RememberRequest` tagged by `kind`
+GetResponse with `MemoryItem` tagged by `table`, ExplainResponse, HistoryResponse and HistoryEntry, `RememberRequest` tagged by `kind`
 (fact|observation|procedure), RememberResponse, ForgetQuery, ForgetResponse), `work_state` (6.5), `work` (6.6:
 LeaseRequest, LeasedPacket with `prompt{system,user_template,user}`, ResultRequest, ResultResponse, Fail*,
 HeartbeatResponse, `PacketRecord` = a `work_packets` row, `sqlx::FromRow`), `packets` (9.2 inputs: ExtractInputs,
@@ -344,6 +344,7 @@ CLI `memvault`: `serve [--host] [--port]` (graceful shutdown on SIGINT/SIGTERM),
 | `engine::timeline(&AppState, &Identity, TimelineQuery) -> Result<TimelineResponse, ApiError>` | recall | 6.4 |
 | `engine::get_memories(&AppState, &Identity, &[Uuid]) -> Result<GetResponse, ApiError>` | recall | 6.4 |
 | `engine::explain(&AppState, &Identity, Uuid) -> Result<ExplainResponse, ApiError>` | recall | 12.5 |
+| `engine::history(&AppState, &Identity, Uuid) -> Result<HistoryResponse, ApiError>` | recall | 6.4 |
 | `context::render_context(&AppState, &Identity, project_key: Option<&str>, device_id: Option<&str>, source: &str) -> Result<String, ApiError>` | recall | 6.3, 11.5-11.7 |
 | `cache::spawn_listener(AppState, CancellationToken) -> JoinHandle<()>` | recall | 11.6 |
 | `cache::rerender(&AppState, &RenderContextJob) -> Result<bool, ApiError>` | recall | 11.6 |

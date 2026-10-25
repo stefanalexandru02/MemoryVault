@@ -96,6 +96,45 @@ async fn memory_routes(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
+async fn as_of_and_history_routes(pool: PgPool) {
+    let w = world(pool).await;
+    let h = insert_editor_history(&w).await;
+    let app = app(w.state.clone(), memvault_recall::router());
+    let token = w.alice.token.as_str();
+
+    let uri = "/v1/search?q=editor&tables=facts&as_of=2026-02-01T00:00:00Z";
+    let resp = send(&app, Method::GET, uri, Some(token), None).await;
+    assert_eq!(resp.status, StatusCode::OK, "{}", resp.text());
+    assert_eq!(resp.json()["rows"][0]["id"], json!(h.vim));
+    // as_of alone is a filter, so a q-less search is valid.
+    let resp = send(&app, Method::GET, "/v1/search?tables=facts&as_of=2026-04-01T00:00:00Z", Some(token), None).await;
+    assert_eq!(resp.json()["rows"][0]["id"], json!(h.helix));
+    for bad in ["yesterday", "2026-02-01", ""] {
+        let resp = send(&app, Method::GET, &format!("/v1/search?q=x&as_of={bad}"), Some(token), None).await;
+        assert_eq!((resp.status.as_u16(), resp.error_code().as_deref()), (422, Some("invalid_request")), "{bad}");
+    }
+    let body = json!({"query": "editor", "as_of": "2026-02-01T00:00:00Z", "rerank": false, "budgets": {"profile": 0}});
+    let resp = send(&app, Method::POST, "/v1/recall", Some(token), Some(body)).await;
+    assert_eq!(resp.status, StatusCode::OK, "{}", resp.text());
+    assert_eq!(resp.json()["slots"]["facts"][0]["id"], json!(h.vim));
+    let resp = send(&app, Method::POST, "/v1/recall", Some(token), Some(json!({"as_of": "soon"}))).await;
+    assert_eq!((resp.status.as_u16(), resp.error_code().as_deref()), (422, Some("invalid_request")));
+
+    let resp = send(&app, Method::GET, &format!("/v1/memories/{}/history", h.helix), Some(token), None).await;
+    assert_eq!(resp.status, StatusCode::OK, "{}", resp.text());
+    let v = resp.json();
+    assert_eq!((v["id"].clone(), v["table"].clone()), (json!(h.helix), json!("facts")));
+    assert_eq!(v["entries"][0]["id"], json!(h.vim));
+    assert_eq!(v["entries"][0]["ended_by"], "planner");
+    assert_eq!(v["entries"][1]["current"], true);
+    let unknown = uuid::Uuid::now_v7();
+    let resp = send(&app, Method::GET, &format!("/v1/memories/{unknown}/history"), Some(token), None).await;
+    assert_eq!((resp.status, resp.error_code().as_deref()), (StatusCode::NOT_FOUND, Some("not_found")));
+    let uri = format!("/v1/memories/{}/history", h.helix);
+    assert_eq!(send(&app, Method::GET, &uri, None, None).await.status, StatusCode::UNAUTHORIZED);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
 async fn context_route_is_markdown_with_etag(pool: PgPool) {
     let w = world(pool).await;
     insert_obs(&w, Obs::new(w.alice.space_id, "Chose pgvector", "one database")).await;

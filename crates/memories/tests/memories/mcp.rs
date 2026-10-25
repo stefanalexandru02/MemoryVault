@@ -124,6 +124,7 @@ async fn initialize_and_tools_list(pool: PgPool) {
             "memory_timeline",
             "memory_get",
             "memory_explain",
+            "memory_history",
             "memory_remember",
             "memory_forget",
             "work_state_write"
@@ -141,6 +142,8 @@ async fn initialize_and_tools_list(pool: PgPool) {
     }
     assert_eq!(by_name("memory_search")["inputSchema"]["required"], json!(["query"]));
     assert_eq!(by_name("memory_search")["inputSchema"]["properties"]["limit"]["maximum"], 30);
+    assert_eq!(by_name("memory_search")["inputSchema"]["properties"]["as_of"]["type"], "string");
+    assert_eq!(by_name("memory_history")["inputSchema"]["required"], json!(["id"]));
     assert_eq!(by_name("memory_get")["inputSchema"]["properties"]["ids"]["maxItems"], 20);
     assert_eq!(by_name("memory_timeline")["inputSchema"]["properties"]["before"]["maximum"], 10);
 }
@@ -230,6 +233,56 @@ async fn remember_search_timeline_get_explain_forget(pool: PgPool) {
     assert_eq!(reason.as_deref(), Some("obsolete"));
     let (_, after) = call(&app, alice, "memory_search", json!({"query": "router firmware"})).await;
     assert!(!after.contains(&first_id) && after.contains(&second_id), "{after}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn as_of_search_and_history(pool: PgPool) {
+    let w = world(pool).await;
+    let app = mcp_app(&w);
+    let alice = &w.alice;
+    let remember = |value: &'static str| {
+        call(
+            &app,
+            alice,
+            "memory_remember",
+            json!({"kind": "fact", "content": value, "subject": "alex", "predicate": "prefers.editor", "scope": "global"}),
+        )
+    };
+    let (_, first) = remember("vim").await;
+    let (first_id, between) = (id_in(&first), chrono::Utc::now().to_rfc3339());
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (_, second) = remember("helix").await;
+    let second_id = id_in(&second);
+
+    // Facts are not in the default search; with as_of they are, as they stood then.
+    let (err, now) = call(&app, alice, "memory_search", json!({"query": "vim helix"})).await;
+    assert!(!err && !now.contains(&second_id), "{now}");
+    let (err, past) = call(&app, alice, "memory_search", json!({"query": "vim helix", "as_of": between})).await;
+    assert!(!err && past.contains(&first_id) && !past.contains(&second_id), "{past}");
+    let (_, present) =
+        call(&app, alice, "memory_search", json!({"query": "vim helix", "as_of": chrono::Utc::now().to_rfc3339()}))
+            .await;
+    assert!(present.contains(&second_id) && !present.contains(&first_id), "{present}");
+    for bad in ["yesterday", "2026-10-01", "7d"] {
+        let (err, text) = call(&app, alice, "memory_search", json!({"query": "vim helix", "as_of": bad})).await;
+        assert!(err && text.contains("error (invalid_request)") && text.contains("as_of"), "{bad}: {text}");
+    }
+
+    // The chain from either end, by full id or short citation id, oldest first with the audit reason.
+    let short = &second_id[second_id.len() - 6..];
+    for reference in [first_id.clone(), second_id.clone(), format!("fact#{short}")] {
+        let (err, chain) = call(&app, alice, "memory_history", json!({"id": reference})).await;
+        assert!(!err && chain.contains("2 versions"), "{chain}");
+        let (vim, helix) = (chain.find("prefers.editor: vim"), chain.find("prefers.editor: helix"));
+        assert!(vim.is_some() && helix.is_some() && vim < helix, "{chain}");
+        assert!(chain.contains("replaced by an explicit write"), "{chain}");
+    }
+    let (err, text) = call(&app, alice, "memory_history", json!({"id": "ffffffff-ffff-ffff-ffff-ffffffffffff"})).await;
+    assert!(err && text.contains("not_found"), "{text}");
+    // Another user cannot see the chain.
+    let bob = seed_identity(&w.pool, TokenKind::Device).await;
+    let (err, text) = call(&app, &bob, "memory_history", json!({"id": first_id})).await;
+    assert!(err && text.contains("not_found"), "{text}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]

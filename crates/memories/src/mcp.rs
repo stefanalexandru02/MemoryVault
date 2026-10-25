@@ -15,10 +15,10 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use memvault_core::auth::{MEMORIES_READ, MEMORIES_WRITE, authenticate_header};
-use memvault_core::schemas::common::{Concept, ObservationType, Scope, ScopeKind, Sensitivity};
+use memvault_core::schemas::common::{Concept, MemoryTable, ObservationType, Scope, ScopeKind, Sensitivity};
 use memvault_core::schemas::mcp::{
-    MAX_RESULT_CHARS, McpScope, MemoryExplainArgs, MemoryForgetArgs, MemoryGetArgs, MemoryRememberArgs,
-    MemorySearchArgs, MemoryTimelineArgs, RememberKind, RememberScope, WorkStateWriteArgs,
+    MAX_RESULT_CHARS, McpScope, MemoryExplainArgs, MemoryForgetArgs, MemoryGetArgs, MemoryHistoryArgs,
+    MemoryRememberArgs, MemorySearchArgs, MemoryTimelineArgs, RememberKind, RememberScope, WorkStateWriteArgs,
 };
 use memvault_core::schemas::memories::{
     FactSubject, RememberFact, RememberObservation, RememberProcedure, RememberRequest, SearchQuery, TimelineQuery,
@@ -49,8 +49,7 @@ const PROJECT_HEADER: &str = "x-memory-project";
 /// tokens, get ~6k.
 const INDEX_CAP_CHARS: usize = 8_000;
 const GET_CAP_CHARS: usize = 24_000;
-const NEXT_STEP_HINT: &str =
-    "\n\n_Next: `memory_timeline` for the neighbours of a row, `memory_get` for full bodies (ids above)._";
+const NEXT_STEP_HINT: &str = "\n\n_Next: `memory_timeline` for the neighbours of a row, `memory_get` for full bodies (ids above), `memory_history` for how a fact changed._";
 
 /// The streamable-HTTP MCP service mounted by the server at `/mcp` (stateless: a new server value
 /// per request, no session affinity; same bearer auth as REST via `authenticate_header`).
@@ -149,6 +148,7 @@ impl ServerHandler for MemoryServer {
                 "memory_timeline" => self.timeline(&caller, parse(args)?).await,
                 "memory_get" => self.get(&caller, parse(args)?).await,
                 "memory_explain" => self.explain(&caller, parse(args)?).await,
+                "memory_history" => self.history(&caller, parse(args)?).await,
                 "memory_remember" => self.remember(&caller, parse(args)?).await,
                 "memory_forget" => self.forget(&caller, parse(args)?).await,
                 "work_state_write" => self.work_state_write(&caller, parse(args)?).await,
@@ -193,12 +193,17 @@ impl MemoryServer {
             // Without a known project there is nothing to narrow to.
             McpScope::Project => self.project(caller).await?.map(|key| vec![Scope::new(ScopeKind::Project, key)]),
         };
+        let as_of = args.as_of.as_deref().map(parse_as_of).transpose()?;
+        // The past is asked about facts and procedures as much as about what happened.
+        let tables = as_of.map(|_| MemoryTable::ALL.to_vec());
         let query = SearchQuery {
             q: Some(args.query),
             scopes,
             types: args.types,
+            tables,
             since: args.since.as_deref().map(parse_since).transpose()?,
             files: args.files,
+            as_of,
             limit: args.limit,
             ..SearchQuery::default()
         };
@@ -244,6 +249,13 @@ impl MemoryServer {
         let id = self.resolve_one(caller, &args.id).await?;
         let explained = engine::explain(&self.state, &caller.identity, id).await?;
         Ok(cap(render::explain_markdown(&explained), INDEX_CAP_CHARS))
+    }
+
+    async fn history(&self, caller: &Caller, args: MemoryHistoryArgs) -> ToolResult {
+        require_scope(&self.state, &caller.identity, MEMORIES_READ).await?;
+        let id = self.resolve_one(caller, &args.id).await?;
+        let chain = engine::history(&self.state, &caller.identity, id).await?;
+        Ok(cap(render::history_markdown(&chain), INDEX_CAP_CHARS))
     }
 
     async fn remember(&self, caller: &Caller, args: MemoryRememberArgs) -> ToolResult {
@@ -406,6 +418,13 @@ fn parse_since(text: &str) -> Result<DateTime<Utc>, ApiError> {
     Err(ApiError::invalid("since must be an RFC 3339 time, a date like 2026-10-01 or a span like 7d"))
 }
 
+/// RFC 3339 time for `as_of`.
+fn parse_as_of(text: &str) -> Result<DateTime<Utc>, ApiError> {
+    DateTime::parse_from_rfc3339(text.trim())
+        .map(|t| t.with_timezone(&Utc))
+        .map_err(|_| ApiError::invalid("as_of must be an RFC 3339 time like 2026-10-01T12:00:00Z"))
+}
+
 // ---------- tool definitions ----------
 
 fn tools() -> Vec<Tool> {
@@ -421,6 +440,7 @@ fn tools() -> Vec<Tool> {
                 "scope": {"type": "string", "enum": ["project", "global", "all"], "description": "Default: the current project when the client reports one, else all."},
                 "since": {"type": "string", "description": "RFC 3339 time, a date like 2026-10-01, or a span like 7d."},
                 "files": {"type": "array", "items": {"type": "string"}, "description": "Only observations touching these paths."},
+                "as_of": {"type": "string", "description": "RFC 3339 time: search the memory as it stood then, facts and procedures included, with superseded ones back in force."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 30, "description": "Default 20."}
             }),
             &["query"],
@@ -450,6 +470,13 @@ fn tools() -> Vec<Tool> {
             "memory_explain",
             "Show where a memory came from (session, events, extractor, audit history) for an id found by search → timeline → get.",
             json!({"id": {"type": "string", "description": "A memory id."}}),
+            &["id"],
+            read.clone(),
+        ),
+        tool(
+            "memory_history",
+            "Show how a fact or procedure changed over time: the chain of versions it replaced and was replaced by, with who changed it and why.",
+            json!({"id": {"type": "string", "description": "A memory id from memory_search or memory_get."}}),
             &["id"],
             read,
         ),
@@ -535,6 +562,14 @@ mod tests {
         assert!((parse_since("2w").unwrap() - (Utc::now() - Duration::weeks(2))).num_seconds().abs() < 5);
         for bad in ["", "yesterday", "7x", "-3d", "d"] {
             assert!(parse_since(bad).is_err(), "{bad}");
+        }
+    }
+
+    #[test]
+    fn as_of_takes_rfc3339_only() {
+        assert_eq!(parse_as_of("2026-10-01T12:00:00+02:00").unwrap().to_rfc3339(), "2026-10-01T10:00:00+00:00");
+        for bad in ["", "2026-10-01", "7d", "last week"] {
+            assert!(parse_as_of(bad).is_err(), "{bad}");
         }
     }
 

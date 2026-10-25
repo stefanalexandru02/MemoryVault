@@ -80,6 +80,9 @@ pub struct RecallRequest {
     pub exclude_sensitivity: Vec<Sensitivity>,
     #[serde(default)]
     pub format: RecallFormat,
+    /// Point in time (RFC 3339): recall what was valid then instead of now.
+    #[serde(default)]
+    pub as_of: Option<DateTime<Utc>>,
 }
 
 impl Default for RecallRequest {
@@ -94,6 +97,7 @@ impl Default for RecallRequest {
             rerank: true,
             exclude_sensitivity: default_exclude(),
             format: RecallFormat::Both,
+            as_of: None,
         }
     }
 }

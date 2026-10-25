@@ -1,16 +1,16 @@
 //! Deterministic markdown rendering (spec 11.5): citation tags, slot sections, the
 //! progressive-disclosure index (claude-mem's code-mode glyphs), since-you-were-here, memory bodies
-//! and explain chains.
+//! explain chains and supersession history.
 //!
 //! Everything here is a pure function of its inputs (UTC dates, stable ordering), so the same slots
 //! always render to the same bytes. The MCP tools reuse [`index_rows_markdown`],
-//! [`memory_items_markdown`] and [`explain_markdown`] so pull-mode output matches the SessionStart
+//! [`memory_items_markdown`], [`explain_markdown`] and [`history_markdown`] so pull-mode output matches the SessionStart
 //! block.
 
 use chrono::{DateTime, Utc};
 use memvault_core::ids::short_id;
 use memvault_core::schemas::common::{MemoryTable, Scope, ScopeKind};
-use memvault_core::schemas::memories::{ExplainResponse, IndexRow, MemoryItem, Provenance};
+use memvault_core::schemas::memories::{ExplainResponse, HistoryResponse, IndexRow, MemoryItem, Provenance};
 use memvault_core::schemas::recall::{
     FactItem, ObservationItem, ProcedureItem, RecallSlots, SummaryItem, WorkStateList,
 };
@@ -512,9 +512,39 @@ pub fn explain_markdown(e: &ExplainResponse) -> String {
     lines.join("\n")
 }
 
+/// The supersession chain, oldest first: when each link held, who ended it and why.
+pub fn history_markdown(h: &HistoryResponse) -> String {
+    let mut lines = vec![format!(
+        "**History** of `{}` ({} {})",
+        h.id,
+        h.entries.len(),
+        if h.entries.len() == 1 { "version" } else { "versions" }
+    )];
+    for e in &h.entries {
+        let until = e.valid_to.map_or_else(|| "now".into(), |t| fmt_date(Some(t)));
+        let mark = if e.current { " ← asked" } else { "" };
+        lines.push(format!(
+            "- {} `{}` {} · {} → {} · {}{mark}",
+            glyph(e.table, None),
+            short_id(&e.id),
+            e.status,
+            fmt_date(e.valid_from),
+            until,
+            excerpt(&e.text, EXCERPT_CHARS)
+        ));
+        if let Some(actor) = &e.ended_by {
+            let reason = e.reason.as_deref().map(|r| format!(": {}", excerpt(r, EXCERPT_CHARS))).unwrap_or_default();
+            let model = e.model.as_deref().map(|m| format!(" ({m})")).unwrap_or_default();
+            lines.push(format!("  ended {} by {actor}{model}{reason}", fmt_when(e.ended_at)));
+        }
+    }
+    lines.join("\n")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    use memvault_core::schemas::memories::HistoryEntry;
     use memvault_core::schemas::recall::SlotItem;
 
     fn item(n: u128) -> SlotItem {
@@ -581,6 +611,41 @@ mod tests {
         assert_eq!(
             assemble_context(&["2 packets waiting".into()], "", ""),
             "## Memory\n> memory: 2 packets waiting\n_No memories for this project yet._"
+        );
+    }
+
+    #[test]
+    fn history_lists_versions_oldest_first() {
+        let entry = |n: u128, status: &str, text: &str, to: Option<&str>| HistoryEntry {
+            id: Uuid::from_u128(n),
+            table: MemoryTable::Facts,
+            text: text.into(),
+            status: status.into(),
+            valid_from: "2026-01-01T00:00:00Z".parse().ok(),
+            valid_to: to.and_then(|t| t.parse().ok()),
+            supersedes_id: None,
+            superseded_by: None,
+            current: n == 2,
+            ended_at: to.and_then(|t| t.parse().ok()),
+            ended_by: to.map(|_| "planner".into()),
+            reason: to.map(|_| "switched\neditors".into()),
+            model: None,
+            run_id: None,
+        };
+        let h = HistoryResponse {
+            id: Uuid::from_u128(2),
+            table: MemoryTable::Facts,
+            entries: vec![
+                entry(1, "superseded", "prefers.editor: vim", Some("2026-03-01T00:00:00Z")),
+                entry(2, "active", "prefers.editor: helix", None),
+            ],
+        };
+        assert_eq!(
+            history_markdown(&h),
+            "**History** of `00000000-0000-0000-0000-000000000002` (2 versions)\n\
+             - ≡ `000001` superseded · 2026-01-01 → 2026-03-01 · prefers.editor: vim\n  \
+             ended 03-01 00:00 by planner: switched editors\n\
+             - ≡ `000002` active · 2026-01-01 → now · prefers.editor: helix ← asked"
         );
     }
 

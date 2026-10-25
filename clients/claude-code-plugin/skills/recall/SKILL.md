@@ -21,6 +21,9 @@ Then answer from what you read:
 
 - Say where it came from: the date, and the project or device when the entry shows one. Do not present a
   memory as certain when it may be out of date; code and the user's current instructions win over memory.
+- To see memory as it was on an earlier date, pass `as_of` (RFC 3339, e.g. `2026-09-01T00:00:00Z`) to
+  `memory_search`; it then also covers facts and procedures, and facts that were replaced since count again.
+  To see how one fact or procedure changed, call **`memory_history`** with its id.
 - If the search finds nothing relevant, say so and carry on. Do not guess at what the memory might contain.
 - To answer "why do you think that?" about a memory, call **`memory_explain`** with its id. It shows the
   session, the events and the extractor behind it.

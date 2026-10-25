@@ -27,7 +27,7 @@ fn default_limit() -> i64 {
 }
 
 /// `GET /v1/search` query params (list params comma-separated in the URL). Requires `q` or at
-/// least one filter (types, since, until, files, scopes).
+/// least one filter (types, since, until, files, scopes, as_of).
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SearchQuery {
     #[serde(default)]
@@ -47,6 +47,10 @@ pub struct SearchQuery {
     pub until: Option<DateTime<Utc>>,
     #[serde(default, deserialize_with = "comma_list::deserialize")]
     pub files: Option<Vec<String>>,
+    /// Point in time (RFC 3339): only what was valid then. Facts and procedures count when their
+    /// validity covers the instant, observations and summaries when they already existed.
+    #[serde(default)]
+    pub as_of: Option<DateTime<Utc>>,
     #[serde(default = "default_limit")]
     pub limit: i64,
     #[serde(default)]
@@ -63,7 +67,8 @@ impl SearchQuery {
             || self.since.is_some()
             || self.until.is_some()
             || self.files.is_some()
-            || self.scopes.is_some();
+            || self.scopes.is_some()
+            || self.as_of.is_some();
         if !has_q && !has_filter {
             return Err(ApiError::invalid("search requires q or at least one filter"));
         }
@@ -455,6 +460,48 @@ pub struct ExplainResponse {
     pub evidence: Vec<EvidenceObservation>,
     #[serde(default)]
     pub audit: Vec<AuditEntry>,
+}
+
+// ---------- history ----------
+
+/// One link of a supersession chain.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryEntry {
+    pub id: Uuid,
+    pub table: MemoryTable,
+    /// Fact `predicate: value`, procedure name and version with the start of its body.
+    pub text: String,
+    /// Fact status, procedure status, `archived` or `active` for observations and summaries.
+    pub status: String,
+    #[serde(default)]
+    pub valid_from: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub valid_to: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub supersedes_id: Option<Uuid>,
+    #[serde(default)]
+    pub superseded_by: Option<Uuid>,
+    /// The id the history was asked for.
+    pub current: bool,
+    /// Audit trail of the entry's supersession (or retraction): when, by whom, why.
+    #[serde(default)]
+    pub ended_at: Option<DateTime<Utc>>,
+    #[serde(default)]
+    pub ended_by: Option<String>,
+    #[serde(default)]
+    pub reason: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub run_id: Option<Uuid>,
+}
+
+/// `GET /v1/memories/{id}/history`: the chain oldest to newest, the asked-for id included.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct HistoryResponse {
+    pub id: Uuid,
+    pub table: MemoryTable,
+    pub entries: Vec<HistoryEntry>,
 }
 
 // ---------- explicit writes ----------

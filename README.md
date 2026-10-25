@@ -149,7 +149,9 @@ there). Open it, paste a device token (`make token`, or the one in `~/.memory/co
 - browse and search observations, summaries, facts and procedures, filtered by kind, project, type and period,
   with live updates as new memories arrive (`/` focuses the search box, `j`/`k` step through the list);
 - open any memory to read it in full, see where it came from (session, device, extractor, the observations a
-  fact rests on, the audit history) and what was recorded around it;
+  fact rests on, the audit log) and what was recorded around it; for a fact or procedure, the chain of versions
+  it replaced and was replaced by, each one a click away;
+- pick an "As of" day to see memory as it was then (facts and procedures included);
 - forget a memory, with a reason that goes to the audit log;
 - read the open work lists per project;
 - with an admin token: see the server's health checks (the same as `memvault admin doctor`), list and revoke

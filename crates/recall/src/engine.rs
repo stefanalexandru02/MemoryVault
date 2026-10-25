@@ -15,9 +15,9 @@ use memvault_core::db::caps;
 use memvault_core::ids::new_id;
 use memvault_core::schemas::common::{MemoryTable, Scope, ScopeKind, Sensitivity, SummaryGrain};
 use memvault_core::schemas::memories::{
-    AuditEntry, ByFileQuery, EntityRef, EvidenceObservation, ExplainResponse, FactFull, GetResponse, IndexRow,
-    MAX_GET_IDS, MemoryItem, ObservationFull, ProcedureFull, ProcedureStatus, Provenance, SearchQuery, SearchResponse,
-    SessionInfo, SummaryFull, TimelineQuery, TimelineResponse,
+    AuditEntry, ByFileQuery, EntityRef, EvidenceObservation, ExplainResponse, FactFull, GetResponse, HistoryEntry,
+    HistoryResponse, IndexRow, MAX_GET_IDS, MemoryItem, ObservationFull, ProcedureFull, ProcedureStatus, Provenance,
+    SearchQuery, SearchResponse, SessionInfo, SummaryFull, TimelineQuery, TimelineResponse,
 };
 use memvault_core::schemas::recall::{
     Budgets, FactItem, FeedbackRequest, FeedbackResponse, ObservationItem, ProcedureItem, ProfileSlot, RecallFormat,
@@ -108,6 +108,8 @@ pub struct PackOptions {
     /// SessionStart: no query, pinned facts only, subagent observations hidden, session summaries
     /// only (at most [`CONTEXT_SUMMARIES`]), at most [`CONTEXT_OBS_ROWS`] index rows.
     pub context: bool,
+    /// Rank and filter as of this instant instead of now.
+    pub as_of: Option<DateTime<Utc>>,
 }
 
 pub const CONTEXT_OBS_ROWS: usize = 30;
@@ -196,7 +198,7 @@ pub async fn build_pack(
     scopes: &[Scope],
     opts: &PackOptions,
 ) -> Result<Pack, ApiError> {
-    let now = Utc::now();
+    let now = opts.as_of.unwrap_or_else(Utc::now);
     let budgets = opts.budgets;
     let query = opts.query.as_deref().map(str::trim).filter(|q| !q.is_empty());
     let qvec = match query {
@@ -217,6 +219,7 @@ pub async fn build_pack(
         exclude_sensitivity: opts.exclude_sensitivity.clone(),
         summary_grains: Some(if opts.context { vec![SummaryGrain::Session] } else { RECALL_SUMMARY_GRAINS.to_vec() }),
         exclude_subagent: opts.context,
+        as_of: opts.as_of,
         ..Filters::default()
     };
 
@@ -340,7 +343,8 @@ pub async fn build_pack(
     slots.summaries = summaries;
     by_slot.insert("summaries".into(), used);
 
-    if budgets.work_state > 0 {
+    // Work state has no history, so a recall of the past leaves it out.
+    if budgets.work_state > 0 && opts.as_of.is_none() {
         let lists = fold_work_state(conn, spaces, scopes).await?;
         let (lists, used) = budget_fill(lists, budgets.work_state, |w| w.token_estimate);
         slots.work_state = lists;
@@ -415,16 +419,21 @@ async fn profile_slot(
     }
     let kinds: Vec<ScopeKind> = scopes.iter().map(|s| s.kind).collect();
     let keys: Vec<String> = scopes.iter().map(|s| s.key.clone()).collect();
-    let mut rows: Vec<(Uuid, ScopeKind, String, String)> = sqlx::query_as(
-        "SELECT space_id, scope_kind, scope_key, body_md FROM profiles
-          WHERE space_id = ANY($1)
-            AND (scope_kind, scope_key) IN (SELECT * FROM unnest($2::scope_kind[], $3::text[]))",
-    )
-    .bind(spaces.to_vec())
-    .bind(kinds)
-    .bind(keys)
-    .fetch_all(&mut *conn)
-    .await?;
+    // Rendered profiles describe the present; a past instant is rebuilt from the facts valid then.
+    let mut rows: Vec<(Uuid, ScopeKind, String, String)> = if opts.as_of.is_some() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT space_id, scope_kind, scope_key, body_md FROM profiles
+              WHERE space_id = ANY($1)
+                AND (scope_kind, scope_key) IN (SELECT * FROM unnest($2::scope_kind[], $3::text[]))",
+        )
+        .bind(spaces.to_vec())
+        .bind(kinds)
+        .bind(keys)
+        .fetch_all(&mut *conn)
+        .await?
+    };
     if !rows.is_empty() {
         let pos = |r: &(Uuid, ScopeKind, String, String)| {
             let scope = Scope::new(r.1, r.2.clone());
@@ -467,6 +476,7 @@ async fn profile_slot(
         spaces: spaces.to_vec(),
         scopes: Some(scopes.to_vec()),
         exclude_sensitivity: opts.exclude_sensitivity.clone(),
+        as_of: opts.as_of,
         ..Filters::default()
     };
     let ids = recent_leg(conn, MemoryTable::Facts, &f, PINNED_LIMIT, 0).await?;
@@ -729,6 +739,7 @@ pub async fn recall(state: &AppState, identity: &Identity, req: RecallRequest) -
         rerank: req.rerank,
         exclude_sensitivity: req.exclude_sensitivity.clone(),
         context: false,
+        as_of: req.as_of,
     };
     let pack = build_pack(state, &mut tx, &spaces, &scopes, &opts).await?;
     let rendered = (req.format != RecallFormat::Json).then(|| render::recall_markdown(&pack.slots));
@@ -875,9 +886,10 @@ pub async fn search(state: &AppState, identity: &Identity, query: SearchQuery) -
         since: query.since,
         until: query.until,
         files: query.files.clone(),
+        as_of: query.as_of,
         ..Filters::default()
     };
-    let now = Utc::now();
+    let now = query.as_of.unwrap_or_else(Utc::now);
     // (sort key, row): score descending or newest first, then id.
     let mut rows: Vec<((f64, Uuid), IndexRow)> = Vec::new();
     match query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
@@ -1375,4 +1387,133 @@ pub async fn explain(state: &AppState, identity: &Identity, id: Uuid) -> Result<
         })
         .collect();
     Ok(ExplainResponse { id, table: item.table(), item, provenance: prov, evidence, audit })
+}
+
+// ---------- history ----------
+
+/// Links followed from the asked-for memory in each direction.
+const HISTORY_DEPTH: i32 = 50;
+
+/// When a chain entry started to hold: a fact's `valid_from` (else `first_seen_at`), otherwise `created_at`.
+fn history_started(row: &TierRow) -> DateTime<Utc> {
+    match row {
+        TierRow::Obs(r) => r.created_at,
+        TierRow::Sum(r) => r.created_at,
+        TierRow::Fact(r) => r.valid_from.unwrap_or(r.first_seen_at),
+        TierRow::Proc(r) => r.created_at,
+    }
+}
+
+fn history_entry(row: &TierRow, current: bool) -> HistoryEntry {
+    let (table, status, text, valid_from, valid_to, supersedes_id, superseded_by) = match row {
+        TierRow::Obs(r) => {
+            let status = if r.archived_at.is_some() { "archived" } else { "active" };
+            (
+                MemoryTable::Observations,
+                status.to_string(),
+                None,
+                Some(r.created_at),
+                r.archived_at,
+                None,
+                r.superseded_by,
+            )
+        }
+        TierRow::Sum(r) => (MemoryTable::Summaries, "active".to_string(), None, Some(r.created_at), None, None, None),
+        TierRow::Fact(r) => {
+            (MemoryTable::Facts, r.status.to_string(), None, r.valid_from, r.valid_to, r.supersedes_id, r.superseded_by)
+        }
+        TierRow::Proc(r) => {
+            let text = format!("{} (v{}): {}", r.name, r.version, render::excerpt(&r.body_md, 160));
+            (MemoryTable::Procedures, r.status.clone(), Some(text), Some(r.created_at), None, r.supersedes_id, None)
+        }
+    };
+    HistoryEntry {
+        id: row.id(),
+        table,
+        text: text.unwrap_or_else(|| index_row(row, None, false).title),
+        status,
+        valid_from,
+        valid_to,
+        supersedes_id,
+        superseded_by,
+        current,
+        ended_at: None,
+        ended_by: None,
+        reason: None,
+        model: None,
+        run_id: None,
+    }
+}
+
+/// Ids of the supersession chain through `id`: its ancestors by `supersedes_id`, its descendants, itself.
+async fn chain_ids(conn: &mut PgConnection, table: MemoryTable, id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+    let t = table.as_str();
+    sqlx::query_scalar(&format!(
+        "WITH RECURSIVE up(id, depth) AS (
+           SELECT id, 0 FROM {t} WHERE id = $1
+           UNION
+           SELECT p.supersedes_id, up.depth + 1 FROM up JOIN {t} p ON p.id = up.id
+            WHERE p.supersedes_id IS NOT NULL AND up.depth < $2),
+         down(id, depth) AS (
+           SELECT id, 0 FROM {t} WHERE id = $1
+           UNION
+           SELECT n.id, down.depth + 1 FROM down JOIN {t} n ON n.supersedes_id = down.id WHERE down.depth < $2)
+         SELECT id FROM {t} WHERE id IN (SELECT id FROM up UNION SELECT id FROM down)"
+    ))
+    .bind(id)
+    .bind(HISTORY_DEPTH)
+    .fetch_all(conn)
+    .await
+}
+
+/// `GET /v1/memories/{id}/history`: the supersession chain through `id`, oldest first, with who ended
+/// each link and why where the audit trail knows. Facts and procedures chain; an observation or a
+/// summary is a chain of one. Other secret rows in the chain are left out.
+pub async fn history(state: &AppState, identity: &Identity, id: Uuid) -> Result<HistoryResponse, ApiError> {
+    let mut tx = user_tx(&state.db.app, identity).await?;
+    let table =
+        load_items(&mut tx, &[id]).await?.remove(&id).ok_or_else(|| ApiError::not_found("memory not found"))?.table();
+    let ids = match table {
+        MemoryTable::Facts | MemoryTable::Procedures => chain_ids(&mut tx, table, id).await?,
+        MemoryTable::Observations | MemoryTable::Summaries => vec![id],
+    };
+    let mut rows: Vec<TierRow> = hydrate(&mut tx, table, &ids)
+        .await?
+        .into_values()
+        .filter(|row| {
+            let secret = match row {
+                TierRow::Obs(r) => r.sensitivity == Sensitivity::Secret,
+                TierRow::Fact(r) => r.sensitivity == Sensitivity::Secret,
+                TierRow::Sum(_) | TierRow::Proc(_) => false,
+            };
+            row.id() == id || !secret
+        })
+        .collect();
+    rows.sort_by_key(|row| (history_started(row), row.id()));
+    type EndRow = (Uuid, String, Option<String>, Option<String>, Option<Uuid>, DateTime<Utc>);
+    let ends: Vec<EndRow> = sqlx::query_as(
+        "SELECT DISTINCT ON (target_id) target_id, actor, reason, model, run_id, created_at
+           FROM memory_audit
+          WHERE target_table = $1 AND target_id = ANY($2) AND action IN ('fact.supersede', 'fact.retract', 'proc.retire')
+          ORDER BY target_id, created_at DESC, id DESC",
+    )
+    .bind(table)
+    .bind(&ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let mut ends: HashMap<Uuid, EndRow> = ends.into_iter().map(|e| (e.0, e)).collect();
+    let mut entries: Vec<HistoryEntry> = rows.iter().map(|row| history_entry(row, row.id() == id)).collect();
+    let successors: HashMap<Uuid, Uuid> = entries.iter().filter_map(|e| e.supersedes_id.map(|p| (p, e.id))).collect();
+    for e in &mut entries {
+        e.superseded_by = e.superseded_by.or_else(|| successors.get(&e.id).copied());
+        if !matches!(e.status.as_str(), "superseded" | "retracted" | "retired") {
+            continue;
+        }
+        if let Some((_, actor, reason, model, run_id, at)) = ends.remove(&e.id) {
+            e.valid_to = e.valid_to.or(Some(at));
+            (e.ended_at, e.ended_by, e.reason, e.model, e.run_id) = (Some(at), Some(actor), reason, model, run_id);
+        }
+    }
+    Ok(HistoryResponse { id, table, entries })
 }

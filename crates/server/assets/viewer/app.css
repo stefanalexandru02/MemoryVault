@@ -171,6 +171,13 @@ h1, h2, h3, h4 { margin: 0; line-height: 1.25; }
 .chips-line { display: flex; gap: 6px; flex-wrap: wrap; }
 .mini { background: var(--panel-2); border: 1px solid var(--line); border-radius: 6px; padding: 1px 8px; font-size: 12.5px; overflow-wrap: anywhere; }
 button.mini { cursor: pointer; } button.mini:hover { border-color: var(--accent); }
+.history { list-style: none; margin: 0; padding: 0; display: grid; gap: 8px; }
+.history li { border: 1px solid var(--line); border-radius: 8px; padding: 8px 12px; display: grid; gap: 4px; background: var(--bg); }
+.history li.current { border-color: var(--accent); background: var(--panel-2); }
+.hist-text { font-weight: 600; overflow-wrap: anywhere; }
+.hist-link { background: none; border: 0; padding: 0; color: var(--accent); cursor: pointer; font: inherit; text-align: left; overflow-wrap: anywhere; }
+.hist-link:hover { text-decoration: underline; }
+.asof { display: flex; gap: 6px; align-items: center; }
 .fact-line { font-size: 17px; overflow-wrap: anywhere; }
 .fact-line code { background: var(--panel-2); padding: 1px 6px; border-radius: 6px; }
 .bar { height: 6px; background: var(--panel-2); border-radius: 999px; overflow: hidden; width: 120px; display: inline-block; vertical-align: middle; }

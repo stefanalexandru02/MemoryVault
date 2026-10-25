@@ -176,6 +176,12 @@ fn api_models() {
     assert_eq!(q.scopes.unwrap()[1], "project:github.com/a/b".parse::<Scope>().unwrap());
     let q: SearchQuery = serde_urlencoded::from_str("q=x&limit=500").unwrap();
     assert!(q.validate().is_err());
+    let q: SearchQuery = serde_urlencoded::from_str("as_of=2026-10-01T12:00:00Z").unwrap();
+    q.validate().unwrap();
+    assert_eq!(q.as_of.unwrap().to_rfc3339(), "2026-10-01T12:00:00+00:00");
+    assert!(serde_urlencoded::from_str::<SearchQuery>("q=x&as_of=last-tuesday").is_err());
+    let req: RecallRequest = serde_json::from_value(json!({"as_of": "2026-10-01T12:00:00Z"})).unwrap();
+    assert!(req.as_of.is_some());
 
     assert!(GetRequest { ids: vec![] }.validate().is_err());
     assert!(GetRequest { ids: vec![uuid::Uuid::nil(); 21] }.validate().is_err());

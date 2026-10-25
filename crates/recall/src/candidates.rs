@@ -116,11 +116,57 @@ pub struct Filters {
     pub exclude_subagent: bool,
     /// Facts: pinned only.
     pub pinned_only: bool,
+    /// Point in time: rows valid then replace the live rows (see [`push_live`]).
+    pub as_of: Option<DateTime<Utc>>,
+}
+
+/// Retirement time of a procedure: the audited `proc.retire`, else when its successor was created.
+const PROCEDURE_ENDED_AT: &str = "coalesce(
+    (SELECT max(a.created_at) FROM memory_audit a
+      WHERE a.target_table = 'procedures' AND a.target_id = t.id AND a.action = 'proc.retire'),
+    (SELECT min(n.created_at) FROM procedures n WHERE n.supersedes_id = t.id))";
+
+/// Rows that may be shown: the live ones, or with `as_of` the ones that were valid at that instant.
+/// A fact counts from `valid_from` (else `first_seen_at`) until `valid_to`; candidates and merged
+/// duplicates (superseded without an end) never held. A procedure counts from `created_at` until
+/// it was retired. Observations and summaries count from `created_at`, observations until archived.
+fn push_live(qb: &mut QueryBuilder<'_, Postgres>, table: MemoryTable, as_of: Option<DateTime<Utc>>) {
+    let Some(at) = as_of else {
+        qb.push(spec(table).live);
+        return;
+    };
+    match table {
+        MemoryTable::Observations => {
+            qb.push("t.created_at <= ").push_bind(at).push(" AND (t.archived_at IS NULL OR t.archived_at > ");
+            qb.push_bind(at).push(")");
+        }
+        MemoryTable::Summaries => {
+            qb.push("t.created_at <= ").push_bind(at);
+        }
+        MemoryTable::Facts => {
+            qb.push(
+                "t.status <> 'candidate' AND NOT (t.status = 'superseded' AND t.valid_to IS NULL) \
+                 AND coalesce(t.valid_from, t.first_seen_at) <= ",
+            )
+            .push_bind(at)
+            .push(" AND (t.valid_to IS NULL OR t.valid_to > ")
+            .push_bind(at)
+            .push(")");
+        }
+        MemoryTable::Procedures => {
+            qb.push("t.created_at <= ")
+                .push_bind(at)
+                .push(format_args!(" AND (t.status = 'active' OR {PROCEDURE_ENDED_AT} > "))
+                .push_bind(at)
+                .push(")");
+        }
+    }
 }
 
 fn push_where(qb: &mut QueryBuilder<'_, Postgres>, table: MemoryTable, f: &Filters) {
     let s = spec(table);
-    qb.push("t.space_id = ANY(").push_bind(f.spaces.clone()).push(") AND ").push(s.live);
+    qb.push("t.space_id = ANY(").push_bind(f.spaces.clone()).push(") AND ");
+    push_live(qb, table, f.as_of);
     if let Some(scopes) = &f.scopes {
         let kinds: Vec<ScopeKind> = scopes.iter().map(|s| s.kind).collect();
         let keys: Vec<String> = scopes.iter().map(|s| s.key.clone()).collect();
@@ -232,7 +278,12 @@ pub async fn vector_leg(
         .push(") AND ");
     push_where(&mut qb, table, f);
     if let Some(days) = s.vector_window_days.filter(|_| windows) {
-        qb.push(format_args!(" AND t.{} > now() - make_interval(days => ", s.time_col)).push_bind(days).push(")");
+        qb.push(format_args!(" AND t.{} > ", s.time_col));
+        match f.as_of {
+            Some(at) => qb.push_bind(at),
+            None => qb.push("now()"),
+        };
+        qb.push(" - make_interval(days => ").push_bind(days).push(")");
     }
     qb.push(" ORDER BY d LIMIT ")
         .push_bind(limit * VECTOR_PART_FANOUT)

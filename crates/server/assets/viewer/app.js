@@ -72,7 +72,7 @@
     admin: false,
     health: null,
     projects: new Map(), // key -> count seen
-    filters: { q: '', tables: new Set(['observations', 'summaries', 'facts', 'procedures']), project: '', type: '', period: '30d' },
+    filters: { q: '', tables: new Set(['observations', 'summaries', 'facts', 'procedures']), project: '', type: '', period: '30d', asOf: '' },
     rows: [],
     offset: 0,
     hasMore: false,
@@ -252,11 +252,17 @@
   const PERIODS = [['24h', 'Last 24 hours'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['90d', 'Last 90 days'], ['all', 'All time']];
   let $list, $detail, $panes, $memory, $count, searchTimer;
 
-  function sinceFor(period) {
+  // The picked day (YYYY-MM-DD, local) counts up to its last millisecond.
+  function asOfTime(day) {
+    const [y, m, d] = day.split('-').map(Number);
+    return new Date(y, m - 1, d + 1).getTime() - 1;
+  }
+
+  function sinceFor(period, base) {
     if (period === 'all') return '2000-01-01T00:00:00Z';
     const n = parseInt(period, 10);
     const unit = period.endsWith('h') ? HOUR : DAY;
-    return new Date(Date.now() - n * unit).toISOString();
+    return new Date(base - n * unit).toISOString();
   }
 
   function searchParams(offset) {
@@ -267,7 +273,9 @@
     if (f.project === '__global') p.set('scopes', 'global');
     else if (f.project) p.set('scopes', `project:${f.project}`);
     if (f.type) p.set('types', f.type);
-    p.set('since', sinceFor(f.period));
+    const base = f.asOf ? asOfTime(f.asOf) : Date.now();
+    p.set('since', sinceFor(f.period, base));
+    if (f.asOf) p.set('as_of', new Date(base).toISOString());
     p.set('limit', String(PAGE));
     p.set('offset', String(offset));
     return p;
@@ -303,6 +311,16 @@
     const periodSel = h('select', { class: 'input', id: 'period', onchange: (e) => { f.period = e.target.value; load(true); } },
       PERIODS.map(([v, l]) => h('option', { value: v, text: l })));
     periodSel.value = f.period;
+    const today = new Date();
+    const asOfInput = h('input', {
+      class: 'input', type: 'date', id: 'asof', value: f.asOf, 'aria-label': 'Show memory as it was on this day',
+      max: `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`,
+      onchange: (e) => { f.asOf = e.target.value; nowBtn.hidden = !f.asOf; load(true); },
+    });
+    const nowBtn = h('button', {
+      class: 'mini', type: 'button', text: 'Now', hidden: !f.asOf, title: 'Back to the present',
+      onclick: () => { f.asOf = ''; asOfInput.value = ''; nowBtn.hidden = true; load(true); },
+    });
     const live = h('input', { type: 'checkbox', id: 'live', onchange: (e) => { state.live = e.target.checked; } });
     live.checked = state.live;
     $count = h('span', { class: 'muted' });
@@ -317,6 +335,7 @@
         h('label', { class: 'field' }, h('span', { text: 'Project' }), projectSel),
         h('label', { class: 'field' }, h('span', { text: 'Type' }), typeSel),
         h('label', { class: 'field' }, h('span', { text: 'Period' }), periodSel),
+        h('div', { class: 'field' }, h('span', { text: 'As of' }), h('div', { class: 'asof' }, asOfInput, nowBtn)),
         h('label', { class: 'check' }, live, 'Live'),
         $count),
       $panes);
@@ -343,7 +362,7 @@
     const f = state.filters;
     if (reset) { state.offset = 0; state.rows = []; }
     state.loading = true;
-    const myQuery = JSON.stringify([f.q, [...f.tables], f.project, f.type, f.period]);
+    const myQuery = JSON.stringify([f.q, [...f.tables], f.project, f.type, f.period, f.asOf]);
     state.lastQuery = myQuery;
     renderList({ loading: true });
     try {
@@ -364,7 +383,7 @@
   // Live updates: fetch the newest page and add rows that are not shown yet.
   async function pollNew() {
     const f = state.filters;
-    if (f.q.trim() || state.loading || !$list) return;
+    if (f.q.trim() || f.asOf || state.loading || !$list) return;
     try {
       const res = await api(`/v1/search?${searchParams(0)}`);
       const have = new Set(state.rows.map((r) => r.id));
@@ -392,7 +411,7 @@
     const nodes = [];
     if (error) nodes.push(h('div', { class: 'empty error', role: 'alert', text: error }));
     else if (!rows.length && loading) nodes.push(h('div', { class: 'empty', text: 'Loading…' }));
-    else if (!rows.length) nodes.push(h('div', { class: 'empty', text: state.filters.q.trim() ? 'Nothing matches that search.' : 'No memories in this period yet.' }));
+    else if (!rows.length) nodes.push(h('div', { class: 'empty', text: state.filters.q.trim() ? 'Nothing matches that search.' : state.filters.asOf ? 'Nothing was in memory in this period as of that day.' : 'No memories in this period yet.' }));
     let lastDay = '';
     const ranked = state.filters.q.trim() !== '';
     for (const r of rows) {
@@ -519,6 +538,8 @@
     }
 
     const around = h('div', { class: 'section', hidden: true });
+    const versions = item.table === 'facts' || item.table === 'procedures'
+      ? h('div', { class: 'section' }, h('h3', { text: 'History' }), h('div', { class: 'muted', text: 'Loading…' })) : null;
     const why = h('div', { class: 'section' }, h('h3', { text: 'Where this came from' }), h('div', { class: 'muted', text: 'Loading…' }));
     const canTimeline = item.table === 'observations' || item.table === 'summaries';
     const actions = h('div', { class: 'actions' },
@@ -527,8 +548,27 @@
       h('button', { class: 'btn small', onclick: () => { navigator.clipboard?.writeText(item.id).then(() => toast('Id copied'), () => toast(item.id)); } }, 'Copy id'),
       h('button', { class: 'btn small danger', onclick: () => confirmForget(item) }, 'Forget…'));
     const idLine = h('div', { class: 'muted', title: item.id }, h('code', { text: item.id }));
-    $detail.replaceChildren(h('div', { class: 'detail-inner' }, actions, head, ...body, around, why, idLine));
+    $detail.replaceChildren(h('div', { class: 'detail-inner' }, actions, head, ...body, versions, around, why, idLine));
+    if (versions) loadHistory(item.id, versions);
     loadExplain(item.id, why);
+  }
+
+  // The chain of versions a fact or procedure went through, oldest first; the one on screen is marked.
+  async function loadHistory(id, box) {
+    const title = h('h3', { text: 'History' });
+    try {
+      const res = await api(`/v1/memories/${id}/history`);
+      if (!state.selected || state.selected.id !== id) return;
+      const entries = res.entries || [];
+      if (entries.length < 2) { box.replaceChildren(title, h('div', { class: 'muted', text: 'This is the only version so far.' })); return; }
+      box.replaceChildren(title, h('ol', { class: 'history' }, entries.map((e) => h('li', { class: e.current ? 'current' : '', 'aria-current': e.current ? 'true' : false },
+        e.current ? h('div', { class: 'hist-text', text: e.text })
+          : h('button', { class: 'hist-link', type: 'button', onclick: () => openMemory(e.id, e.table), text: e.text }),
+        kv([['status', e.status], ['from', e.valid_from ? fullTime(e.valid_from) : ''], ['until', e.valid_to ? fullTime(e.valid_to) : (e.status === 'active' ? 'now' : '')],
+          ['ended by', e.ended_by], ['why', e.reason], ['model', e.model]])))));
+    } catch (e) {
+      if (e.status !== 401) box.replaceChildren(title, h('div', { class: 'muted', text: e.message }));
+    }
   }
 
   async function showTimeline(id, box) {
@@ -567,7 +607,7 @@
       }
       if (!ex.provenance && !(ex.evidence && ex.evidence.length)) parts.push(h('div', { class: 'muted', text: 'No source observations are linked to this one.' }));
       if (ex.audit && ex.audit.length) {
-        parts.push(h('h3', { text: 'History' }));
+        parts.push(h('h3', { text: 'Audit log' }));
         parts.push(h('div', { class: 'scroll-x' }, h('table', { class: 't' },
           h('thead', {}, h('tr', {}, ['When', 'Who', 'What', 'Why'].map((c) => h('th', { text: c })))),
           h('tbody', {}, ex.audit.map((a) => h('tr', {}, h('td', { text: fullTime(a.created_at) }), h('td', { text: a.actor }), h('td', { text: a.action }), h('td', { text: [a.reason, a.model].filter(Boolean).join(' · ') })))))));

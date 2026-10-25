@@ -28,7 +28,7 @@ use memvault_core::{ApiError, AppState, Identity, require_scope};
 use uuid::Uuid;
 
 /// Routes under `/v1` (paths without the prefix): recall, context, search, timeline, memories/get,
-/// explain, observations/by-file, feedback.
+/// explain, history, observations/by-file, feedback.
 pub fn router() -> Router<AppState> {
     Router::new()
         .route("/recall", post(recall))
@@ -38,6 +38,7 @@ pub fn router() -> Router<AppState> {
         .route("/timeline", get(timeline))
         .route("/memories/get", post(get_memories))
         .route("/memories/{id}/explain", get(explain))
+        .route("/memories/{id}/history", get(history))
         .route("/observations/by-file", get(by_file))
 }
 
@@ -126,6 +127,15 @@ async fn explain(
 ) -> Result<impl IntoResponse, ApiError> {
     require_scope(&state, &identity, MEMORIES_READ).await?;
     Ok(Json(engine::explain(&state, &identity, id).await?))
+}
+
+async fn history(
+    State(state): State<AppState>,
+    identity: Identity,
+    Path(id): Path<Uuid>,
+) -> Result<impl IntoResponse, ApiError> {
+    require_scope(&state, &identity, MEMORIES_READ).await?;
+    Ok(Json(engine::history(&state, &identity, id).await?))
 }
 
 async fn by_file(
