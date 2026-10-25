@@ -468,7 +468,7 @@
       const item = (res.items || [])[0];
       if (!item) { $detail.replaceChildren(h('div', { class: 'empty', text: 'That memory is gone, or you cannot see it.' })); return; }
       state.selected.table = item.table;
-      renderItem(item);
+      renderItem(item, (res.feedback || {})[item.id]);
     } catch (e) {
       if (e.status !== 401) $detail.replaceChildren(h('div', { class: 'empty error', role: 'alert', text: e.message }));
     }
@@ -488,7 +488,7 @@
     load(true);
   }
 
-  function renderItem(item) {
+  function renderItem(item, feedback) {
     const body = [];
     let head;
     if (item.table === 'observations') {
@@ -519,6 +519,7 @@
       head = h('div', { class: 'detail-head' },
         h('div', {}, h('span', { class: 'tag t-fact', text: 'fact' }), ' ', h('span', { class: 'mini', text: item.status }),
           item.conflict ? h('span', { class: 'mini warn', text: 'conflict' }) : null,
+          item.caution ? h('span', { class: 'mini warn', text: item.caution }) : null,
           item.pinned ? h('span', { class: 'mini', text: ' pinned' }) : null),
         h('h2', { class: 'fact-line' }, `${item.subject.canonical_name} `, h('code', { text: item.predicate }), ' = ', item.value_text),
         kv([['scope', scopeLabel(item.scope)], ['first seen', fullTime(item.first_seen_at)], ['last confirmed', fullTime(item.last_confirmed_at)],
@@ -537,6 +538,8 @@
       body.push(section('Steps', h('div', { class: 'pre', text: item.body_md })));
     }
 
+    if (item.table !== 'summaries') body.push(feedbackSection(item, feedback || {}));
+
     const around = h('div', { class: 'section', hidden: true });
     const versions = item.table === 'facts' || item.table === 'procedures'
       ? h('div', { class: 'section' }, h('h3', { text: 'History' }), h('div', { class: 'muted', text: 'Loading…' })) : null;
@@ -551,6 +554,25 @@
     $detail.replaceChildren(h('div', { class: 'detail-inner' }, actions, head, ...body, versions, around, why, idLine));
     if (versions) loadHistory(item.id, versions);
     loadExplain(item.id, why);
+  }
+
+  // helpful / wrong / outdated on a memory, with how many were given. A verdict counts once per user; a
+  // fact with enough negative ones is queued for the consolidation planner, which retracts it (undoable).
+  const VERDICTS = [['helpful', 'Helpful'], ['wrong', 'Wrong'], ['outdated', 'Outdated']];
+  function feedbackSection(item, counts) {
+    const note = h('input', { class: 'input', type: 'text', maxlength: '500', placeholder: 'Optional note, kept with the verdict', 'aria-label': 'Feedback note' });
+    async function send(verdict) {
+      try {
+        const res = await api(`/v1/memories/${item.id}/feedback`, { method: 'POST', body: { verdict, note: note.value.trim() || undefined } });
+        toast(res.applied ? (res.queued ? 'Noted. It is queued for review.' : 'Noted.') : `You already marked this ${verdict}.`);
+        if (res.applied && state.selected && state.selected.id === item.id) openMemory(item.id, item.table, { fromHash: true });
+      } catch (e) { if (e.status !== 401) toast(e.message, true); }
+    }
+    return h('div', { class: 'section' }, h('h3', { text: 'Was this right?' }),
+      h('div', { class: 'actions' }, VERDICTS.map(([verdict, label]) =>
+        h('button', { class: `btn small verdict ${verdict}`, type: 'button', onclick: () => send(verdict) },
+          label, h('span', { class: 'count', text: String(counts[verdict] || 0) })))),
+      note);
   }
 
   // The chain of versions a fact or procedure went through, oldest first; the one on screen is marked.

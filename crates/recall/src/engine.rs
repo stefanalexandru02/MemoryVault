@@ -15,9 +15,10 @@ use memvault_core::db::caps;
 use memvault_core::ids::new_id;
 use memvault_core::schemas::common::{MemoryTable, Scope, ScopeKind, Sensitivity, SummaryGrain};
 use memvault_core::schemas::memories::{
-    AuditEntry, ByFileQuery, EntityRef, EvidenceObservation, ExplainResponse, FactFull, GetResponse, HistoryEntry,
-    HistoryResponse, IndexRow, MAX_GET_IDS, MemoryItem, ObservationFull, ProcedureFull, ProcedureStatus, Provenance,
-    SearchQuery, SearchResponse, SessionInfo, SummaryFull, TimelineQuery, TimelineResponse,
+    AuditEntry, ByFileQuery, EntityRef, EvidenceObservation, ExplainResponse, FactFull, FeedbackCounts, GetResponse,
+    HistoryEntry, HistoryResponse, IndexRow, MAX_GET_IDS, MemoryItem, ObservationFull, ProcedureFull, ProcedureStatus,
+    Provenance, SearchQuery, SearchResponse, SessionInfo, SummaryFull, TimelineQuery, TimelineResponse,
+    procedure_caution,
 };
 use memvault_core::schemas::recall::{
     Budgets, FactItem, FeedbackRequest, FeedbackResponse, ObservationItem, ProcedureItem, ProfileSlot, RecallFormat,
@@ -580,7 +581,8 @@ fn slot_item(c: &Candidate, row: &TierRow, token_estimate: i32, citation: String
 fn fact_item(c: &Candidate) -> Option<FactItem> {
     let row @ TierRow::Fact(r) = c.row.as_ref()? else { return None };
     let confidence = f64::from(r.confidence);
-    let citation = render::fact_tag(&r.id, confidence, &r.devices, Some(r.first_seen_at));
+    let citation =
+        render::fact_tag(&r.id, confidence, &r.devices, Some(r.first_seen_at), r.caution(Utc::now()).as_deref());
     Some(FactItem {
         item: slot_item(c, row, estimate_tokens(&r.value_text), citation),
         subject: r.subject_name.clone(),
@@ -601,7 +603,17 @@ fn procedure_item(c: &Candidate) -> Option<ProcedureItem> {
     let row @ TierRow::Proc(r) = c.row.as_ref()? else { return None };
     let tokens = if r.token_estimate > 0 { r.token_estimate } else { estimate_tokens(&r.body_md) };
     Some(ProcedureItem {
-        item: slot_item(c, row, tokens, render::procedure_tag(&r.id, r.version, Some(r.created_at))),
+        item: slot_item(
+            c,
+            row,
+            tokens,
+            render::procedure_tag(
+                &r.id,
+                r.version,
+                Some(r.created_at),
+                procedure_caution(r.success_count, r.failure_count).as_deref(),
+            ),
+        ),
         name: r.name.clone(),
         task_class: r.task_class.clone(),
         trigger_text: r.trigger_text.clone(),
@@ -850,6 +862,11 @@ fn index_row(row: &TierRow, score: Option<f64>, anchor: bool) -> IndexRow {
             (MemoryTable::Procedures, r.task_class.clone(), r.name.clone(), r.created_at, tokens)
         }
     };
+    let caution = match row {
+        TierRow::Fact(r) => r.caution(Utc::now()),
+        TierRow::Proc(r) => procedure_caution(r.success_count, r.failure_count),
+        TierRow::Obs(_) | TierRow::Sum(_) => None,
+    };
     IndexRow {
         id: row.id(),
         table,
@@ -860,6 +877,7 @@ fn index_row(row: &TierRow, score: Option<f64>, anchor: bool) -> IndexRow {
         token_estimate: tokens,
         score: score.map(round6),
         is_anchor: anchor,
+        caution,
     }
 }
 
@@ -1076,34 +1094,38 @@ fn memory_item(row: TierRow) -> MemoryItem {
             token_estimate: r.token_estimate,
             created_at: r.created_at,
         }),
-        TierRow::Fact(r) => MemoryItem::Facts(FactFull {
-            id: r.id,
-            space_id: r.space_id,
-            scope: Scope::new(r.scope_kind, r.scope_key),
-            subject: EntityRef { id: r.subject_id, kind: r.subject_kind, canonical_name: r.subject_name },
-            predicate: r.predicate,
-            value: r.value,
-            value_text: r.value_text,
-            confidence: f64::from(r.confidence),
-            importance: f64::from(r.importance),
-            status: r.status,
-            conflict: r.conflict,
-            supersedes_id: r.supersedes_id,
-            superseded_by: r.superseded_by,
-            valid_from: r.valid_from,
-            valid_to: r.valid_to,
-            first_seen_at: r.first_seen_at,
-            last_confirmed_at: r.last_confirmed_at,
-            confirmations: r.confirmations,
-            evidence_observation_ids: r.evidence_observation_ids,
-            learned_on_client_ids: r.learned_on_client_ids,
-            access_count: r.access_count,
-            last_accessed_at: r.last_accessed_at,
-            pinned: r.pinned,
-            sensitivity: r.sensitivity,
-            written_by_client_id: r.written_by_client_id,
-            extracted_by: r.extracted_by,
-        }),
+        TierRow::Fact(r) => {
+            let caution = r.caution(Utc::now());
+            MemoryItem::Facts(FactFull {
+                id: r.id,
+                space_id: r.space_id,
+                scope: Scope::new(r.scope_kind, r.scope_key),
+                subject: EntityRef { id: r.subject_id, kind: r.subject_kind, canonical_name: r.subject_name },
+                predicate: r.predicate,
+                value: r.value,
+                value_text: r.value_text,
+                confidence: f64::from(r.confidence),
+                importance: f64::from(r.importance),
+                status: r.status,
+                conflict: r.conflict,
+                supersedes_id: r.supersedes_id,
+                superseded_by: r.superseded_by,
+                valid_from: r.valid_from,
+                valid_to: r.valid_to,
+                first_seen_at: r.first_seen_at,
+                last_confirmed_at: r.last_confirmed_at,
+                confirmations: r.confirmations,
+                evidence_observation_ids: r.evidence_observation_ids,
+                learned_on_client_ids: r.learned_on_client_ids,
+                access_count: r.access_count,
+                last_accessed_at: r.last_accessed_at,
+                pinned: r.pinned,
+                sensitivity: r.sensitivity,
+                written_by_client_id: r.written_by_client_id,
+                extracted_by: r.extracted_by,
+                caution,
+            })
+        }
         TierRow::Proc(r) => MemoryItem::Procedures(ProcedureFull {
             id: r.id,
             space_id: r.space_id,
@@ -1231,8 +1253,26 @@ pub async fn get_memories(state: &AppState, identity: &Identity, ids: &[Uuid]) -
     let items: Vec<MemoryItem> = wanted.iter().filter_map(|id| found.remove(id)).collect();
     let missing = wanted.iter().filter(|id| !items.iter().any(|i| i.id() == **id)).copied().collect();
     log_access(&mut tx, identity, "get", &items.iter().collect::<Vec<_>>()).await?;
+    let found_ids: Vec<Uuid> = items.iter().map(MemoryItem::id).collect();
+    let feedback = feedback_counts(&mut tx, &found_ids).await?;
     tx.commit().await?;
-    Ok(GetResponse { items, missing })
+    Ok(GetResponse { items, missing, feedback })
+}
+
+/// Verdicts given on each of `ids`, for the ones that have any (RLS bounds them to the caller's spaces).
+async fn feedback_counts(conn: &mut PgConnection, ids: &[Uuid]) -> Result<BTreeMap<Uuid, FeedbackCounts>, sqlx::Error> {
+    let rows: Vec<(Uuid, i64, i64, i64)> = sqlx::query_as(
+        "SELECT target_id, count(*) FILTER (WHERE verdict = 'helpful'), count(*) FILTER (WHERE verdict = 'wrong'),
+                count(*) FILTER (WHERE verdict = 'outdated')
+           FROM memory_feedback WHERE target_id = ANY($1) GROUP BY target_id",
+    )
+    .bind(ids)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, helpful, wrong, outdated)| (id, FeedbackCounts { helpful, wrong, outdated }))
+        .collect())
 }
 
 /// Map display refs (`obs#a1b2c3`, the 6-hex short id, or a full id) to visible row ids, for the

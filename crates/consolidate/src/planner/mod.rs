@@ -2,17 +2,19 @@
 //! transaction on the system role:
 //!
 //! 1. refresh `facts.learned_on_client_ids` from evidence (so packets carry current devices);
-//! 2. fact clusters -> `consolidate_facts` packets; lone old candidates are auto-activated;
-//! 3. decay and archival;
-//! 4. day and week summaries -> `consolidate_summary` packets;
-//! 5. procedure hints -> `consolidate_procedures` packets;
-//! 6. profile re-rendering.
+//! 2. facts disputed by feedback are retracted;
+//! 3. fact clusters -> `consolidate_facts` packets; lone old candidates are auto-activated;
+//! 4. decay and archival;
+//! 5. day and week summaries -> `consolidate_summary` packets;
+//! 6. procedure hints -> `consolidate_procedures` packets;
+//! 7. profile re-rendering.
 //!
 //! Everything written by one `run_planner` call shares a run id: code-only changes are audited with
 //! it, packets carry it in their inputs, and appliers audit with it (so a revert undoes the run).
 
 pub mod clusters;
 pub mod decay;
+pub mod feedback;
 mod housekeeping;
 mod procedures;
 mod summaries;
@@ -133,6 +135,7 @@ pub async fn plan_space(
     let ctx = AuditCtx::planner(space_id, run_id);
     let mut tally = Tally::default();
     tally.action("learned_on_refreshed", housekeeping::refresh_learned_on(conn, space_id).await?);
+    tally.action("feedback_retract", feedback::retract_disputed(conn, &ctx, now).await?);
     clusters::plan(conn, state, &ctx, now, &mut tally).await?;
     let (observations, facts) = decay::decay(conn, space_id, now).await?;
     tally.action("decay_observations", observations);

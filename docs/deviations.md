@@ -294,6 +294,23 @@ and repeated items are merged. The last section lists the gaps that are still op
 - **Bearer auth on /mcp.** An axum middleware checks the header with `authenticate_header`. It answers 401 in the spec
   error shape for every MCP method, including `initialize`. The identity reaches the tools through request
   extensions. Each tool call runs `require_scope` (`memories:read` or `memories:write`) and the rate limit.
+- **Memory feedback.** `POST /v1/memories/{id}/feedback` and the MCP `memory_feedback(id, verdict, note?)` (scope
+  `memories:write`, which the spec already lists for "feedback") record `helpful`, `wrong` or `outdated` on a fact,
+  observation or procedure in the append-only `memory_feedback` table (user, client, time, note; summaries take
+  none). One verdict per user and memory counts once, enforced by a unique index; a repeat answers `applied: false`.
+  Effects: a fact's confidence moves +0.05 (helpful, which also sets `last_confirmed_at`), -0.2 (wrong) or -0.1
+  (outdated), kept within 0.05 and 0.98, and pinned facts keep theirs; an observation's importance moves by the same
+  steps; a procedure counts a success or a failure. Each applied verdict is audited (`fact.feedback`, `obs.feedback`,
+  `proc.feedback`), drops the scope's profile row and signals the context cache. `POST /v1/recall/{id}/feedback`
+  (per retrieval) is unchanged.
+- **Dispute weights.** Net negative feedback is `2 x wrong + outdated - helpful`; at 2 an active, unpinned fact gets
+  `disputed_at` (cleared again when helpful verdicts bring it under). The numbers are a choice, not in the spec: a
+  single `wrong` queues a fact, a single `outdated` does not. Nothing is retracted by the request itself.
+- **Cautions.** A fact is shown as `disputed` when it is queued or its confidence is under 0.4, else as `unconfirmed N
+  months` when `last_confirmed_at` is 90 or more days old; a procedure that failed more than it worked is `disputed`.
+  The tag is the last part of the citation (`[fact#a91c2e · 0.83 · laptop · 2026-10-02 · unconfirmed 4 months]`),
+  appears after the title in index rows (`IndexRow.caution`, `FactFull.caution`) and in rendered profiles. Pinned facts
+  carry none. Scoring is unchanged: it already uses confidence, and facts still have no recency term.
 - **Tool errors.** Tool failures (bad arguments, 403, 404, scope errors) come back as `CallToolResult` with
   `isError`, and text `error (<code>): <message>`. They are not JSON-RPC errors, so the model can correct the call.
 - **Project inference.** The `X-Memory-Project` request header is used when present. Otherwise the project comes from
@@ -335,6 +352,13 @@ and repeated items are merged. The last section lists the gaps that are still op
   `decision` and `bugfix`, 30 days for other observation types (spec 11.4), and 365 days for facts. Floors are 0.0 for
   observations and 0.1 for facts. Pinned facts, and rows decayed in the last 6 h, are skipped. Observations have no
   access tracking, so their decay runs from creation. The "+0.1 on access" reset is not implemented.
+- **Disputed facts.** Step 2 of the planner (before the clusters) retracts the active, unpinned facts that feedback
+  queued (`facts.disputed_at`), in code, with the audit action `fact.retract` under the run id, so `revert_run`
+  restores them; the reason names the verdict counts and the feedback ids, because the evidence rule of packet
+  retractions (a cited observation) does not fit user feedback. The queue mark is cleared before the audited change,
+  so a revert does not queue the fact again. A fact whose key has a candidate waiting stays for the clusters, which
+  supersede it. Tally action: `feedback_retract`. Profile lines are tagged like citations, and `facts_version`
+  covers the dispute flag and the months since confirmation, so a stale or disputed fact re-renders its profile.
 - **Cluster skip.** A cluster is skipped while any of its facts is in a pending or leased `consolidate_facts` packet.
   The idempotency key is `consolidate_facts:<space>:<hash of the sorted ids>`. Revert releases the keys of the packets
   it cancels, so the planner can plan the cluster again.

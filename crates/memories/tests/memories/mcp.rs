@@ -127,6 +127,7 @@ async fn initialize_and_tools_list(pool: PgPool) {
             "memory_history",
             "memory_remember",
             "memory_forget",
+            "memory_feedback",
             "work_state_write"
         ]
     );
@@ -144,6 +145,8 @@ async fn initialize_and_tools_list(pool: PgPool) {
     assert_eq!(by_name("memory_search")["inputSchema"]["properties"]["limit"]["maximum"], 30);
     assert_eq!(by_name("memory_search")["inputSchema"]["properties"]["as_of"]["type"], "string");
     assert_eq!(by_name("memory_history")["inputSchema"]["required"], json!(["id"]));
+    assert_eq!(by_name("memory_feedback")["inputSchema"]["required"], json!(["id", "verdict"]));
+    assert_eq!(by_name("memory_feedback")["inputSchema"]["properties"]["verdict"]["enum"].as_array().unwrap().len(), 3);
     assert_eq!(by_name("memory_get")["inputSchema"]["properties"]["ids"]["maxItems"], 20);
     assert_eq!(by_name("memory_timeline")["inputSchema"]["properties"]["before"]["maximum"], 10);
 }
@@ -433,4 +436,44 @@ async fn get_truncates_long_bodies_to_the_cap(pool: PgPool) {
     assert!(text.chars().count() <= 24_000 + 20 * 100, "{} chars", text.chars().count());
     assert_eq!(text.matches("#### ").count(), 20, "every body is present, none dropped");
     assert!(text.contains("truncated"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn feedback_tool_records_a_verdict_once_and_explains_the_outcome(pool: PgPool) {
+    let w = world(pool).await;
+    let app = mcp_app(&w);
+    let alice = &w.alice;
+    let (_, fact) = call(
+        &app,
+        alice,
+        "memory_remember",
+        json!({"kind": "fact", "content": "neovim", "predicate": "prefers.editor", "scope": "global"}),
+    )
+    .await;
+    let id = id_in(&fact);
+
+    let (err, wrong) =
+        call(&app, alice, "memory_feedback", json!({"id": id, "verdict": "wrong", "note": "it is helix"})).await;
+    assert!(!err, "{wrong}");
+    assert!(wrong.starts_with(&format!("Recorded wrong on facts `{id}`.")), "{wrong}");
+    assert!(
+        wrong.contains("Confidence is now 0.75.") && wrong.contains("queued for the consolidation planner"),
+        "{wrong}"
+    );
+
+    // The short id from the context block works, and a repeat changes nothing.
+    let short = &id[id.len() - 6..];
+    let (err, again) = call(&app, alice, "memory_feedback", json!({"id": short, "verdict": "wrong"})).await;
+    assert!(!err && again.contains("already gave wrong"), "{again}");
+
+    // The result of memory_get carries the tag a model should read.
+    let (_, got) = call(&app, alice, "memory_get", json!({"ids": [id]})).await;
+    assert!(got.contains("· disputed]"), "{got}");
+    let (_, explained) = call(&app, alice, "memory_explain", json!({"id": id})).await;
+    assert!(explained.contains("fact.feedback") && explained.contains("wrong: it is helix"), "{explained}");
+
+    let (err, bad) = call(&app, alice, "memory_feedback", json!({"id": id, "verdict": "meh"})).await;
+    assert!(err && bad.contains("invalid arguments"), "{bad}");
+    let (err, missing) = call(&app, alice, "memory_feedback", json!({"id": "zzzz", "verdict": "helpful"})).await;
+    assert!(err && missing.contains("not_found"), "{missing}");
 }

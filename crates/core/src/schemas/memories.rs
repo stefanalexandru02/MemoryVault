@@ -1,12 +1,14 @@
 //! Spec 6.4 (memories), 12.5 (explain).
 
+use std::collections::BTreeMap;
+
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
 use uuid::Uuid;
 
 use crate::error::ApiError;
 use crate::schemas::common::{
-    Concept, FactStatus, MemoryTable, ObservationType, Scope, Sensitivity, SummaryGrain, comma_list,
+    Concept, FactStatus, FeedbackVerdict, MemoryTable, ObservationType, Scope, Sensitivity, SummaryGrain, comma_list,
 };
 
 pub const MAX_GET_IDS: usize = 20;
@@ -103,6 +105,9 @@ pub struct IndexRow {
     /// Timeline only.
     #[serde(default)]
     pub is_anchor: bool,
+    /// `disputed` / `unconfirmed 4 months` for a fact or procedure to treat with care (see [`fact_caution`]).
+    #[serde(default)]
+    pub caution: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -296,6 +301,9 @@ pub struct FactFull {
     pub written_by_client_id: Option<Uuid>,
     #[serde(default)]
     pub extracted_by: Option<serde_json::Value>,
+    /// Why to treat the fact with care, if so (see [`fact_caution`]).
+    #[serde(default)]
+    pub caution: Option<String>,
 }
 
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -385,6 +393,9 @@ pub struct GetResponse {
     /// Unknown or not visible to the caller.
     #[serde(default)]
     pub missing: Vec<Uuid>,
+    /// Feedback counts of the returned facts, observations and procedures that have any.
+    #[serde(default)]
+    pub feedback: BTreeMap<Uuid, FeedbackCounts>,
 }
 
 // ---------- explain (12.5) ----------
@@ -696,4 +707,99 @@ pub struct ForgetResponse {
     pub id: Uuid,
     pub table: MemoryTable,
     pub action: ForgetAction,
+}
+
+// ---------- feedback (quality signals) ----------
+
+/// Longest feedback note.
+pub const MAX_FEEDBACK_NOTE_CHARS: usize = 500;
+/// A fact not confirmed for this many days is shown as unconfirmed.
+pub const UNCONFIRMED_AFTER_DAYS: i64 = 90;
+/// A fact below this confidence is shown as disputed.
+pub const DISPUTED_BELOW_CONFIDENCE: f64 = 0.4;
+/// Net negative feedback (see [`FeedbackCounts::dispute_score`]) at which a fact is queued for the planner.
+pub const DISPUTE_THRESHOLD: i64 = 2;
+
+impl FeedbackVerdict {
+    /// Signed step of a fact's confidence (or an observation's importance) for one verdict.
+    pub fn step(self) -> f64 {
+        match self {
+            FeedbackVerdict::Helpful => 0.05,
+            FeedbackVerdict::Wrong => -0.2,
+            FeedbackVerdict::Outdated => -0.1,
+        }
+    }
+}
+
+/// `POST /v1/memories/{id}/feedback` (and the MCP tool `memory_feedback`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryFeedbackRequest {
+    pub verdict: FeedbackVerdict,
+    #[serde(default)]
+    pub note: Option<String>,
+}
+
+impl MemoryFeedbackRequest {
+    pub fn validate(&self) -> Result<(), ApiError> {
+        if self.note.as_deref().is_some_and(|n| n.chars().count() > MAX_FEEDBACK_NOTE_CHARS) {
+            return Err(ApiError::invalid(format!("note must be at most {MAX_FEEDBACK_NOTE_CHARS} characters")));
+        }
+        Ok(())
+    }
+}
+
+/// Verdicts recorded on one memory, one per user and verdict.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct FeedbackCounts {
+    pub helpful: i64,
+    pub wrong: i64,
+    pub outdated: i64,
+}
+
+impl FeedbackCounts {
+    /// Negative weight minus positive: `wrong` counts 2, `outdated` 1, `helpful` -1. At
+    /// [`DISPUTE_THRESHOLD`] a fact is queued for the planner.
+    pub fn dispute_score(&self) -> i64 {
+        2 * self.wrong + self.outdated - self.helpful
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryFeedbackResponse {
+    pub id: Uuid,
+    pub table: MemoryTable,
+    pub verdict: FeedbackVerdict,
+    /// `false` when this user had given this verdict on this memory already: nothing changed.
+    pub applied: bool,
+    pub counts: FeedbackCounts,
+    /// The fact's confidence after the verdict (facts only).
+    #[serde(default)]
+    pub confidence: Option<f64>,
+    /// The fact is queued for the consolidation planner to retract or supersede.
+    pub queued: bool,
+}
+
+/// Why a fact should be treated with care: `disputed` (queued by feedback, or confidence under
+/// [`DISPUTED_BELOW_CONFIDENCE`]) or `unconfirmed N months` (not confirmed for [`UNCONFIRMED_AFTER_DAYS`]).
+/// Pinned facts are the user's own word and carry none.
+pub fn fact_caution(
+    confidence: f64,
+    last_confirmed_at: DateTime<Utc>,
+    disputed: bool,
+    pinned: bool,
+    now: DateTime<Utc>,
+) -> Option<String> {
+    if pinned {
+        return None;
+    }
+    if disputed || confidence < DISPUTED_BELOW_CONFIDENCE {
+        return Some("disputed".into());
+    }
+    let days = (now - last_confirmed_at).num_days();
+    (days >= UNCONFIRMED_AFTER_DAYS).then(|| format!("unconfirmed {} months", days / 30))
+}
+
+/// A procedure that failed more often than it worked is `disputed`.
+pub fn procedure_caution(success_count: i32, failure_count: i32) -> Option<String> {
+    (failure_count > success_count).then(|| "disputed".into())
 }

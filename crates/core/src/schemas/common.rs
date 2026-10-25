@@ -237,6 +237,8 @@ str_enum!(FactStatus {
     Retracted = "retracted",
 });
 
+str_enum!(FeedbackVerdict { Helpful = "helpful", Wrong = "wrong", Outdated = "outdated" });
+
 str_enum!(MembershipRole { Owner = "owner", Writer = "writer", Reader = "reader" });
 
 str_enum!(SpaceKind { Private = "private", Shared = "shared" });

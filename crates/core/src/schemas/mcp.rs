@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::schemas::common::FeedbackVerdict;
 use crate::schemas::memories::MAX_GET_IDS;
 
 /// `_meta["anthropic/maxResultSizeChars"]` on every tool.
@@ -104,6 +105,14 @@ pub struct MemoryForgetArgs {
     pub id: String,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryFeedbackArgs {
+    pub id: String,
+    pub verdict: FeedbackVerdict,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

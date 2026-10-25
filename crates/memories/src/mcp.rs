@@ -17,11 +17,13 @@ use chrono::{DateTime, Duration, NaiveDate, Utc};
 use memvault_core::auth::{MEMORIES_READ, MEMORIES_WRITE, authenticate_header};
 use memvault_core::schemas::common::{Concept, MemoryTable, ObservationType, Scope, ScopeKind, Sensitivity};
 use memvault_core::schemas::mcp::{
-    MAX_RESULT_CHARS, McpScope, MemoryExplainArgs, MemoryForgetArgs, MemoryGetArgs, MemoryHistoryArgs,
-    MemoryRememberArgs, MemorySearchArgs, MemoryTimelineArgs, RememberKind, RememberScope, WorkStateWriteArgs,
+    MAX_RESULT_CHARS, McpScope, MemoryExplainArgs, MemoryFeedbackArgs, MemoryForgetArgs, MemoryGetArgs,
+    MemoryHistoryArgs, MemoryRememberArgs, MemorySearchArgs, MemoryTimelineArgs, RememberKind, RememberScope,
+    WorkStateWriteArgs,
 };
 use memvault_core::schemas::memories::{
-    FactSubject, RememberFact, RememberObservation, RememberProcedure, RememberRequest, SearchQuery, TimelineQuery,
+    FactSubject, MemoryFeedbackRequest, RememberFact, RememberObservation, RememberProcedure, RememberRequest,
+    SearchQuery, TimelineQuery,
 };
 use memvault_core::schemas::work_state::WorkStateWrite;
 use memvault_core::{ApiError, AppState, Identity, require_scope};
@@ -39,6 +41,7 @@ use serde::de::DeserializeOwned;
 use serde_json::{Value, json};
 use uuid::Uuid;
 
+use crate::feedback::feedback;
 use crate::memories::{current_project, forget, remember};
 use crate::work_state;
 use memvault_core::user_tx;
@@ -151,6 +154,7 @@ impl ServerHandler for MemoryServer {
                 "memory_history" => self.history(&caller, parse(args)?).await,
                 "memory_remember" => self.remember(&caller, parse(args)?).await,
                 "memory_forget" => self.forget(&caller, parse(args)?).await,
+                "memory_feedback" => self.feedback(&caller, parse(args)?).await,
                 "work_state_write" => self.work_state_write(&caller, parse(args)?).await,
                 other => Err(ApiError::invalid(format!("unknown tool {other}"))),
             }
@@ -324,6 +328,20 @@ impl MemoryServer {
         let done = forget(&self.state, &caller.identity, id, false, args.reason.as_deref()).await?;
         let action = serde_json::to_value(done.action).ok().and_then(|v| v.as_str().map(String::from));
         Ok(format!("Forgot {} `{}` ({}).", done.table, done.id, action.unwrap_or_default()))
+    }
+
+    async fn feedback(&self, caller: &Caller, args: MemoryFeedbackArgs) -> ToolResult {
+        require_scope(&self.state, &caller.identity, MEMORIES_WRITE).await?;
+        let id = self.resolve_one(caller, &args.id).await?;
+        let request = MemoryFeedbackRequest { verdict: args.verdict, note: args.note };
+        let done = feedback(&self.state, &caller.identity, id, request).await?;
+        if !done.applied {
+            return Ok(format!("You already gave {} on {} `{}`; nothing changed.", done.verdict, done.table, done.id));
+        }
+        let confidence = done.confidence.map(|c| format!(" Confidence is now {c:.2}.")).unwrap_or_default();
+        let queued =
+            if done.queued { " It is queued for the consolidation planner to retract or replace." } else { "" };
+        Ok(format!("Recorded {} on {} `{}`.{confidence}{queued}", done.verdict, done.table, done.id))
     }
 
     async fn work_state_write(&self, caller: &Caller, args: WorkStateWriteArgs) -> ToolResult {
@@ -502,6 +520,17 @@ fn tools() -> Vec<Tool> {
             }),
             &["id"],
             ToolAnnotations::new().read_only(false).destructive(true),
+        ),
+        tool(
+            "memory_feedback",
+            "Record that a recalled memory was helpful, wrong or outdated (once per verdict), which nudges a fact's confidence and, when negative feedback adds up, queues the fact to be retracted or replaced without deleting anything.",
+            json!({
+                "id": {"type": "string", "description": "The memory id, or the short id from the context block."},
+                "verdict": {"type": "string", "enum": ["helpful", "wrong", "outdated"]},
+                "note": {"type": "string", "description": "What was wrong or what is true now (at most 500 characters)."}
+            }),
+            &["id", "verdict"],
+            write.clone(),
         ),
         tool(
             "work_state_write",

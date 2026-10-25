@@ -15,6 +15,7 @@ use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
 use memvault_core::schemas::common::{FactStatus, MemoryTable, Scope, ScopeKind, Sensitivity, SummaryGrain};
+use memvault_core::schemas::memories::fact_caution;
 use pgvector::Vector;
 use serde_json::Value;
 use sqlx::{PgConnection, Postgres, QueryBuilder};
@@ -393,8 +394,17 @@ pub struct FactRow {
     pub sensitivity: Sensitivity,
     pub written_by_client_id: Option<Uuid>,
     pub extracted_by: Option<Value>,
+    /// Set while the fact waits for the planner to act on negative feedback.
+    pub disputed_at: Option<DateTime<Utc>>,
     /// Device ids the fact was learned on (sorted).
     pub devices: Vec<String>,
+}
+
+impl FactRow {
+    /// Why to treat the fact with care at `now`, if so.
+    pub fn caution(&self, now: DateTime<Utc>) -> Option<String> {
+        fact_caution(f64::from(self.confidence), self.last_confirmed_at, self.disputed_at.is_some(), self.pinned, now)
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -480,6 +490,7 @@ const FACT_SELECT: &str = "SELECT t.id, t.space_id, t.scope_kind, t.scope_key, t
         t.importance, t.status, t.conflict, t.supersedes_id, t.superseded_by, t.valid_from, t.valid_to,
         t.first_seen_at, t.last_confirmed_at, t.confirmations, t.evidence_observation_ids, t.learned_on_client_ids,
         t.access_count, t.last_accessed_at, t.pinned, t.sensitivity, t.written_by_client_id, t.extracted_by,
+        t.disputed_at,
         ARRAY(SELECT DISTINCT c.device_id FROM clients c
                WHERE c.id = ANY(CASE WHEN cardinality(t.learned_on_client_ids) > 0 THEN t.learned_on_client_ids
                                      ELSE ARRAY[t.written_by_client_id] END)

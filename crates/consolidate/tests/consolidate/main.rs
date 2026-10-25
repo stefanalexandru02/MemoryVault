@@ -8,5 +8,6 @@ mod cli;
 mod common;
 mod doctor;
 mod e2e;
+mod feedback;
 mod planner;
 mod revert;

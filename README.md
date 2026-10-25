@@ -152,6 +152,8 @@ there). Open it, paste a device token (`make token`, or the one in `~/.memory/co
   fact rests on, the audit log) and what was recorded around it; for a fact or procedure, the chain of versions
   it replaced and was replaced by, each one a click away;
 - pick an "As of" day to see memory as it was then (facts and procedures included);
+- mark a fact, observation or procedure helpful, wrong or outdated (with an optional note), and see how many of
+  each it has;
 - forget a memory, with a reason that goes to the audit log;
 - read the open work lists per project;
 - with an admin token: see the server's health checks (the same as `memvault admin doctor`), list and revoke
@@ -297,7 +299,8 @@ recorder. Open: the acceptance checks (window to observation within 2 min, cross
 replay) need a live run.
 
 **Phase 2: semantic tier and push mode.** Built: entities, facts and profiles, fact candidates in extraction,
-`/v1/recall` with budgets, retrieval log and feedback, `memory_remember`, `memory_forget` and `work_state_write`.
+`/v1/recall` with budgets, retrieval log and feedback, `memory_remember`, `memory_forget`, `work_state_write` and `memory_feedback`
+(helpful, wrong or outdated verdicts that steer a fact's confidence).
 Dropped by owner decision: the Python client and the agentic OS packet runner, so the "agentic OS injects a
 slot under 300 ms p95" check does not apply. Open: the fact-confirmation check across two sessions needs a
 live run.

@@ -30,7 +30,7 @@ lock" is normal, wait; never kill cargo or delete `target/`. Build and test only
 | `crates/server` | `memvault` (bin) / `memvault_server` | foundation | CLI, router assembly, `/health`, `/metrics`, `/mcp` mount, migrate |
 | `crates/ingest` | `memvault-ingest` | ingest | sessions, events, windows, work packets (lease/result/fail/heartbeat), prompts route, extract/summary appliers |
 | `crates/recall` | `memvault-recall` | recall | candidates, fusion, rerank, budgets, rendering, context cache + listener, recall/context/search/timeline/get/explain/history/by-file/feedback routes |
-| `crates/memories` | `memvault-memories` | memories | memories (remember/forget) + work-state routes, MCP server |
+| `crates/memories` | `memvault-memories` | memories | memories (remember/forget/feedback) + work-state routes, MCP server |
 | `crates/consolidate` | `memvault-consolidate` | consolidation | planner, consolidation appliers, revert, admin routes and admin CLI |
 | `crates/worker` | `memvault-worker` | worker | embedding parts and jobs, worker loop, sweeps, retention |
 | `crates/evals` | `memvault-evals` | evals | record, redact, replay, compare |
@@ -127,6 +127,10 @@ Full DDL of spec 4.1-4.7 plus:
   (except `api_tokens.last_used_at` and `clients.last_seen_at/current_project_key/current_project_at`) and DELETE on
   `jobs`; the SECURITY DEFINER functions are executable by `memsvc_app`/`memsvc_system` only, not PUBLIC.
   Admin writes go through the system role, so they are unaffected.
+- **0300 memories**: `memory_feedback(id, space_id, user_id, client_id, target_table, target_id, verdict, note,
+  created_at)`, append-only, unique on `(user_id, target_id, verdict)` (a repeat is a no-op), forced space RLS
+  (writes need owner/writer); `facts.disputed_at` (the planner's queue of facts whose net negative feedback
+  crossed the threshold).
 - **0400 consolidation**: `observations.decayed_at`, `facts.decayed_at` (incremental decay),
   `memory_audit.seq bigserial` (reverse-replay order), `memory_audit.reverts_audit_id`,
   `procedure_hints.consumed_run_id`, index on `work_packets((inputs->>'run_id'))`.
@@ -265,7 +269,8 @@ header), `invalid_token`, `token_revoked`, `token_expired`, `user_disabled`; 403
 and `opt_from_str` for query strings), `sessions` (6.1), `events` (6.2, clamp constants), `recall` (6.3:
 RecallRequest, RecallResponse, slot items with flattened `SlotItem`, ContextQuery, Feedback*), `memories`
 (6.4/12.5: SearchQuery (comma-separated list params), IndexRow, SearchResponse, Timeline*, ByFileQuery, GetRequest,
-GetResponse with `MemoryItem` tagged by `table`, ExplainResponse, HistoryResponse and HistoryEntry, `RememberRequest` tagged by `kind`
+GetResponse with `MemoryItem` tagged by `table`, ExplainResponse, HistoryResponse and HistoryEntry, `MemoryFeedbackRequest`/`MemoryFeedbackResponse`/`FeedbackCounts` and the
+caution helpers `fact_caution`/`procedure_caution`, `RememberRequest` tagged by `kind`
 (fact|observation|procedure), RememberResponse, ForgetQuery, ForgetResponse), `work_state` (6.5), `work` (6.6:
 LeaseRequest, LeasedPacket with `prompt{system,user_template,user}`, ResultRequest, ResultResponse, Fail*,
 HeartbeatResponse, `PacketRecord` = a `work_packets` row, `sqlx::FromRow`), `packets` (9.2 inputs: ExtractInputs,

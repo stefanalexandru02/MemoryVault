@@ -7,6 +7,7 @@ use memvault_core::estimate_tokens;
 use memvault_core::ids::short_id;
 use memvault_core::invalidate::notify_invalidate;
 use memvault_core::schemas::common::ScopeKind;
+use memvault_core::schemas::memories::{UNCONFIRMED_AFTER_DAYS, fact_caution};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
@@ -21,16 +22,21 @@ struct ProfileFact {
     value_text: String,
     confidence: f64,
     first_seen_at: DateTime<Utc>,
+    last_confirmed_at: DateTime<Utc>,
+    pinned: bool,
+    disputed: bool,
     devices: String,
 }
 
-/// One profile line: `- <subject>: <predicate> = <value> [fact#abc123 · 0.83 · laptop+desktop · 2026-10-02]`.
-fn render_line(f: &ProfileFact) -> String {
+/// One profile line: `- <subject>: <predicate> = <value> [fact#abc123 · 0.83 · laptop+desktop · 2026-10-02]`,
+/// with `disputed` or `unconfirmed N months` as a last tag part for a fact to treat with care.
+fn render_line(f: &ProfileFact, now: DateTime<Utc>) -> String {
     let mut tag = vec![format!("fact#{}", short_id(&f.id)), format!("{:.2}", f.confidence)];
     if !f.devices.is_empty() {
         tag.push(f.devices.clone());
     }
     tag.push(f.first_seen_at.format("%Y-%m-%d").to_string());
+    tag.extend(fact_caution(f.confidence, f.last_confirmed_at, f.disputed, f.pinned, now));
     format!("- {}: {} = {} [{}]", f.subject, f.predicate, f.value_text.replace('\n', " "), tag.join(" · "))
 }
 
@@ -49,7 +55,8 @@ fn fill(lines: impl IntoIterator<Item = String>, max_tokens: i32) -> String {
     out.join("\n")
 }
 
-/// Hash of everything a profile line is rendered from; changes iff the rendering could change.
+/// Hash of everything a profile line is rendered from; changes iff the rendering could change (the
+/// caution tag counts: the dispute flag, and the months since confirmation once past the threshold).
 /// Secret facts are left out of profiles (they never enter an automatic context pack), so they are
 /// left out of the hash too.
 async fn facts_version(
@@ -61,13 +68,17 @@ async fn facts_version(
     sqlx::query_scalar(
         "SELECT hashtextextended(coalesce(string_agg(
                   id::text || '|' || confidence::text || '|' || importance::text || '|' || pinned::text || '|'
-                  || value_text || '|' || learned_on_client_ids::text, ';' ORDER BY id), ''), 0)
+                  || value_text || '|' || learned_on_client_ids::text || '|' || (disputed_at IS NOT NULL)::text || '|'
+                  || CASE WHEN now() - last_confirmed_at >= make_interval(days => $4)
+                          THEN floor(extract(epoch FROM now() - last_confirmed_at) / 2592000)::text ELSE '' END,
+                  ';' ORDER BY id), ''), 0)
            FROM facts WHERE space_id = $1 AND scope_kind = $2 AND scope_key = $3 AND status = 'active'
             AND sensitivity <> 'secret'",
     )
     .bind(space_id)
     .bind(kind)
     .bind(key)
+    .bind(i32::try_from(UNCONFIRMED_AFTER_DAYS).unwrap_or(i32::MAX))
     .fetch_one(conn)
     .await
 }
@@ -92,7 +103,7 @@ pub async fn refresh_scope(
     .await?;
     let facts: Vec<ProfileFact> = sqlx::query_as(
         "SELECT f.id, e.canonical_name AS subject, f.predicate, f.value_text, f.confidence::float8 AS confidence,
-                f.first_seen_at,
+                f.first_seen_at, f.last_confirmed_at, f.pinned, f.disputed_at IS NOT NULL AS disputed,
                 coalesce((SELECT string_agg(c.device_id, '+' ORDER BY c.device_id)
                             FROM clients c WHERE c.id = ANY (f.learned_on_client_ids)), '') AS devices
            FROM facts f JOIN entities e ON e.id = f.subject_id
@@ -120,7 +131,8 @@ pub async fn refresh_scope(
         if stored == Some(version) {
             return Ok(false);
         }
-        let body = fill(facts.iter().map(render_line), PROFILE_MAX_TOKENS);
+        let now = Utc::now();
+        let body = fill(facts.iter().map(|f| render_line(f, now)), PROFILE_MAX_TOKENS);
         sqlx::query(
             "INSERT INTO profiles (space_id, scope_kind, scope_key, body_md, token_estimate, facts_version)
              VALUES ($1, $2, $3, $4, $5, $6)
@@ -170,20 +182,37 @@ mod tests {
             predicate: "prefers.editor".into(),
             value_text: "x".repeat(n),
             confidence: 0.83,
-            first_seen_at: DateTime::from_timestamp(1_790_000_000, 0).unwrap(),
+            first_seen_at: seen(),
+            last_confirmed_at: seen(),
+            pinned: false,
+            disputed: false,
             devices: "desktop+laptop".into(),
         }
     }
 
+    fn seen() -> DateTime<Utc> {
+        DateTime::from_timestamp(1_790_000_000, 0).unwrap()
+    }
+
     #[test]
     fn line_format() {
-        let line = render_line(&fact(3));
+        let line = render_line(&fact(3), seen());
         assert_eq!(line, "- alex: prefers.editor = xxx [fact#000000 · 0.83 · desktop+laptop · 2026-09-21]");
     }
 
     #[test]
+    fn line_carries_the_caution_tag() {
+        let later = seen() + chrono::Duration::days(125);
+        assert!(render_line(&fact(3), later).ends_with("· 2026-09-21 · unconfirmed 4 months]"));
+        let disputed = ProfileFact { disputed: true, ..fact(3) };
+        assert!(render_line(&disputed, seen()).ends_with("· 2026-09-21 · disputed]"));
+        let pinned = ProfileFact { disputed: true, pinned: true, ..fact(3) };
+        assert!(render_line(&pinned, later).ends_with("· 2026-09-21]"));
+    }
+
+    #[test]
     fn fill_stops_at_budget() {
-        let lines: Vec<String> = (0..10).map(|_| render_line(&fact(200))).collect();
+        let lines: Vec<String> = (0..10).map(|_| render_line(&fact(200), seen())).collect();
         let body = fill(lines.clone(), PROFILE_MAX_TOKENS);
         assert!(estimate_tokens(&body) <= PROFILE_MAX_TOKENS);
         assert!(body.lines().count() < 10 && body.lines().count() >= 5);

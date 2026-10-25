@@ -10,7 +10,9 @@
 use chrono::{DateTime, Utc};
 use memvault_core::ids::short_id;
 use memvault_core::schemas::common::{MemoryTable, Scope, ScopeKind};
-use memvault_core::schemas::memories::{ExplainResponse, HistoryResponse, IndexRow, MemoryItem, Provenance};
+use memvault_core::schemas::memories::{
+    ExplainResponse, HistoryResponse, IndexRow, MemoryItem, Provenance, procedure_caution,
+};
 use memvault_core::schemas::recall::{
     FactItem, ObservationItem, ProcedureItem, RecallSlots, SummaryItem, WorkStateList,
 };
@@ -90,9 +92,25 @@ fn tag(kind: &str, id: &Uuid, parts: &[Option<String>]) -> String {
     format!("[{}]", bits.join(" · "))
 }
 
-/// `[fact#a91c2e · 0.83 · laptop+desktop · 2026-10-02]`.
-pub fn fact_tag(id: &Uuid, confidence: f64, devices: &[String], first_seen: Option<DateTime<Utc>>) -> String {
-    tag("fact", id, &[Some(format!("{confidence:.2}")), Some(devices.join("+")), Some(fmt_date(first_seen))])
+/// `[fact#a91c2e · 0.83 · laptop+desktop · 2026-10-02]`, with the caution (`disputed`, `unconfirmed 4 months`)
+/// as a last part when the fact is to be treated with care.
+pub fn fact_tag(
+    id: &Uuid,
+    confidence: f64,
+    devices: &[String],
+    first_seen: Option<DateTime<Utc>>,
+    caution: Option<&str>,
+) -> String {
+    tag(
+        "fact",
+        id,
+        &[
+            Some(format!("{confidence:.2}")),
+            Some(devices.join("+")),
+            Some(fmt_date(first_seen)),
+            caution.map(String::from),
+        ],
+    )
 }
 
 /// `[obs#a1b2c3 · laptop-x1 · 2026-10-22]`.
@@ -104,8 +122,8 @@ pub fn summary_tag(id: &Uuid, device: Option<&str>, created_at: Option<DateTime<
     tag("sum", id, &[device.map(String::from), Some(fmt_date(created_at))])
 }
 
-pub fn procedure_tag(id: &Uuid, version: i32, created_at: Option<DateTime<Utc>>) -> String {
-    tag("proc", id, &[Some(format!("v{version}")), Some(fmt_date(created_at))])
+pub fn procedure_tag(id: &Uuid, version: i32, created_at: Option<DateTime<Utc>>, caution: Option<&str>) -> String {
+    tag("proc", id, &[Some(format!("v{version}")), Some(fmt_date(created_at)), caution.map(String::from)])
 }
 
 fn with_citation(line: String, citation: &Option<String>) -> String {
@@ -208,6 +226,8 @@ pub struct IndexEntry {
     pub title: String,
     pub tokens: i32,
     pub anchor: bool,
+    /// `disputed` / `unconfirmed 4 months`, shown after the title.
+    pub caution: Option<String>,
 }
 
 impl IndexEntry {
@@ -219,6 +239,7 @@ impl IndexEntry {
             title: r.title.clone(),
             tokens: r.token_estimate,
             anchor: r.is_anchor,
+            caution: r.caution.clone(),
         }
     }
 
@@ -230,6 +251,7 @@ impl IndexEntry {
             title: o.title.clone(),
             tokens: o.item.token_estimate,
             anchor: false,
+            caution: None,
         }
     }
 }
@@ -239,7 +261,11 @@ pub fn index_line(e: &IndexEntry, full_ids: bool) -> String {
     if e.anchor {
         reference = format!("**▶ {reference}**");
     }
-    format!("| {reference} | {} | {} | {} | {} |", fmt_when(Some(e.when)), e.glyph, cell(&e.title), e.tokens)
+    let title = match &e.caution {
+        Some(c) => format!("{} [{c}]", cell(&e.title)),
+        None => cell(&e.title),
+    };
+    format!("| {reference} | {} | {} | {title} | {} |", fmt_when(Some(e.when)), e.glyph, e.tokens)
 }
 
 /// Header, one line per entry and the legend; empty for no entries.
@@ -425,14 +451,23 @@ pub fn memory_item_markdown(item: &MemoryItem) -> String {
                 "#### ≡ {} {} {}",
                 f.subject.canonical_name,
                 f.predicate,
-                fact_tag(&f.id, f.confidence, &[], Some(f.first_seen_at))
+                fact_tag(&f.id, f.confidence, &[], Some(f.first_seen_at), f.caution.as_deref())
             ),
             format!("`{}` · {} · {} · confirmations {}", f.id, f.status, f.scope.as_text(), f.confirmations),
             one_line(&f.value_text),
         ]
         .join("\n"),
         MemoryItem::Procedures(p) => [
-            format!("#### ¶ {} {}", one_line(&p.name), procedure_tag(&p.id, p.version, Some(p.created_at))),
+            format!(
+                "#### ¶ {} {}",
+                one_line(&p.name),
+                procedure_tag(
+                    &p.id,
+                    p.version,
+                    Some(p.created_at),
+                    procedure_caution(p.success_count, p.failure_count).as_deref()
+                )
+            ),
             format!(
                 "`{}` · {} · {} · {}",
                 p.id,
@@ -563,8 +598,12 @@ mod tests {
         let id = Uuid::from_u128(0xa91c2e);
         let day = "2026-10-02T08:00:00Z".parse().ok();
         assert_eq!(
-            fact_tag(&id, 0.83, &["laptop".into(), "desktop".into()], day),
+            fact_tag(&id, 0.83, &["laptop".into(), "desktop".into()], day, None),
             "[fact#a91c2e · 0.83 · laptop+desktop · 2026-10-02]"
+        );
+        assert_eq!(
+            fact_tag(&id, 0.83, &[], day, Some("unconfirmed 4 months")),
+            "[fact#a91c2e · 0.83 · 2026-10-02 · unconfirmed 4 months]"
         );
         assert_eq!(obs_tag(&id, None, day), "[obs#a91c2e · 2026-10-02]");
         assert_eq!(excerpt("  a  b\nc ", 10), "a b c");

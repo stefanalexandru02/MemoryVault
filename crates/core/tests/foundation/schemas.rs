@@ -1,5 +1,9 @@
-use memvault_core::schemas::common::{OutputSchemaName, Scope};
-use memvault_core::schemas::memories::{GetRequest, MemoryItem, RememberRequest, SearchQuery};
+use chrono::{Duration, Utc};
+use memvault_core::schemas::common::{FeedbackVerdict, OutputSchemaName, Scope};
+use memvault_core::schemas::memories::{
+    DISPUTE_THRESHOLD, FeedbackCounts, GetRequest, MemoryFeedbackRequest, MemoryItem, RememberRequest, SearchQuery,
+    fact_caution, procedure_caution,
+};
 use memvault_core::schemas::outputs::{FactDecision, LlmOutput};
 use memvault_core::schemas::recall::{RecallFormat, RecallRequest};
 use memvault_core::schemas::validate::{OutputError, OutputSchemas, strip_code_fence};
@@ -215,4 +219,37 @@ fn api_models() {
     let lease: LeaseRequest = serde_json::from_value(json!({})).unwrap();
     assert_eq!((lease.max, lease.lease_seconds, lease.kinds.len()), (1, 600, 3));
     assert!(LeaseRequest { max: 51, ..lease }.validate().is_err());
+}
+
+#[test]
+fn feedback_request_and_counts() {
+    let req: MemoryFeedbackRequest = serde_json::from_value(json!({"verdict": "outdated"})).unwrap();
+    assert_eq!((req.verdict, req.note.as_deref()), (FeedbackVerdict::Outdated, None));
+    assert!(req.validate().is_ok());
+    assert!(serde_json::from_value::<MemoryFeedbackRequest>(json!({"verdict": "meh"})).is_err());
+    let long = MemoryFeedbackRequest { verdict: FeedbackVerdict::Wrong, note: Some("x".repeat(501)) };
+    assert!(long.validate().is_err());
+    assert!(FeedbackVerdict::Helpful.step() > 0.0 && FeedbackVerdict::Wrong.step() < FeedbackVerdict::Outdated.step());
+
+    // One `wrong` reaches the threshold alone, `outdated` needs company, `helpful` cancels.
+    let counts = |helpful, wrong, outdated| FeedbackCounts { helpful, wrong, outdated };
+    assert!(counts(0, 1, 0).dispute_score() >= DISPUTE_THRESHOLD);
+    assert!(counts(0, 0, 1).dispute_score() < DISPUTE_THRESHOLD);
+    assert!(counts(0, 0, 2).dispute_score() >= DISPUTE_THRESHOLD);
+    assert!(counts(1, 1, 0).dispute_score() < DISPUTE_THRESHOLD);
+}
+
+#[test]
+fn cautions_for_stale_and_disputed_memories() {
+    let now = Utc::now();
+    let caution = |conf, days, disputed, pinned| fact_caution(conf, now - Duration::days(days), disputed, pinned, now);
+    assert_eq!(caution(0.9, 10, false, false), None);
+    assert_eq!(caution(0.9, 89, false, false), None);
+    assert_eq!(caution(0.9, 90, false, false).as_deref(), Some("unconfirmed 3 months"));
+    assert_eq!(caution(0.9, 125, false, false).as_deref(), Some("unconfirmed 4 months"));
+    assert_eq!(caution(0.39, 1, false, false).as_deref(), Some("disputed"));
+    assert_eq!(caution(0.9, 400, true, false).as_deref(), Some("disputed"), "disputed beats unconfirmed");
+    assert_eq!(caution(0.1, 400, true, true), None, "pinned facts carry none");
+    assert_eq!(procedure_caution(3, 1), None);
+    assert_eq!(procedure_caution(1, 2).as_deref(), Some("disputed"));
 }

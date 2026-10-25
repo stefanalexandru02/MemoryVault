@@ -28,7 +28,7 @@ from other devices and an index of recent observations. During a session the age
 `memory_search`, `memory_timeline` and `memory_get`, and a hook mentions earlier work on a file the first time
 it is read. The `recall`, `brief` and `project-history` skills describe how to search well.
 
-**Control.** The server's web viewer (`/viewer` on the server's URL, signed in with a device token) lets the user browse, search and forget memories and see where each came from. `memory_remember` stores something on request; `memory_forget` retracts it; `memory_explain` shows
+**Control.** The server's web viewer (`/viewer` on the server's URL, signed in with a device token) lets the user browse, search and forget memories and see where each came from. `memory_remember` stores something on request; `memory_forget` retracts it; `memory_feedback` marks one helpful, wrong or outdated, which lowers or raises a fact's confidence; `memory_explain` shows
 where an entry came from and `memory_history` how a fact or procedure changed over time. To keep one project out of memory entirely, add its key to `~/.memory/exclude`
 (one project key per line, such as `github.com/me/private-repo`). To stop capture on this machine, run
 `make disconnect` in the MemoryVault checkout.

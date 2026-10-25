@@ -851,3 +851,88 @@ async fn history_respects_rls_and_hides_other_secrets(pool: PgPool) {
     let from_vim = engine::history(&w.state, &w.alice.identity, h.vim).await.unwrap();
     assert_eq!(from_vim.entries.iter().map(|e| e.id).collect::<Vec<_>>(), vec![h.vim, h.helix]);
 }
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn stale_and_disputed_memories_carry_a_caution_everywhere_they_are_shown(pool: PgPool) {
+    let w = world(pool).await;
+    let space = w.alice.space_id;
+    let fresh = insert_fact(&w, Fact::new(space, "prefers.editor", "helix for editor work")).await;
+    let stale = insert_fact(&w, Fact::new(space, "prefers.shell", "fish for editor shells")).await;
+    let disputed = insert_fact(&w, Fact::new(space, "prefers.font", "mono for editor fonts")).await;
+    let weak =
+        insert_fact(&w, Fact { confidence: 0.3, ..Fact::new(space, "prefers.theme", "dark for editor themes") }).await;
+    let mut pin = Fact::new(space, "timezone", "Europe/Bucharest");
+    pin.pinned = true;
+    let pinned = insert_fact(&w, pin).await;
+    for id in [stale, pinned] {
+        sqlx::query("UPDATE facts SET last_confirmed_at = now() - interval '130 days' WHERE id = $1")
+            .bind(id)
+            .execute(&w.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE facts SET disputed_at = now() WHERE id = $1").bind(disputed).execute(&w.pool).await.unwrap();
+
+    // Recall: the fallback profile lists the facts with their tags.
+    let resp = engine::recall(&w.state, &w.alice.identity, req("editor")).await.unwrap();
+    let md = resp.rendered_markdown.unwrap();
+    let line = |id: Uuid| {
+        let tag = format!("[fact#{}", memvault_core::ids::short_id(&id));
+        md.lines().find(|l| l.contains(&tag)).unwrap_or_else(|| panic!("no line for {tag} in {md}")).to_string()
+    };
+    assert!(line(stale).ends_with("· unconfirmed 4 months]"), "{}", line(stale));
+    assert!(line(disputed).ends_with("· disputed]") && line(weak).ends_with("· disputed]"));
+    assert!(!line(fresh).contains("unconfirmed") && !line(fresh).contains("disputed"));
+    assert!(!line(pinned).contains("unconfirmed"), "pinned facts are the user's word: {}", line(pinned));
+
+    // Search results and memory_get bodies say the same.
+    let query = SearchQuery {
+        q: Some("editor".into()),
+        tables: Some(vec![MemoryTable::Facts]),
+        limit: 20,
+        ..SearchQuery::default()
+    };
+    let rows = engine::search(&w.state, &w.alice.identity, query).await.unwrap().rows;
+    let caution = |id: Uuid| rows.iter().find(|r| r.id == id).unwrap().caution.clone();
+    assert_eq!(caution(stale).as_deref(), Some("unconfirmed 4 months"));
+    assert_eq!(caution(disputed).as_deref(), Some("disputed"));
+    assert_eq!(caution(fresh), None);
+    let table = memvault_recall::render::index_rows_markdown(&rows);
+    assert!(table.contains("prefers.shell: fish for editor shells [unconfirmed 4 months]"), "{table}");
+
+    let got = engine::get_memories(&w.state, &w.alice.identity, &[stale, fresh]).await.unwrap();
+    let MemoryItem::Facts(full) = &got.items[0] else { panic!("fact expected") };
+    assert_eq!(full.caution.as_deref(), Some("unconfirmed 4 months"));
+    let body = memvault_recall::render::memory_item_markdown(&got.items[0]);
+    assert!(body.lines().next().unwrap().ends_with("· unconfirmed 4 months]"), "{body}");
+    assert!(got.feedback.is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_procedure_that_failed_more_than_it_worked_is_flagged(pool: PgPool) {
+    let w = world(pool).await;
+    let space = w.alice.space_id;
+    let flaky = insert_procedure(&w, space, "Deploy flaky", "deploy", "steps: run it twice").await;
+    let solid = insert_procedure(&w, space, "Deploy solid", "deploy", "steps: run it once").await;
+    sqlx::query("UPDATE procedures SET failure_count = 2, success_count = 1 WHERE id = $1")
+        .bind(flaky)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let query = SearchQuery {
+        q: Some("deploy".into()),
+        tables: Some(vec![MemoryTable::Procedures]),
+        limit: 20,
+        ..SearchQuery::default()
+    };
+    let rows = engine::search(&w.state, &w.alice.identity, query).await.unwrap().rows;
+    assert_eq!(rows.iter().find(|r| r.id == flaky).unwrap().caution.as_deref(), Some("disputed"));
+    assert_eq!(rows.iter().find(|r| r.id == solid).unwrap().caution, None);
+    let resp = engine::recall(&w.state, &w.alice.identity, req("deploy")).await.unwrap();
+    let md = resp.rendered_markdown.unwrap();
+    let tag = |id: Uuid| {
+        md.lines().find(|l| l.contains(&format!("[proc#{}", memvault_core::ids::short_id(&id)))).unwrap().to_string()
+    };
+    assert!(tag(flaky).ends_with("· disputed]"), "{md}");
+    assert!(!tag(solid).contains("disputed"));
+}
