@@ -13,7 +13,11 @@ async fn health_metrics_and_fallbacks(pool: PgPool) {
     assert_eq!(body["status"], "ok");
     assert_eq!(body["db"], true);
     assert_eq!(body["tei"], serde_json::json!({"embed": true, "rerank": true}));
-    assert_eq!(body["pg_search"], false);
+    let pg_search: bool = sqlx::query_scalar("SELECT EXISTS (SELECT 1 FROM pg_extension WHERE extname = 'pg_search')")
+        .fetch_one(&pool)
+        .await
+        .unwrap();
+    assert_eq!(body["pg_search"], pg_search);
     assert!(r.headers.contains_key("x-request-id"));
 
     let r = send(&app, Method::GET, "/metrics", None, None).await;

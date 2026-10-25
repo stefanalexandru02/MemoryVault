@@ -20,9 +20,12 @@ const PROJECT: &str = "github.com/alex/e2e-demo";
 const TITLE: &str = "Config parser accepts trailing commas in arrays";
 const NEXT_STEPS: &str = "Add a regression test for nested arrays";
 
+/// `DATABASE_URL` pointed at this test's database. `PgConnectOptions` does not expose the password,
+/// so the URL is derived from the environment rather than rebuilt from the pool's options.
 fn database_url(pool: &PgPool) -> String {
-    let o = pool.connect_options();
-    format!("postgres://{}@{}:{}/{}", o.get_username(), o.get_host(), o.get_port(), o.get_database().unwrap())
+    let mut url = reqwest::Url::parse(&std::env::var("DATABASE_URL").expect("DATABASE_URL")).unwrap();
+    url.set_path(pool.connect_options().get_database().unwrap());
+    url.to_string()
 }
 
 /// `memvault <args>` against `db`; stdout parsed as JSON (null when empty).

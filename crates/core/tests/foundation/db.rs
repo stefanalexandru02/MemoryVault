@@ -32,12 +32,30 @@ async fn system_tx_role(pool: PgPool) {
     assert_eq!(user, "memsvc_system");
 }
 
+/// Password for logging in as memsvc_app: `MEMSVC_APP_PASSWORD` when set (the compose stack), else a
+/// test password, which is only ever set on a role that has none (a fresh CI cluster; migration 0002
+/// creates the role without one). Trust-auth clusters ignore it.
+async fn app_role_password(pool: &PgPool) -> String {
+    if let Ok(p) = std::env::var("MEMSVC_APP_PASSWORD") {
+        return p;
+    }
+    let unset: bool = sqlx::query_scalar("SELECT rolpassword IS NULL FROM pg_authid WHERE rolname = 'memsvc_app'")
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    if unset {
+        sqlx::query("ALTER ROLE memsvc_app PASSWORD 'memsvc-app-test'").execute(pool).await.unwrap();
+    }
+    "memsvc-app-test".to_string()
+}
+
 /// Production path: the app pool logs in as memsvc_app itself (no SET ROLE), and a system pool
 /// without BYPASSRLS is refused instead of silently seeing nothing.
 #[sqlx::test(migrations = "../../migrations")]
 async fn app_role_login(pool: PgPool) {
     let alice = seed_identity(&pool, TokenKind::Device).await;
-    let opts = (*pool.connect_options()).clone().username("memsvc_app");
+    let password = app_role_password(&pool).await;
+    let opts = (*pool.connect_options()).clone().username("memsvc_app").password(&password);
     let app = PgPoolOptions::new().max_connections(2).connect_with(opts).await.unwrap();
     let c = caps(&app).await.unwrap();
     assert!(!c.superuser && !c.bypass_rls && c.current_user == "memsvc_app");
