@@ -103,6 +103,9 @@ and repeated items are merged. The last section lists the gaps that are still op
   `0099`.
 - **No migration needed** in the ranges 0100 (kept as it was), 0300 to 0399, 0500 to 0599 (beyond `0500`) and
   0600 to 0699. The existing jobs table, unique `idempotency_key` and embeddings schema were enough.
+- **Migration 0301 (documents).** The `documents` table and the `documents` value of the `embeddings.owner_table`
+  check, for ingested files. It is a fifth memory table (`MemoryTable::Documents`, `EmbeddingOwnerTable::Documents`),
+  not observations, so decay, consolidation and the context index never see it. See "Document sources" in section 9.
 - **Entities.** Entities have no scope columns, so their vectors are stored with
   `scope_kind = 'global'` and `scope_key = ''`.
 - **Response additions.** `POST /v1/sessions` returns `next_seq`. `POST /v1/sessions/{id}/end` accepts
@@ -233,6 +236,10 @@ and repeated items are merged. The last section lists the gaps that are still op
   `musl-tools`.
 - **Undefined modes.** The `--final` flag and the "loop up to 3 packets" were undefined for the other modes. The
   decisions are above (session 3, final 10, all 50).
+- **`mem-hook ingest`.** A hand-run subcommand like `doctor`: it bypasses the exit-0 guard and the `MEMORY_OBSERVER`
+  guard, prints to the terminal and exits 1 when a file or the listing failed, 2 for a bad command line. It walks
+  with `std::fs` and matches `--glob` itself (no glob dependency), hashes with SHA-256, compares with
+  `GET /v1/sources` and retries a 429 after `Retry-After`. Details are in the plugin README.
 
 ## 8. Recall and context
 
@@ -253,8 +260,17 @@ and repeated items are merged. The last section lists the gaps that are still op
   this client's newest session on the project, but only if it started within the last 10 minutes. The line shows the
   session summary, or the latest prompt summary while the session is still running. agentic-os clients are labelled
   `assistant`.
-- **Cache key (11.6).** The key is sha256 of `(user_id, sorted space_ids, sorted scopes, device_id, source)`. Spec 11.6
-  has no `user_id`. It is added because `context_cache` rows are per user (RLS), and `cache_key` is the primary key.
+- **Cache key (11.6).** The key is sha256 of `(user_id, sorted space_ids, sorted scopes, device_id, source, mode)`. Spec
+  11.6 has no `user_id`. It is added because `context_cache` rows are per user (RLS), and `cache_key` is the primary
+  key. `mode` is the injection mode (below).
+- **Injection modes.** `GET /v1/context` takes `mode=full|lean`; without it the user's default from `user_settings`
+  (`GET`/`PUT /v1/me/settings`), else `full`. `mem-hook` sends `MEM_INJECTION` from `~/.memory/config` as `mode`. The
+  lean block is the Profile and Open work sections (budgets 120/60/80 for profile, pinned facts and work state) plus a
+  fixed rubric of about 140 tokens; it has no since-you-were-here section. A re-render job carries the mode of the
+  block it replaces.
+- **Context calls are logged on cache hits too.** `retrieval_log` gained `tokens`, `hits` and `injection`. A hit logs
+  a row with no candidates, so `GET /v1/stats/recall` (own calls; `all=true` for admin tokens) counts every call. Rows
+  from before migration 0203 have no tokens and are left out.
 - **ETag.** The ETag is a hash of the full response body, live sections included. It replaces
   `(space, scopes, cache_version)`. `If-None-Match` gets a 304. Cached rows also expire after 1 hour, as a backstop
   against a lost NOTIFY.
@@ -294,6 +310,23 @@ and repeated items are merged. The last section lists the gaps that are still op
 - **Bearer auth on /mcp.** An axum middleware checks the header with `authenticate_header`. It answers 401 in the spec
   error shape for every MCP method, including `initialize`. The identity reaches the tools through request
   extensions. Each tool call runs `require_scope` (`memories:read` or `memories:write`) and the rate limit.
+- **Memory feedback.** `POST /v1/memories/{id}/feedback` and the MCP `memory_feedback(id, verdict, note?)` (scope
+  `memories:write`, which the spec already lists for "feedback") record `helpful`, `wrong` or `outdated` on a fact,
+  observation or procedure in the append-only `memory_feedback` table (user, client, time, note; summaries take
+  none). One verdict per user and memory counts once, enforced by a unique index; a repeat answers `applied: false`.
+  Effects: a fact's confidence moves +0.05 (helpful, which also sets `last_confirmed_at`), -0.2 (wrong) or -0.1
+  (outdated), kept within 0.05 and 0.98, and pinned facts keep theirs; an observation's importance moves by the same
+  steps; a procedure counts a success or a failure. Each applied verdict is audited (`fact.feedback`, `obs.feedback`,
+  `proc.feedback`), drops the scope's profile row and signals the context cache. `POST /v1/recall/{id}/feedback`
+  (per retrieval) is unchanged.
+- **Dispute weights.** Net negative feedback is `2 x wrong + outdated - helpful`; at 2 an active, unpinned fact gets
+  `disputed_at` (cleared again when helpful verdicts bring it under). The numbers are a choice, not in the spec: a
+  single `wrong` queues a fact, a single `outdated` does not. Nothing is retracted by the request itself.
+- **Cautions.** A fact is shown as `disputed` when it is queued or its confidence is under 0.4, else as `unconfirmed N
+  months` when `last_confirmed_at` is 90 or more days old; a procedure that failed more than it worked is `disputed`.
+  The tag is the last part of the citation (`[fact#a91c2e · 0.83 · laptop · 2026-10-02 · unconfirmed 4 months]`),
+  appears after the title in index rows (`IndexRow.caution`, `FactFull.caution`) and in rendered profiles. Pinned facts
+  carry none. Scoring is unchanged: it already uses confidence, and facts still have no recency term.
 - **Tool errors.** Tool failures (bad arguments, 403, 404, scope errors) come back as `CallToolResult` with
   `isError`, and text `error (<code>): <message>`. They are not JSON-RPC errors, so the model can correct the call.
 - **Project inference.** The `X-Memory-Project` request header is used when present. Otherwise the project comes from
@@ -324,6 +357,26 @@ and repeated items are merged. The last section lists the gaps that are still op
 - **Promotion.** `promote_scope` supports only `to: global`. Promotion to project, device or agent is rejected,
   because a decision carries no scope key to derive it from.
 - **Explain.** `explain` is implemented in the API and the tool. Its output is capped as in section 8.
+- **Document sources.** `POST /v1/sources` (memories:write), `GET /v1/sources` and `DELETE /v1/sources` ingest files
+  as memory of a new kind `document`; the spec has nothing like it. A source is `(space, scope, uri)` with a
+  project or the global scope. `content` is chunked in `memvault_memories::chunk` (markdown by heading, text by
+  paragraph, 600 to 800 tokens, a heading stays with the block after it, the heading path in effect at the chunk's
+  first line is stored) and each chunk is a `documents` row with an embed job. The same `content_hash` with all
+  its chunks live is a no-op (200 `unchanged`); with a chunk forgotten since it is rewritten like a changed one;
+  another hash retires the old chunks (`retired_at`, their embeddings deleted) and writes new ones
+  in one transaction under an advisory lock per source (201 `replaced`). Retired chunks stay for `as_of` searches;
+  `DELETE` removes every chunk of the source, retired ones too, and is a 404 when there is none. `GET` lists the
+  default space unless `space_id` is given. `content` over `SOURCE_MAX_BYTES` (400 KiB) is 413 `payload_too_large`.
+  Not signalled to the context cache: documents are not in the session-start block.
+- **Documents in search and recall.** `types` containing `document` adds the documents table to a search whose
+  `tables` is not given (the default stays observations and summaries); `as_of` searches take all tables. `POST
+  /v1/recall` has a `documents` slot and budget (default 400 tokens, 0 in the context budgets and skipped when
+  building the session-start block) rendered as an excerpt with `[doc#id · source: uri#Heading > Sub · date]`. A
+  document scores with a 0.8 multiplier and no decay, so it ranks below a fact of equal relevance. Documents take no
+  feedback; `DELETE /v1/memories/{id}` retires one chunk. The worker embeds a chunk as `body:i` windows of
+  `EMBED_MAX_PART_TOKENS`, each led by the heading path, and none for a retired chunk (reindex skips those too).
+  `memory_search` has no ingest tool: files are sent by `mem-hook ingest`. A project remap (`admin project remap`)
+  does not move documents; ingest again under the new key and delete the old sources.
 
 ## 10. Consolidation
 
@@ -335,6 +388,13 @@ and repeated items are merged. The last section lists the gaps that are still op
   `decision` and `bugfix`, 30 days for other observation types (spec 11.4), and 365 days for facts. Floors are 0.0 for
   observations and 0.1 for facts. Pinned facts, and rows decayed in the last 6 h, are skipped. Observations have no
   access tracking, so their decay runs from creation. The "+0.1 on access" reset is not implemented.
+- **Disputed facts.** Step 2 of the planner (before the clusters) retracts the active, unpinned facts that feedback
+  queued (`facts.disputed_at`), in code, with the audit action `fact.retract` under the run id, so `revert_run`
+  restores them; the reason names the verdict counts and the feedback ids, because the evidence rule of packet
+  retractions (a cited observation) does not fit user feedback. The queue mark is cleared before the audited change,
+  so a revert does not queue the fact again. A fact whose key has a candidate waiting stays for the clusters, which
+  supersede it. Tally action: `feedback_retract`. Profile lines are tagged like citations, and `facts_version`
+  covers the dispute flag and the months since confirmation, so a stale or disputed fact re-renders its profile.
 - **Cluster skip.** A cluster is skipped while any of its facts is in a pending or leased `consolidate_facts` packet.
   The idempotency key is `consolidate_facts:<space>:<hash of the sorted ids>`. Revert releases the keys of the packets
   it cancels, so the planner can plan the cluster again.
@@ -343,8 +403,9 @@ and repeated items are merged. The last section lists the gaps that are still op
   auto-activated.
 - **Consolidation tests.** Consolidate tests load the repository's `prompts/` directory, which is what the deploy ships.
   The crate's own prompt copies were deleted.
-- **Not built.** The on-demand consolidation trigger (candidates above 50, or a conflict older than 24 h, from
-  architecture 5.4). Marking a procedure's `failure_count` from later summaries. Spec 12 requires neither.
+- **Not built.** The on-demand consolidation trigger on a candidate backlog above 50 or a conflict older than 24 h
+  (architecture 5.4; session-end and observation-threshold triggers are built, below). Marking a procedure's
+  `failure_count` from later summaries. Spec 12 requires neither.
 - **Admin CLI.** `memvault admin project remap` takes `--from` and `--to`, as the spec says. The positional form is gone.
 - **Project remap.** It is audited as `project.remap` with before and after rows. It refuses with 409 when active
   facts would collide on the target key. It is undone through the revert endpoint.
@@ -358,6 +419,26 @@ and repeated items are merged. The last section lists the gaps that are still op
 - **Replay observers.** `evals replay --observer` is optional. Without it, packet outputs are the recorded ones, or a
   fake observer's when the recording has none. `--prompt` implies the `claude` observer, which runs only `extract`
   packets through `claude -p`. Summaries keep their recorded or fake outputs.
+- **Triggers instead of the backlog trigger.** Architecture 5.4 wants an on-demand run when candidates pile up. What is
+  built reacts to activity: a session end (once its extract packets settled) and `CONSOLIDATE_OBSERVATION_THRESHOLD`
+  new observations in a scope (counted from `scope_planning.last_planned_at`, extract results only) each queue a
+  scoped `plan` job. `CONSOLIDATE_OBSERVATION_THRESHOLD=0` turns the second off.
+- **One live job per scope.** The unique index `jobs_plan_live` allows one `plan` job per `(space, scope)` while it is
+  queued or running, so a trigger that arrives during a run is dropped; the nightly pass or a later trigger picks the
+  activity up.
+- **Debounce at run time.** The minimum interval is checked when the worker claims the job, not when it is queued
+  (ingest has no settings at the point where it queues). A job inside the interval goes back to `queued` with
+  `run_after` at the end of it and is not counted as an attempt (`queue::defer`).
+- **Nightly skip.** `memvault planner` leaves out scopes whose `scope_planning.last_planned_at` is inside the
+  interval. `POST /v1/admin/consolidate`, `memvault admin consolidate now` and `planner::run_planner` are `manual` and
+  never skip. Every pass, scoped or not, stamps the scopes it planned.
+- **Scope in a pass.** A scoped pass filters its own stages (learned-on refresh, disputed facts, fact candidates,
+  decay, archival, summaries, procedures, profiles). A candidate still clusters with a similar fact of another scope
+  of the same space, as before.
+- **Audit and metrics.** `planner_runs` (one row per run and space, 180-day retention like the other logs) records the
+  trigger and scope; `memory_audit` rows keep joining on `run_id`. `memsvc_consolidation_actions_total` gained a
+  `trigger` label; new are `memsvc_planner_runs_total{trigger}`, `memsvc_plan_enqueued_total{trigger,outcome}` and
+  `memsvc_plan_jobs_total{trigger,outcome}` (planned or deferred).
 
 ## 11. Worker and jobs
 
@@ -383,6 +464,10 @@ and repeated items are merged. The last section lists the gaps that are still op
   and `settings.port`). A failed bind logs an error, and the worker keeps running. This is not an HTTP API in the
   spec's sense.
 - **Worker port.** The worker's Service and container port were meant to be removed. See section 14.
+- **Plan lane.** Scoped `plan` jobs (triggered consolidation, section 10) have a worker lane of their own, so a long
+  reindex cannot hold them up. A job that is not due yet is requeued with `queue::defer`, and the worker now depends on
+  `memvault-consolidate`.
+
 ## 12. Evals
 
 - **Questions name content.** Questions list expected content, not ids, because ids differ on every replay. They use
@@ -488,7 +573,7 @@ and repeated items are merged. The last section lists the gaps that are still op
   the token as an environment reference. The plugin now ships `.mcp.json` and takes the URL and token from its own
   `userConfig` (token in the keychain, or `~/.claude/.credentials.json` where there is none), so no shell profile
   is involved and IDE and desktop apps connect too. Tool names become `mcp__plugin_memory_memory__*`. The plugin
-  also ships six skills (`recall`, `remember`, `brief`, `project-history`, `handoff`, `how-it-works`), which the
+  also ships seven skills (`recall`, `remember`, `brief`, `project-history`, `handoff`, `ingest`, `how-it-works`), which the
   spec does not list. `make connect-local`, `make connect-remote` and `make disconnect` wrap the setup.
 - **File-context hook is informational.** Phase 4's file-context hook is built as a `PreToolUse` hook on `Read`
   (`mem-hook file-context`). It adds earlier observations for the file as context, once per file per session, and
@@ -500,3 +585,16 @@ and repeated items are merged. The last section lists the gaps that are still op
   parameter on `DELETE /v1/memories/{id}` (the audit log already had a reason column). Not built: sessions and raw
   events, editing a memory, undoing a forget, user and space administration, and server-side sign-in (cookies,
   OAuth), so a token is typed or pasted per browser.
+- **Point-in-time queries.** `as_of` (RFC 3339) on `GET /v1/search`, `POST /v1/recall` and the MCP `memory_search`
+  (which then also searches facts and procedures) replaces the "live" filter with what held at that instant. A fact
+  counts from `valid_from` (else `first_seen_at`) until `valid_to`, so a superseded fact is back in force before it was
+  replaced; candidates and duplicates merged into another fact (superseded without an end) never count. A procedure
+  counts from `created_at` until it was retired, taken from the `proc.retire` audit entry (else when its successor was
+  created). Observations and summaries count from `created_at`, observations until `archived_at`. Recall ranks relative to
+  `as_of`, rebuilds the profile from the facts valid then instead of the rendered `profiles` row, and leaves work state
+  out. `/v1/context`, the timeline and by-file do not take `as_of`; the context cache is not time-aware.
+- **History endpoint.** `GET /v1/memories/{id}/history` and the MCP `memory_history` follow `supersedes_id` in both
+  directions (at most 50 links each way) under the caller's RLS, so links in spaces the caller cannot read drop out and
+  an invisible id is a 404. Only facts and procedures chain; an observation or summary is a chain of one. Other
+  `secret` rows in a chain are left out. Procedures have no `superseded_by` or end time columns, so both are derived
+  from the chain and the audit log.

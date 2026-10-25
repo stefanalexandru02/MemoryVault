@@ -1,7 +1,12 @@
-use memvault_core::schemas::common::{OutputSchemaName, Scope};
-use memvault_core::schemas::memories::{GetRequest, MemoryItem, RememberRequest, SearchQuery};
+use chrono::{Duration, Utc};
+use memvault_core::schemas::common::InjectionMode;
+use memvault_core::schemas::common::{FeedbackVerdict, OutputSchemaName, Scope};
+use memvault_core::schemas::memories::{
+    DISPUTE_THRESHOLD, FeedbackCounts, GetRequest, MemoryFeedbackRequest, MemoryItem, RememberRequest, SearchQuery,
+    fact_caution, procedure_caution,
+};
 use memvault_core::schemas::outputs::{FactDecision, LlmOutput};
-use memvault_core::schemas::recall::{RecallFormat, RecallRequest};
+use memvault_core::schemas::recall::{ContextQuery, RecallFormat, RecallRequest, UserSettings};
 use memvault_core::schemas::validate::{OutputError, OutputSchemas, strip_code_fence};
 use memvault_core::schemas::work::LeaseRequest;
 use memvault_core::schemas::work_state::WorkStateQuery;
@@ -176,6 +181,12 @@ fn api_models() {
     assert_eq!(q.scopes.unwrap()[1], "project:github.com/a/b".parse::<Scope>().unwrap());
     let q: SearchQuery = serde_urlencoded::from_str("q=x&limit=500").unwrap();
     assert!(q.validate().is_err());
+    let q: SearchQuery = serde_urlencoded::from_str("as_of=2026-10-01T12:00:00Z").unwrap();
+    q.validate().unwrap();
+    assert_eq!(q.as_of.unwrap().to_rfc3339(), "2026-10-01T12:00:00+00:00");
+    assert!(serde_urlencoded::from_str::<SearchQuery>("q=x&as_of=last-tuesday").is_err());
+    let req: RecallRequest = serde_json::from_value(json!({"as_of": "2026-10-01T12:00:00Z"})).unwrap();
+    assert!(req.as_of.is_some());
 
     assert!(GetRequest { ids: vec![] }.validate().is_err());
     assert!(GetRequest { ids: vec![uuid::Uuid::nil(); 21] }.validate().is_err());
@@ -209,4 +220,51 @@ fn api_models() {
     let lease: LeaseRequest = serde_json::from_value(json!({})).unwrap();
     assert_eq!((lease.max, lease.lease_seconds, lease.kinds.len()), (1, 600, 3));
     assert!(LeaseRequest { max: 51, ..lease }.validate().is_err());
+}
+
+#[test]
+fn feedback_request_and_counts() {
+    let req: MemoryFeedbackRequest = serde_json::from_value(json!({"verdict": "outdated"})).unwrap();
+    assert_eq!((req.verdict, req.note.as_deref()), (FeedbackVerdict::Outdated, None));
+    assert!(req.validate().is_ok());
+    assert!(serde_json::from_value::<MemoryFeedbackRequest>(json!({"verdict": "meh"})).is_err());
+    let long = MemoryFeedbackRequest { verdict: FeedbackVerdict::Wrong, note: Some("x".repeat(501)) };
+    assert!(long.validate().is_err());
+    assert!(FeedbackVerdict::Helpful.step() > 0.0 && FeedbackVerdict::Wrong.step() < FeedbackVerdict::Outdated.step());
+
+    // One `wrong` reaches the threshold alone, `outdated` needs company, `helpful` cancels.
+    let counts = |helpful, wrong, outdated| FeedbackCounts { helpful, wrong, outdated };
+    assert!(counts(0, 1, 0).dispute_score() >= DISPUTE_THRESHOLD);
+    assert!(counts(0, 0, 1).dispute_score() < DISPUTE_THRESHOLD);
+    assert!(counts(0, 0, 2).dispute_score() >= DISPUTE_THRESHOLD);
+    assert!(counts(1, 1, 0).dispute_score() < DISPUTE_THRESHOLD);
+}
+
+#[test]
+fn cautions_for_stale_and_disputed_memories() {
+    let now = Utc::now();
+    let caution = |conf, days, disputed, pinned| fact_caution(conf, now - Duration::days(days), disputed, pinned, now);
+    assert_eq!(caution(0.9, 10, false, false), None);
+    assert_eq!(caution(0.9, 89, false, false), None);
+    assert_eq!(caution(0.9, 90, false, false).as_deref(), Some("unconfirmed 3 months"));
+    assert_eq!(caution(0.9, 125, false, false).as_deref(), Some("unconfirmed 4 months"));
+    assert_eq!(caution(0.39, 1, false, false).as_deref(), Some("disputed"));
+    assert_eq!(caution(0.9, 400, true, false).as_deref(), Some("disputed"), "disputed beats unconfirmed");
+    assert_eq!(caution(0.1, 400, true, true), None, "pinned facts carry none");
+    assert_eq!(procedure_caution(3, 1), None);
+    assert_eq!(procedure_caution(1, 2).as_deref(), Some("disputed"));
+}
+
+#[test]
+fn injection_mode_spellings() {
+    assert_eq!(InjectionMode::default(), InjectionMode::Full);
+    assert_eq!("lean".parse::<InjectionMode>().unwrap(), InjectionMode::Lean);
+    assert!("fat".parse::<InjectionMode>().is_err());
+    assert_eq!(serde_json::to_value(InjectionMode::Lean).unwrap(), json!("lean"));
+    // A request names a mode or leaves the choice to the user's default; the settings body must name one.
+    let q: ContextQuery = serde_json::from_value(json!({"project_key": "p", "mode": "lean"})).unwrap();
+    assert_eq!(q.mode, Some(InjectionMode::Lean));
+    assert_eq!(serde_json::from_value::<ContextQuery>(json!({})).unwrap().mode, None);
+    assert!(serde_json::from_value::<ContextQuery>(json!({"mode": "fat"})).is_err());
+    assert!(serde_json::from_value::<UserSettings>(json!({})).is_err());
 }

@@ -3,6 +3,7 @@
 use serde::{Deserialize, Serialize};
 
 use crate::error::ApiError;
+use crate::schemas::common::FeedbackVerdict;
 use crate::schemas::memories::MAX_GET_IDS;
 
 /// `_meta["anthropic/maxResultSizeChars"]` on every tool.
@@ -37,6 +38,9 @@ pub struct MemorySearchArgs {
     pub since: Option<String>,
     #[serde(default)]
     pub files: Option<Vec<String>>,
+    /// RFC 3339 time: search the memory as it stood then.
+    #[serde(default)]
+    pub as_of: Option<String>,
     /// <= 30.
     #[serde(default = "twenty")]
     pub limit: i64,
@@ -61,6 +65,11 @@ pub struct MemoryGetArgs {
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct MemoryExplainArgs {
+    pub id: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryHistoryArgs {
     pub id: String,
 }
 
@@ -96,6 +105,14 @@ pub struct MemoryForgetArgs {
     pub id: String,
     #[serde(default)]
     pub reason: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct MemoryFeedbackArgs {
+    pub id: String,
+    pub verdict: FeedbackVerdict,
+    #[serde(default)]
+    pub note: Option<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

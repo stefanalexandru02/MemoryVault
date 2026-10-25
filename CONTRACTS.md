@@ -29,14 +29,14 @@ lock" is normal, wait; never kill cargo or delete `target/`. Build and test only
 | `crates/core` | `memvault-core` / `memvault_core` | foundation | config, db + RLS tx, ids, auth, schemas, TEI + FakeTei, prompts, appliers, invalidation, errors, AppState, test-support |
 | `crates/server` | `memvault` (bin) / `memvault_server` | foundation | CLI, router assembly, `/health`, `/metrics`, `/mcp` mount, migrate |
 | `crates/ingest` | `memvault-ingest` | ingest | sessions, events, windows, work packets (lease/result/fail/heartbeat), prompts route, extract/summary appliers |
-| `crates/recall` | `memvault-recall` | recall | candidates, fusion, rerank, budgets, rendering, context cache + listener, recall/context/search/timeline/get/explain/by-file/feedback routes |
-| `crates/memories` | `memvault-memories` | memories | memories (remember/forget) + work-state routes, MCP server |
+| `crates/recall` | `memvault-recall` | recall | candidates, fusion, rerank, budgets, rendering, context cache + listener, recall/context/search/timeline/get/explain/history/by-file/feedback routes, `me/settings`, `stats/recall` |
+| `crates/memories` | `memvault-memories` | memories | memories (remember/forget/feedback), sources (document ingestion, chunker) and work-state routes, MCP server |
 | `crates/consolidate` | `memvault-consolidate` | consolidation | planner, consolidation appliers, revert, admin routes and admin CLI |
 | `crates/worker` | `memvault-worker` | worker | embedding parts and jobs, worker loop, sweeps, retention |
 | `crates/evals` | `memvault-evals` | evals | record, redact, replay, compare |
 | `crates/mem-hook` | `mem-hook` (bin) | plugin | hook subcommands + `observe`; **no dependency on core** (ureq + serde_json, no async runtime) |
 
-Dependency graph: every crate depends on core; memories -> recall; worker -> ingest, recall. Do not add an edge
+Dependency graph: every crate depends on core; memories -> recall; worker -> ingest, recall, consolidate. Do not add an edge
 that creates a cycle (ingest and recall must not depend on worker or memories).
 
 Foundation-owned shared files: root `Cargo.toml`, `Cargo.lock` (cargo updates it; fine), `.cargo/config.toml`,
@@ -65,7 +65,7 @@ take turns on sqlx's advisory lock; migrations the binary does not know are igno
 |---|---|
 | 0001-0099 | foundation (0099 = grants) |
 | 0100-0199 | ingest (0100 exists: `session_windows`, lease bookkeeping) |
-| 0200-0299 | recall (0200-0202 exist: context cache columns, invalidations) |
+| 0200-0299 | recall (0200-0203 exist: context cache columns, invalidations, injection modes) |
 | 0300-0399 | memories / mcp |
 | 0400-0499 | consolidation (0400 exists: decay and revert bookkeeping) |
 | 0500-0599 | worker |
@@ -95,14 +95,17 @@ Full DDL of spec 4.1-4.7 plus:
 - `procedure_hints(id, space_id, scope_kind, scope_key, task_class, note, observation_id, session_id, packet_id,
   consumed_at, created_at)` - 10.4 step 4.
 - `context_cache(cache_key PK, user_id, space_id, space_ids uuid[], scopes text[] ('kind:key'), device_id, source,
-  body_md, etag, token_estimate, rendered_at)` - 11.6. RLS: a user sees only own rows.
+  body_md, etag, token_estimate, rendered_at, mode, hit_count)` - 11.6. RLS: a user sees only own rows.
+- `user_settings(user_id PK, injection_mode 'full'|'lean', updated_at)` - the user's defaults. RLS: own row only
+  (no `space_id`, so `memsvc_apply_space_rls` is not used).
 - `rate_limits(subject, window_start, count)` - 5.1. Old windows are pruned by the worker's retention job.
 - SQL functions: `app_user_id()`, `app_client_id()`, `readable_spaces()`, `writable_spaces()`,
   `memsvc_join(text[], text)`, `memsvc_apply_space_rls(tbl, write_check)`,
   `memsvc_invalidate_context(space uuid, kind text, key text) -> int` (SECURITY DEFINER; kind NULL = whole space).
 - RLS (forced) on: sessions, events, observations, summaries, entities, facts, procedures, work_state, profiles,
-  embeddings, work_packets, memory_audit, procedure_hints (writes need owner/writer); retrieval_log, access_log
-  (writes need any membership); context_cache (own rows); memberships (own rows, read-only for the app role).
+  embeddings, work_packets, memory_audit, procedure_hints, documents (writes need owner/writer); retrieval_log, access_log
+  (writes need any membership); context_cache (own rows); user_settings (own row); memberships (own rows,
+  read-only for the app role).
   users, spaces, clients, api_tokens, jobs, rate_limits have no RLS.
 - Roles `memsvc_app` (NOINHERIT LOGIN) and `memsvc_system` (NOINHERIT LOGIN BYPASSRLS).
 - `emb_hnsw` HNSW index (pgvector 0.6 is fine; `hnsw.iterative_scan` only on >= 0.8). BM25 indexes `obs_bm25`,
@@ -122,11 +125,27 @@ Full DDL of spec 4.1-4.7 plus:
   executable by `memsvc_app`): a cached block is served only when no matching invalidation is newer than its
   `rendered_at`, which closes the render/NOTIFY race.
 - **0202 recall**: forced RLS on `context_invalidations` (it has `space_id`; the app role has no grants on it).
+- **0203 recall**: `user_settings`; `retrieval_log.tokens`, `.hits`, `.injection` (`full`|`lean`, context calls only)
+  and an index on `(client_id, created_at)`; `context_cache.mode`, `.hit_count`; `memsvc_recall_invalidate` is
+  recreated returning `mode` as well (same grants). The cache key is `v2` and includes the mode.
+- **0401 consolidation**: `scope_planning(space_id, scope_kind, scope_key, last_planned_at)` (when the planner last
+  processed a scope), `planner_runs(run_id, space_id, scope_kind?, scope_key?, trigger, packets, actions, created_at)`
+  (one row per run and space; trigger `nightly|session_end|threshold|manual`), both with forced space RLS, and the
+  unique index `jobs_plan_live` (one queued or running `plan` job per space and scope).
 - **0500 worker**: `jobs.priority` (claim order; live jobs 0, `reindex` backfill 10).
 - **0900 hardening**: `memsvc_app` loses INSERT/UPDATE/DELETE on `users`, `spaces`, `api_tokens`, `clients`
   (except `api_tokens.last_used_at` and `clients.last_seen_at/current_project_key/current_project_at`) and DELETE on
   `jobs`; the SECURITY DEFINER functions are executable by `memsvc_app`/`memsvc_system` only, not PUBLIC.
   Admin writes go through the system role, so they are unaffected.
+- **0300 memories**: `memory_feedback(id, space_id, user_id, client_id, target_table, target_id, verdict, note,
+  created_at)`, append-only, unique on `(user_id, target_id, verdict)` (a repeat is a no-op), forced space RLS
+  (writes need owner/writer); `facts.disputed_at` (the planner's queue of facts whose net negative feedback
+  crossed the threshold).
+- **0301 memories**: `documents(id, space_id, scope_kind, scope_key, source_uri, title, content_type 'markdown'|'text',
+  chunk_index, heading_path text[], content, content_hash, token_estimate, ingested_by, created_at, retired_at,
+  search_text, search_tsv)`: one row per chunk of an ingested source `(space, scope, source_uri)`, forced space RLS,
+  a partial unique index on the live chunks, `search_tsv` GIN (and BM25 `doc_bm25` with `pg_search`). The
+  `embeddings.owner_table` check also allows `documents`.
 - **0400 consolidation**: `observations.decayed_at`, `facts.decayed_at` (incremental decay),
   `memory_audit.seq bigserial` (reverse-replay order), `memory_audit.reverts_audit_id`,
   `procedure_hints.consumed_run_id`, index on `work_packets((inputs->>'run_id'))`.
@@ -184,10 +203,16 @@ Full DDL of spec 4.1-4.7 plus:
   ingest must use the core path).
 - **Job types** (`jobs`, worker lanes): `embed` `{owner_table, owner_id, model?}` (`model` set by reindex; a job
   for another model than `EMBED_MODEL` fails permanently); `render_context` = `memvault_recall::cache::
-  RenderContextJob {cache_key, user_id, client_id, project_key, device_id, source}`, queued by the API's cache
+  RenderContextJob {cache_key, user_id, client_id, project_key, device_id, source, mode}` (`mode` defaults to `full`
+  for jobs queued before it existed), queued by the API's cache
   listener with `run_after = now() + CONTEXT_RERENDER_DEBOUNCE_S`, coalesced per `cache_key`, run by
   `memvault_recall::cache::rerender(&state, &payload) -> Result<bool, ApiError>` (false: user or client gone; the
-  job is done either way); `reindex`; `retention` (`idempotency_key = retention:<UTC date>`, queued by the sweep).
+  job is done either way); `plan` = `memvault_core::jobs::PlanJob {space_id, scope, trigger}`, queued by
+  `jobs::enqueue_plan` (a session end, via ingest `windows`) or `jobs::enqueue_plan_if_busy` (the observation
+  threshold, after an extract result), coalesced per scope, run on its own lane by
+  `memvault_consolidate::planner::run_plan_job(&state, &payload, now) -> Result<JobOutcome, ApiError>`
+  (`Deferred(until)`: the scope was planned inside `CONSOLIDATE_MIN_INTERVAL_S`, the worker requeues the job with
+  `queue::defer`); `reindex`; `retention` (`idempotency_key = retention:<UTC date>`, queued by the sweep).
   Only the API listener deletes cache rows; the worker never does.
 - **Invalidation**: `memvault_core::invalidate::notify_invalidate(&mut tx, space_id, scope_kind, scope_key)` inside
   every write transaction that changes what context/recall shows; delivered on commit on channel
@@ -209,7 +234,7 @@ that login is superuser or BYPASSRLS), `DB_POOL_MAX` (10), `TEI_EMBED_URL`, `TEI
 `WINDOW_IDLE_SECONDS` (90), `LEASE_SECONDS_DEFAULT` (600), `PREFERRED_RUNNER_SECONDS` (600),
 `WORKER_SWEEP_INTERVAL_S` (30), `EMBED_BATCH_SIZE` (64), `EMBED_CONCURRENCY` (2), `EMBED_MAX_PART_TOKENS` (512),
 `CONTEXT_RERENDER_DEBOUNCE_S` (2), `RETENTION_EVENTS_PAYLOAD_DAYS` (30), `RETENTION_PACKETS_DAYS` (90),
-`RETENTION_LOGS_DAYS` (180), `HOST`, `PORT`, `LOG_LEVEL` (EnvFilter directive), `LOG_FORMAT` (`json`|`text`),
+`RETENTION_LOGS_DAYS` (180), `CONSOLIDATE_OBSERVATION_THRESHOLD` (25; 0 = off), `CONSOLIDATE_MIN_INTERVAL_S` (900), `SOURCE_MAX_BYTES` (409600, the largest `content` of `POST /v1/sources`), `HOST`, `PORT`, `LOG_LEVEL` (EnvFilter directive), `LOG_FORMAT` (`json`|`text`),
 `TEI_EMBED_BATCH_TIMEOUT_S` (60, worker embed batches), `WORKER_METRICS_ADDR` (default `HOST:PORT`).
 `serve` and `admin` refuse to start with an empty `TOKEN_PEPPER` (`Settings::require_token_pepper`).
 Durations are `std::time::Duration` fields (`tei_rerank_timeout`, ...). Handlers read `state.settings`.
@@ -265,8 +290,11 @@ header), `invalid_token`, `token_revoked`, `token_expired`, `user_disabled`; 403
 and `opt_from_str` for query strings), `sessions` (6.1), `events` (6.2, clamp constants), `recall` (6.3:
 RecallRequest, RecallResponse, slot items with flattened `SlotItem`, ContextQuery, Feedback*), `memories`
 (6.4/12.5: SearchQuery (comma-separated list params), IndexRow, SearchResponse, Timeline*, ByFileQuery, GetRequest,
-GetResponse with `MemoryItem` tagged by `table`, ExplainResponse, `RememberRequest` tagged by `kind`
-(fact|observation|procedure), RememberResponse, ForgetQuery, ForgetResponse), `work_state` (6.5), `work` (6.6:
+GetResponse with `MemoryItem` tagged by `table`, ExplainResponse, HistoryResponse and HistoryEntry, `MemoryFeedbackRequest`/`MemoryFeedbackResponse`/`FeedbackCounts` and the
+caution helpers `fact_caution`/`procedure_caution`, `RememberRequest` tagged by `kind`
+(fact|observation|procedure), RememberResponse, ForgetQuery, ForgetResponse, and the document sources `SourcePut` (with
+`validate(max_bytes)`), SourceResponse, SourceListQuery, SourceDeleteQuery, SourceInfo, SourceList, DocumentFull),
+`work_state` (6.5), `work` (6.6:
 LeaseRequest, LeasedPacket with `prompt{system,user_template,user}`, ResultRequest, ResultResponse, Fail*,
 HeartbeatResponse, `PacketRecord` = a `work_packets` row, `sqlx::FromRow`), `packets` (9.2 inputs: ExtractInputs,
 SummarizePromptInputs, SummarizeSessionInputs), `outputs` (typed LLM outputs ObserverV1, SummaryV1,
@@ -328,9 +356,9 @@ JSON 404/405 fallbacks, `DefaultBodyLimit` 8 MB, request ids (`x-request-id`), t
 `serve(state, TcpListener, shutdown) -> anyhow::Result<()>`: first `db::migrate`, then the router plus the context-cache listener
 (`memvault_recall::cache::spawn_listener`) and recorder upkeep; `memvault serve` and the end-to-end test use it.
 CLI `memvault`: `serve [--host] [--port]` (graceful shutdown on SIGINT/SIGTERM), `worker`
-(`memvault_worker::run_worker_with(state, batch_embedder(&state), shutdown)`), `planner [--space-id]`,
+(`memvault_worker::run_worker_with(state, batch_embedder(&state), shutdown)`), `planner [--space-id]` (the nightly pass: trigger `nightly`),
 `migrate [--dsn]`,
-`admin <args...>` -> `memvault_consolidate::admin_cli::run`, `evals <args...>` -> `memvault_evals::cli::run`.
+`admin <args...>` -> `memvault_consolidate::admin_cli::run` (including `admin doctor [--json]`, the checks of `GET /v1/admin/doctor`), `evals <args...>` -> `memvault_evals::cli::run`.
 
 ## Cross-crate signatures (fill in, keep the signatures)
 
@@ -344,11 +372,12 @@ CLI `memvault`: `serve [--host] [--port]` (graceful shutdown on SIGINT/SIGTERM),
 | `engine::timeline(&AppState, &Identity, TimelineQuery) -> Result<TimelineResponse, ApiError>` | recall | 6.4 |
 | `engine::get_memories(&AppState, &Identity, &[Uuid]) -> Result<GetResponse, ApiError>` | recall | 6.4 |
 | `engine::explain(&AppState, &Identity, Uuid) -> Result<ExplainResponse, ApiError>` | recall | 12.5 |
+| `engine::history(&AppState, &Identity, Uuid) -> Result<HistoryResponse, ApiError>` | recall | 6.4 |
 | `context::render_context(&AppState, &Identity, project_key: Option<&str>, device_id: Option<&str>, source: &str) -> Result<String, ApiError>` | recall | 6.3, 11.5-11.7 |
 | `cache::spawn_listener(AppState, CancellationToken) -> JoinHandle<()>` | recall | 11.6 |
 | `cache::rerender(&AppState, &RenderContextJob) -> Result<bool, ApiError>` | recall | 11.6 |
 | `mcp::service(AppState) -> axum::Router` (applies its own bearer auth; mount with `nest_service("/mcp", ..)`) | memories | 7 |
-| `planner::run_planner(&AppState, Option<Uuid>) -> Result<ConsolidateResponse, ApiError>` | consolidate | 12.1 |
+| `planner::run_planner(&AppState, Option<Uuid>) -> Result<ConsolidateResponse, ApiError>` (trigger `manual`; `run_planner_with(&AppState, &PlanOptions, now)` takes space, scope and trigger) | consolidate | 12.1 |
 | `admin_cli::run(AppState, Vec<String>) -> anyhow::Result<()>` | consolidate | 5.2, 6.7 |
 | `run_worker(AppState, CancellationToken) -> anyhow::Result<()>` (embeds via `state.tei`; tests) | worker | 14 |
 | `run_worker_with(AppState, Arc<dyn Embedder>, CancellationToken)`, `batch_embedder(&AppState) -> Arc<dyn Embedder>` | worker | 13, 14 |
@@ -432,7 +461,9 @@ Choices made while implementing, with the reason; the spec text stays as written
   confirmations land as conflict candidates and consolidation merges them.
 - **Context cache hits write no `access_log` row (5.3, 4.6)**: a cache miss logs what the pack returned
   (`action = 'context'`), `POST /v1/recall` always logs (`'recall'`); the cached block carries no row ids to log
-  on a hit.
+  on a hit. A hit does write a `retrieval_log` row (empty candidates and selection, the block's `hit_count`) so
+  `GET /v1/stats/recall` counts every context call, and `tokens` there is the estimate of the text returned,
+  live sections included.
 - **Windows hook and static build (2, D5)**: mem-hook is `cfg(unix)`/`cfg(windows)` portable (it type-checks for
   `x86_64-pc-windows-gnu`; it has not been run on Windows). The Linux build is a static (`crt-static`) glibc
   binary via `install.sh`; a musl build needs `musl-tools` (see the plugin README).

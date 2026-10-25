@@ -6,23 +6,28 @@ A Claude Code plugin with four parts:
   work on a file the first time it is read. All behavior lives in one Rust binary, `bin/mem-hook`, with one
   subcommand per hook event (spec section 8).
 - **The MCP server** `memory` (`.mcp.json`), with the tools `memory_search`, `memory_timeline`, `memory_get`,
-  `memory_explain`, `memory_remember`, `memory_forget` and `work_state_write`. It reads its URL and token from the
+  `memory_explain`, `memory_history`, `memory_remember`, `memory_forget`, `memory_feedback` and `work_state_write`. It reads its URL and token from the
   plugin's own settings (`userConfig`); the token is kept in the keychain, not in a file you edit.
 - **Skills**, invoked as `/memory:<name>` or picked up by Claude from the description:
 
   | Skill | Use it to |
   |---|---|
-  | `recall` | search earlier work (search, then timeline, then get), and trace where a memory came from |
+  | `recall` | search earlier work (search, then timeline, then get), look at it as of an earlier date, trace where a memory came from, and tell memory when a recalled fact was wrong or outdated |
   | `remember` | store a fact, note or procedure on request, or forget one after confirming it |
   | `brief` | compile a sourced briefing on a topic from facts, procedures and past work |
-  | `project-history` | write a narrative of a project over a period from the recorded timeline |
+  | `project-history` | write a narrative of a project over a period from the recorded timeline, using `as_of` and `memory_history` for what changed |
   | `handoff` | leave the goal, state and next steps as work state for the next session, on any machine |
+  | `ingest` | send the repository's docs (ADRs, READMEs, runbooks) to memory with `mem-hook ingest`; only on request |
   | `how-it-works` | explain what is captured, where it lives, and how to inspect or delete it |
 
 - **Install and wiring scripts**: `install.sh` builds the binary, `connect.sh` wires a machine up in one step.
 
 The quick way, from the repository root: `make connect-local` (this machine's own stack) or
-`make connect-remote URL=... TOKEN=...`; `make disconnect` undoes it. The manual steps follow.
+`make connect-remote URL=... TOKEN=...`; `make disconnect` undoes it. Add `INJECTION=lean` to start sessions with
+only the profile, open work and a rubric for the search tools instead of the full block (see "Full and lean
+session context" in the main README); `make connect-status` shows the tokens served. The manual steps follow.
+Codex CLI and Gemini CLI can be wired to the same server (`make connect-local AGENT=codex|gemini`); see
+[clients/README.md](../README.md), which also documents the generic `mem-hook event --client <name>` input.
 
 Requirements on the machine: the `claude` CLI (the observer runs `claude -p`) and `git` (project
 detection). No Node, Python, `curl` or `jq`.
@@ -83,7 +88,7 @@ Headless runs that should use memory pass `--allowedTools "mcp__plugin_memory_me
 
 | Subcommand | Hook | Behavior |
 |---|---|---|
-| `session-start` | SessionStart | Replays the spool (oldest first, at most 1.5 s), posts a `system` event, fetches `GET /v1/context` (3 s) and prints it as `additionalContext`. On failure it prints the cached block from `~/.memory/cache/<project_key>.md` prefixed with `> memory: server unreachable, showing cached context from <time>`. On `resume` the event is posted but no context is returned. |
+| `session-start` | SessionStart | Replays the spool (oldest first, at most 1.5 s), posts a `system` event, fetches `GET /v1/context` (3 s; with `&mode=lean` or `&mode=full` when `MEM_INJECTION` is set) and prints it as `additionalContext`. On failure it prints the cached block from `~/.memory/cache/<project_key>.md` prefixed with `> memory: server unreachable, showing cached context from <time>`. On `resume` the event is posted but no context is returned. |
 | `prompt` | UserPromptSubmit | Posts `user_prompt`. Returns nothing. |
 | `tool` | PostToolUse | Posts `tool_use`. When the server answers `window_closed: true`, starts the observer. |
 | `tool-failure` | PostToolUseFailure | Posts `tool_failure`; same observer rule. |
@@ -91,9 +96,12 @@ Headless runs that should use memory pass `--allowedTools "mcp__plugin_memory_me
 | `stop` | Stop | Posts `assistant_message` and starts the observer. Nothing is posted while `stop_hook_active` is true. |
 | `subagent-stop` | SubagentStop | Posts `subagent_stop`. |
 | `session-end` | SessionEnd | `POST /v1/sessions/{id}/end` within a 1 s budget, then starts the observer with `--final`. |
+| `event --client <name>` | other agent CLIs | One JSON event on stdin (start, prompt, tool, assistant, end), through the same delivery and spool; the session is recorded under `<name>`. See [clients/README.md](../README.md). |
 | `observe` | (spawned) | The observer runner, below. |
+| `doctor` | (by hand) | Diagnosis, below. Unlike the hooks it prints to the terminal and exits 1 when a check fails. |
+| `ingest` | (by hand) | Sends docs to the server, below. Prints to the terminal and exits 1 when a file failed. |
 
-Every invocation exits 0, whatever happens. Each starts with the same checks: nothing happens when
+Every hook invocation exits 0, whatever happens (`doctor` and `ingest` are the exceptions). Each starts with the same checks: nothing happens when
 `MEMORY_OBSERVER` is set (recursion guard), when `MEMORY_URL`/`MEMORY_TOKEN` are missing (a one-line
 stderr hint once a day on `session-start`), or when the project is listed in `~/.memory/exclude`.
 
@@ -111,6 +119,54 @@ has a stable idempotency key (`<session>:<seq>`). A request that cannot be deliv
 timeout, 5xx, 429, 401/403/404) is appended to `~/.memory/spool/YYYYMMDD.jsonl` and replayed in order at the
 next `session-start`; replay stops at the first failure. A request the server rejects as invalid (other
 4xx) is dropped. The request timeout is 2 s.
+
+## Doctor
+
+`mem-hook doctor [--json] [--server]` answers "why is nothing being remembered?". It prints one line per check
+with `[ ok ]`, `[warn]` or `[FAIL]` and, unless the check passed, the command that fixes it:
+
+| Check | Looks at |
+|---|---|
+| `config` | `~/.memory/config` exists, every line is `KEY=value`, `MEMORY_URL` and `MEMORY_TOKEN` are set |
+| `server` | `GET /health` (3 s) |
+| `token` | `GET /v1/me`: accepted, token kind and scopes (a token without `events:write` cannot record) |
+| `environment` | `MEMORY_OBSERVER` is not set (it makes every hook return at once) |
+| `hook binary` | the path and version of the running binary |
+| `plugin` | `enabledPlugins` and `disableAllHooks` in `~/.claude/settings.json` (`$CLAUDE_CONFIG_DIR`) and the project's `.claude/settings*.json`; read from disk, `claude` is not run |
+| `spool` | undelivered events and the age of the oldest (a warning, a failure after a day) |
+| `session cache` | `~/.memory/sessions` is writable |
+| `last delivery` | when the server last accepted a request from this machine (`~/.memory/last-delivery`, refreshed at most once a minute) |
+
+`--json` prints the same checks as `{"checks": [{name, status, detail, fix}]}`. `--server` appends the server's
+own checks from `GET /v1/admin/doctor`, which needs an admin token: set `MEMORY_ADMIN_TOKEN` in the config file
+or the environment (the device token is tried otherwise, and the section is skipped with a hint when it is
+refused). `make doctor` in the repository runs `mem-hook doctor --server`.
+
+## Ingest
+
+`mem-hook ingest [<path|dir>] [--scope project|global] [--glob PATTERN]... [--dry-run] [--prune] [--force]` sends documents
+to the server (`POST /v1/sources`), which splits them by heading into chunks of 600 to 800 tokens and keeps them as
+memories of type `document`. They are searched with `memory_search` and `GET /v1/search` (`types=document`), show
+up in `POST /v1/recall` results as `source: <uri>#<heading>`, rank below facts of equal relevance and are never
+part of the session-start block.
+
+- `path` is a file or a directory (default `.`). A directory is walked for `.md`, `.markdown`, `.txt`, `.text`,
+  `.rst` and `.adoc` files; `--glob` replaces that list (`**` stands for any number of directories, `*` and `?`
+  stay inside a name, and a pattern without `/` matches file names at any depth). `.git`, `node_modules`,
+  `target`, symlinks, binary files, empty files and files over 400 KiB are skipped. A file named on the command
+  line is sent whatever its extension. Markdown files are chunked by heading, everything else by paragraph.
+- `--scope project` (default) files the documents under the project of the directory, with the path relative to
+  the git root as `uri`; `--scope global` keeps them for every project, with the absolute path as `uri`.
+- The command fetches `GET /v1/sources` for the scope and sends only the files whose SHA-256 differs from the
+  stored `content_hash`, so a second run sends what changed. A rate-limited request waits for the `Retry-After`
+  and is tried again. `--force` sends every file anyway: the server then restores chunks that were forgotten
+  one by one (it answers `unchanged` for a source that is whole), which a plain run would skip.
+- `--prune` (directories only) deletes the sources under the directory whose file is gone. A file that exists but
+  is left out by the extensions or `--glob` of this run is kept.
+- `--dry-run` prints what would be sent and removed (`+` new, `~` changed, `-` removed) and changes nothing.
+
+Exit status: 0 when every file was handled, 1 when a request failed, the server could not be listed or the
+config is missing, 2 for a bad command line. The `ingest` skill drives it for the current repository.
 
 ## The observer
 
@@ -144,10 +200,11 @@ leases packets of any session. Run it from cron on an always-on machine with `cl
 
 | Path | Content |
 |---|---|
-| `config` | `MEMORY_URL`, `MEMORY_TOKEN`, optional `DEVICE_ID`, `CLAUDE_BIN` (mode 0600) |
+| `config` | `MEMORY_URL`, `MEMORY_TOKEN`, optional `DEVICE_ID`, `CLAUDE_BIN`, `MEM_INJECTION` (`lean` or `full`), `MEMORY_ADMIN_TOKEN` (mode 0600) |
 | `exclude` | project keys to ignore |
-| `sessions/` | per-session cache: server session id, next sequence number, window, prompt count |
+| `sessions/` | per-session cache: server session id, next sequence number, window, prompt count (`<client>_<id>` for sessions of other clients) |
 | `spool/` | undelivered requests, one JSON line each |
+| `last-delivery` | modification time = last request the server accepted (for `doctor`) |
 | `cache/` | last context block per project |
 | `observe.lock`, `observe.log` | observer lock and log |
 

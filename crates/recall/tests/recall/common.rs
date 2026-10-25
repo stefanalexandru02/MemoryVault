@@ -283,6 +283,38 @@ pub async fn insert_procedure(w: &World, space: Uuid, name: &str, task_class: &s
     id
 }
 
+/// One live chunk of the source `uri`, embedded from its heading path and content.
+pub async fn insert_document(
+    w: &World,
+    space: Uuid,
+    scope: &Scope,
+    uri: &str,
+    headings: &[&str],
+    content: &str,
+) -> Uuid {
+    let id = new_id();
+    let headings: Vec<String> = headings.iter().map(|h| h.to_string()).collect();
+    sqlx::query(
+        "INSERT INTO documents (id, space_id, scope_kind, scope_key, source_uri, title, content_type, chunk_index,
+                                heading_path, content, content_hash, token_estimate, ingested_by)
+         VALUES ($1, $2, $3, $4, $5, $5, 'markdown', 0, $6, $7, 'h1', $8, $9)",
+    )
+    .bind(id)
+    .bind(space)
+    .bind(scope.kind)
+    .bind(&scope.key)
+    .bind(uri)
+    .bind(&headings)
+    .bind(content)
+    .bind(memvault_core::estimate_tokens(content))
+    .bind(w.alice.client_id)
+    .execute(&w.pool)
+    .await
+    .expect("insert document");
+    embed(w, space, "documents", id, "body:0", scope, &format!("{} {content}", headings.join(" "))).await;
+    id
+}
+
 pub async fn insert_work_state(pool: &PgPool, space: Uuid, scope: &Scope, list: &str, fields: serde_json::Value) {
     sqlx::query(
         "INSERT INTO work_state (id, space_id, scope_kind, scope_key, list_name, fields) VALUES ($1, $2, $3, $4, $5, $6)",
@@ -296,4 +328,62 @@ pub async fn insert_work_state(pool: &PgPool, space: Uuid, scope: &Scope, list: 
     .execute(pool)
     .await
     .expect("insert work_state");
+}
+
+/// A fact chain: `vim` held from `2026-01-01` (no `valid_from`, so `first_seen_at` counts) until it was
+/// superseded on `2026-03-01` by `helix`; `dup` is a merged duplicate candidate that never held.
+pub struct EditorHistory {
+    pub vim: Uuid,
+    pub helix: Uuid,
+    pub dup: Uuid,
+}
+
+pub async fn insert_editor_history(w: &World) -> EditorHistory {
+    let space = w.alice.space_id;
+    let vim = insert_fact(w, Fact::new(space, "prefers.editor", "vim")).await;
+    sqlx::query(
+        "UPDATE facts SET status = 'superseded', first_seen_at = '2026-01-01T00:00:00Z',
+                          valid_to = '2026-03-01T00:00:00Z' WHERE id = $1",
+    )
+    .bind(vim)
+    .execute(&w.pool)
+    .await
+    .expect("end the first fact");
+    let dup = insert_fact(w, Fact::new(space, "prefers.editor", "vim again")).await;
+    sqlx::query(
+        "UPDATE facts SET status = 'superseded', superseded_by = $2, first_seen_at = '2026-01-15T00:00:00Z'
+          WHERE id = $1",
+    )
+    .bind(dup)
+    .bind(vim)
+    .execute(&w.pool)
+    .await
+    .expect("merge the duplicate");
+    let helix = insert_fact(w, Fact::new(space, "prefers.editor", "helix")).await;
+    sqlx::query("UPDATE facts SET valid_from = '2026-03-01T00:00:00Z', supersedes_id = $2 WHERE id = $1")
+        .bind(helix)
+        .bind(vim)
+        .execute(&w.pool)
+        .await
+        .expect("link the new fact");
+    sqlx::query("UPDATE facts SET superseded_by = $2 WHERE id = $1")
+        .bind(vim)
+        .bind(helix)
+        .execute(&w.pool)
+        .await
+        .expect("link the old fact");
+    sqlx::query(
+        "INSERT INTO memory_audit (id, space_id, actor, action, target_table, target_id, reason, model, run_id,
+                                   created_at)
+         VALUES ($1, $2, 'planner', 'fact.supersede', 'facts', $3, 'switched in March', 'sonnet', $4,
+                 '2026-03-01T00:00:00Z')",
+    )
+    .bind(new_id())
+    .bind(space)
+    .bind(vim)
+    .bind(new_id())
+    .execute(&w.pool)
+    .await
+    .expect("audit the supersession");
+    EditorHistory { vim, helix, dup }
 }

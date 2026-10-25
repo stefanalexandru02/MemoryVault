@@ -72,13 +72,14 @@
     admin: false,
     health: null,
     projects: new Map(), // key -> count seen
-    filters: { q: '', tables: new Set(['observations', 'summaries', 'facts', 'procedures']), project: '', type: '', period: '30d' },
+    filters: { q: '', tables: new Set(['observations', 'summaries', 'facts', 'procedures', 'documents']), project: '', type: '', period: '30d', asOf: '' },
     rows: [],
     offset: 0,
     hasMore: false,
     loading: false,
     selected: null, // {id, table}
     live: true,
+    injection: null, // 'full' | 'lean': the user's default for what a session starts with; null when unknown
   };
   const PAGE = 50;
 
@@ -187,6 +188,7 @@
     state.selected = null;
     state.me = await api('/v1/me');
     state.admin = (state.me.scopes || []).includes('admin');
+    try { state.injection = (await api('/v1/me/settings')).injection_mode; } catch { state.injection = null; }
     renderShell();
     refreshHealth();
     stopTimers();
@@ -210,10 +212,34 @@
         h('div', { class: 'brand' }, h('i'), 'MemoryVault'),
         $tabs,
         h('div', { class: 'spacer' }),
-        $health, who,
+        $health, who, injectionToggle(),
         h('button', { class: 'btn small', onclick: toggleTheme, title: 'Switch light and dark' }, 'Theme'),
         h('button', { class: 'btn small', onclick: () => signOut(''), title: 'Forget this token in this browser' }, 'Sign out')),
       $main));
+  }
+
+  // The user's default injection mode (PUT /v1/me/settings). A MEM_INJECTION in a client's ~/.memory/config
+  // and a mode in the request take precedence over it.
+  const INJECTION_MODES = [['full', 'Full context'], ['lean', 'Lean context']];
+  function injectionToggle() {
+    if (!state.injection) return null;
+    const sel = h('select', {
+      class: 'input small', 'aria-label': 'Session start context',
+      title: 'What a new session starts with: the full memory block, or only the profile, open work and a rubric for the search tools. A client set to MEM_INJECTION overrides this.',
+      onchange: async (e) => {
+        const mode = e.target.value;
+        try {
+          await api('/v1/me/settings', { method: 'PUT', body: { injection_mode: mode } });
+          state.injection = mode;
+          toast(`New sessions start with the ${mode} context`);
+        } catch (err) {
+          e.target.value = state.injection;
+          if (err.status !== 401) toast(err.message, true);
+        }
+      },
+    }, INJECTION_MODES.map(([value, label]) => h('option', { value, text: label })));
+    sel.value = state.injection;
+    return sel;
   }
 
   async function refreshHealth() {
@@ -247,16 +273,23 @@
   window.addEventListener('hashchange', () => { if (state.token) route(); });
 
   // ---------- memory view ----------
-  const TIERS = [['observations', 'Observations'], ['summaries', 'Summaries'], ['facts', 'Facts'], ['procedures', 'Procedures']];
+  const TIERS = [['observations', 'Observations'], ['summaries', 'Summaries'], ['facts', 'Facts'], ['procedures', 'Procedures'], ['documents', 'Documents']];
   const OBS_TYPES = ['bugfix', 'feature', 'refactor', 'change', 'discovery', 'decision', 'security_alert', 'security_note'];
+  const TYPE_FILTERS = [...OBS_TYPES, 'document']; // 'document' narrows the search to ingested docs
   const PERIODS = [['24h', 'Last 24 hours'], ['7d', 'Last 7 days'], ['30d', 'Last 30 days'], ['90d', 'Last 90 days'], ['all', 'All time']];
   let $list, $detail, $panes, $memory, $count, searchTimer;
 
-  function sinceFor(period) {
+  // The picked day (YYYY-MM-DD, local) counts up to its last millisecond.
+  function asOfTime(day) {
+    const [y, m, d] = day.split('-').map(Number);
+    return new Date(y, m - 1, d + 1).getTime() - 1;
+  }
+
+  function sinceFor(period, base) {
     if (period === 'all') return '2000-01-01T00:00:00Z';
     const n = parseInt(period, 10);
     const unit = period.endsWith('h') ? HOUR : DAY;
-    return new Date(Date.now() - n * unit).toISOString();
+    return new Date(base - n * unit).toISOString();
   }
 
   function searchParams(offset) {
@@ -267,7 +300,9 @@
     if (f.project === '__global') p.set('scopes', 'global');
     else if (f.project) p.set('scopes', `project:${f.project}`);
     if (f.type) p.set('types', f.type);
-    p.set('since', sinceFor(f.period));
+    const base = f.asOf ? asOfTime(f.asOf) : Date.now();
+    p.set('since', sinceFor(f.period, base));
+    if (f.asOf) p.set('as_of', new Date(base).toISOString());
     p.set('limit', String(PAGE));
     p.set('offset', String(offset));
     return p;
@@ -298,11 +333,21 @@
     const projectSel = h('select', { class: 'input', id: 'project', onchange: (e) => { f.project = e.target.value; load(true); } });
     const typeSel = h('select', {
       class: 'input', id: 'type', onchange: (e) => { f.type = e.target.value; load(true); },
-    }, h('option', { value: '', text: 'Any type' }), OBS_TYPES.map((t) => h('option', { value: t, text: t.replace('_', ' ') })));
+    }, h('option', { value: '', text: 'Any type' }), TYPE_FILTERS.map((t) => h('option', { value: t, text: t.replace('_', ' ') })));
     typeSel.value = f.type;
     const periodSel = h('select', { class: 'input', id: 'period', onchange: (e) => { f.period = e.target.value; load(true); } },
       PERIODS.map(([v, l]) => h('option', { value: v, text: l })));
     periodSel.value = f.period;
+    const today = new Date();
+    const asOfInput = h('input', {
+      class: 'input', type: 'date', id: 'asof', value: f.asOf, 'aria-label': 'Show memory as it was on this day',
+      max: `${today.getFullYear()}-${String(today.getMonth() + 1).padStart(2, '0')}-${String(today.getDate()).padStart(2, '0')}`,
+      onchange: (e) => { f.asOf = e.target.value; nowBtn.hidden = !f.asOf; load(true); },
+    });
+    const nowBtn = h('button', {
+      class: 'mini', type: 'button', text: 'Now', hidden: !f.asOf, title: 'Back to the present',
+      onclick: () => { f.asOf = ''; asOfInput.value = ''; nowBtn.hidden = true; load(true); },
+    });
     const live = h('input', { type: 'checkbox', id: 'live', onchange: (e) => { state.live = e.target.checked; } });
     live.checked = state.live;
     $count = h('span', { class: 'muted' });
@@ -317,6 +362,7 @@
         h('label', { class: 'field' }, h('span', { text: 'Project' }), projectSel),
         h('label', { class: 'field' }, h('span', { text: 'Type' }), typeSel),
         h('label', { class: 'field' }, h('span', { text: 'Period' }), periodSel),
+        h('div', { class: 'field' }, h('span', { text: 'As of' }), h('div', { class: 'asof' }, asOfInput, nowBtn)),
         h('label', { class: 'check' }, live, 'Live'),
         $count),
       $panes);
@@ -343,7 +389,7 @@
     const f = state.filters;
     if (reset) { state.offset = 0; state.rows = []; }
     state.loading = true;
-    const myQuery = JSON.stringify([f.q, [...f.tables], f.project, f.type, f.period]);
+    const myQuery = JSON.stringify([f.q, [...f.tables], f.project, f.type, f.period, f.asOf]);
     state.lastQuery = myQuery;
     renderList({ loading: true });
     try {
@@ -364,7 +410,7 @@
   // Live updates: fetch the newest page and add rows that are not shown yet.
   async function pollNew() {
     const f = state.filters;
-    if (f.q.trim() || state.loading || !$list) return;
+    if (f.q.trim() || f.asOf || state.loading || !$list) return;
     try {
       const res = await api(`/v1/search?${searchParams(0)}`);
       const have = new Set(state.rows.map((r) => r.id));
@@ -381,8 +427,8 @@
   }
 
   function tagFor(row) {
-    const type = row.table === 'facts' ? 'fact' : row.table === 'procedures' ? 'procedure' : row.table === 'summaries' ? 'summary' : (row.type || 'change');
-    const label = row.table === 'facts' ? 'fact' : row.table === 'procedures' ? 'procedure' : row.table === 'summaries' ? `${row.type || 'summary'}` : (row.type || 'note').replace('_', ' ');
+    const type = row.table === 'facts' ? 'fact' : row.table === 'procedures' ? 'procedure' : row.table === 'summaries' ? 'summary' : row.table === 'documents' ? 'document' : (row.type || 'change');
+    const label = row.table === 'facts' ? 'fact' : row.table === 'procedures' ? 'procedure' : row.table === 'summaries' ? `${row.type || 'summary'}` : row.table === 'documents' ? 'document' : (row.type || 'note').replace('_', ' ');
     return h('span', { class: `tag t-${type}`, text: label });
   }
 
@@ -392,7 +438,7 @@
     const nodes = [];
     if (error) nodes.push(h('div', { class: 'empty error', role: 'alert', text: error }));
     else if (!rows.length && loading) nodes.push(h('div', { class: 'empty', text: 'Loading…' }));
-    else if (!rows.length) nodes.push(h('div', { class: 'empty', text: state.filters.q.trim() ? 'Nothing matches that search.' : 'No memories in this period yet.' }));
+    else if (!rows.length) nodes.push(h('div', { class: 'empty', text: state.filters.q.trim() ? 'Nothing matches that search.' : state.filters.asOf ? 'Nothing was in memory in this period as of that day.' : 'No memories in this period yet.' }));
     let lastDay = '';
     const ranked = state.filters.q.trim() !== '';
     for (const r of rows) {
@@ -449,7 +495,7 @@
       const item = (res.items || [])[0];
       if (!item) { $detail.replaceChildren(h('div', { class: 'empty', text: 'That memory is gone, or you cannot see it.' })); return; }
       state.selected.table = item.table;
-      renderItem(item);
+      renderItem(item, (res.feedback || {})[item.id]);
     } catch (e) {
       if (e.status !== 401) $detail.replaceChildren(h('div', { class: 'empty error', role: 'alert', text: e.message }));
     }
@@ -469,7 +515,7 @@
     load(true);
   }
 
-  function renderItem(item) {
+  function renderItem(item, feedback) {
     const body = [];
     let head;
     if (item.table === 'observations') {
@@ -500,6 +546,7 @@
       head = h('div', { class: 'detail-head' },
         h('div', {}, h('span', { class: 'tag t-fact', text: 'fact' }), ' ', h('span', { class: 'mini', text: item.status }),
           item.conflict ? h('span', { class: 'mini warn', text: 'conflict' }) : null,
+          item.caution ? h('span', { class: 'mini warn', text: item.caution }) : null,
           item.pinned ? h('span', { class: 'mini', text: ' pinned' }) : null),
         h('h2', { class: 'fact-line' }, `${item.subject.canonical_name} `, h('code', { text: item.predicate }), ' = ', item.value_text),
         kv([['scope', scopeLabel(item.scope)], ['first seen', fullTime(item.first_seen_at)], ['last confirmed', fullTime(item.last_confirmed_at)],
@@ -516,9 +563,21 @@
           ['worked', `${item.success_count}×`], ['failed', `${item.failure_count}×`], ['last used', item.last_used_at ? fullTime(item.last_used_at) : '']]));
       if (item.trigger_text) body.push(section('When to use it', prose(item.trigger_text)));
       body.push(section('Steps', h('div', { class: 'pre', text: item.body_md })));
+    } else if (item.table === 'documents') {
+      const source = item.heading_path && item.heading_path.length ? `${item.source_uri}#${item.heading_path.join(' > ')}` : item.source_uri;
+      head = h('div', { class: 'detail-head' },
+        h('div', {}, tagFor({ table: 'documents' }), item.retired_at ? h('span', { class: 'mini warn', text: 'retired' }) : null),
+        h('h2', { text: item.title }),
+        kv([['source', source], ['scope', scopeLabel(item.scope)], ['ingested', fullTime(item.created_at)], ['chunk', item.chunk_index + 1],
+          ['~tokens', item.token_estimate || ''], ['retired', item.retired_at ? fullTime(item.retired_at) : '']]));
+      body.push(section('Text', h('div', { class: 'pre', text: item.content })));
     }
 
+    if (item.table !== 'summaries' && item.table !== 'documents') body.push(feedbackSection(item, feedback || {}));
+
     const around = h('div', { class: 'section', hidden: true });
+    const versions = item.table === 'facts' || item.table === 'procedures'
+      ? h('div', { class: 'section' }, h('h3', { text: 'History' }), h('div', { class: 'muted', text: 'Loading…' })) : null;
     const why = h('div', { class: 'section' }, h('h3', { text: 'Where this came from' }), h('div', { class: 'muted', text: 'Loading…' }));
     const canTimeline = item.table === 'observations' || item.table === 'summaries';
     const actions = h('div', { class: 'actions' },
@@ -527,8 +586,46 @@
       h('button', { class: 'btn small', onclick: () => { navigator.clipboard?.writeText(item.id).then(() => toast('Id copied'), () => toast(item.id)); } }, 'Copy id'),
       h('button', { class: 'btn small danger', onclick: () => confirmForget(item) }, 'Forget…'));
     const idLine = h('div', { class: 'muted', title: item.id }, h('code', { text: item.id }));
-    $detail.replaceChildren(h('div', { class: 'detail-inner' }, actions, head, ...body, around, why, idLine));
+    $detail.replaceChildren(h('div', { class: 'detail-inner' }, actions, head, ...body, versions, around, why, idLine));
+    if (versions) loadHistory(item.id, versions);
     loadExplain(item.id, why);
+  }
+
+  // helpful / wrong / outdated on a memory, with how many were given. A verdict counts once per user; a
+  // fact with enough negative ones is queued for the consolidation planner, which retracts it (undoable).
+  const VERDICTS = [['helpful', 'Helpful'], ['wrong', 'Wrong'], ['outdated', 'Outdated']];
+  function feedbackSection(item, counts) {
+    const note = h('input', { class: 'input', type: 'text', maxlength: '500', placeholder: 'Optional note, kept with the verdict', 'aria-label': 'Feedback note' });
+    async function send(verdict) {
+      try {
+        const res = await api(`/v1/memories/${item.id}/feedback`, { method: 'POST', body: { verdict, note: note.value.trim() || undefined } });
+        toast(res.applied ? (res.queued ? 'Noted. It is queued for review.' : 'Noted.') : `You already marked this ${verdict}.`);
+        if (res.applied && state.selected && state.selected.id === item.id) openMemory(item.id, item.table, { fromHash: true });
+      } catch (e) { if (e.status !== 401) toast(e.message, true); }
+    }
+    return h('div', { class: 'section' }, h('h3', { text: 'Was this right?' }),
+      h('div', { class: 'actions' }, VERDICTS.map(([verdict, label]) =>
+        h('button', { class: `btn small verdict ${verdict}`, type: 'button', onclick: () => send(verdict) },
+          label, h('span', { class: 'count', text: String(counts[verdict] || 0) })))),
+      note);
+  }
+
+  // The chain of versions a fact or procedure went through, oldest first; the one on screen is marked.
+  async function loadHistory(id, box) {
+    const title = h('h3', { text: 'History' });
+    try {
+      const res = await api(`/v1/memories/${id}/history`);
+      if (!state.selected || state.selected.id !== id) return;
+      const entries = res.entries || [];
+      if (entries.length < 2) { box.replaceChildren(title, h('div', { class: 'muted', text: 'This is the only version so far.' })); return; }
+      box.replaceChildren(title, h('ol', { class: 'history' }, entries.map((e) => h('li', { class: e.current ? 'current' : '', 'aria-current': e.current ? 'true' : false },
+        e.current ? h('div', { class: 'hist-text', text: e.text })
+          : h('button', { class: 'hist-link', type: 'button', onclick: () => openMemory(e.id, e.table), text: e.text }),
+        kv([['status', e.status], ['from', e.valid_from ? fullTime(e.valid_from) : ''], ['until', e.valid_to ? fullTime(e.valid_to) : (e.status === 'active' ? 'now' : '')],
+          ['ended by', e.ended_by], ['why', e.reason], ['model', e.model]])))));
+    } catch (e) {
+      if (e.status !== 401) box.replaceChildren(title, h('div', { class: 'muted', text: e.message }));
+    }
   }
 
   async function showTimeline(id, box) {
@@ -567,7 +664,7 @@
       }
       if (!ex.provenance && !(ex.evidence && ex.evidence.length)) parts.push(h('div', { class: 'muted', text: 'No source observations are linked to this one.' }));
       if (ex.audit && ex.audit.length) {
-        parts.push(h('h3', { text: 'History' }));
+        parts.push(h('h3', { text: 'Audit log' }));
         parts.push(h('div', { class: 'scroll-x' }, h('table', { class: 't' },
           h('thead', {}, h('tr', {}, ['When', 'Who', 'What', 'Why'].map((c) => h('th', { text: c })))),
           h('tbody', {}, ex.audit.map((a) => h('tr', {}, h('td', { text: fullTime(a.created_at) }), h('td', { text: a.actor }), h('td', { text: a.action }), h('td', { text: [a.reason, a.model].filter(Boolean).join(' · ') })))))));
@@ -587,7 +684,7 @@
       h('form', { method: 'dialog' },
         h('h3', { id: 'forget-title', text: 'Forget this memory?' }),
         h('div', { class: 'pre', text: label }),
-        h('p', { class: 'muted', text: item.table === 'facts' ? 'The fact is retracted: agents stop using it, and the history stays in the audit log.' : item.table === 'procedures' ? 'The procedure is retired.' : 'The observation is archived: it no longer shows up in searches or context. The viewer cannot undo this.' }),
+        h('p', { class: 'muted', text: item.table === 'facts' ? 'The fact is retracted: agents stop using it, and the history stays in the audit log.' : item.table === 'procedures' ? 'The procedure is retired.' : item.table === 'documents' ? 'This chunk of the document is retired: it no longer shows up in searches. `mem-hook ingest --force` on the file brings it back.' : 'The observation is archived: it no longer shows up in searches or context. The viewer cannot undo this.' }),
         h('label', { class: 'field', for: 'reason' }, h('span', { text: 'Why' }), reason),
         h('menu', {}, h('button', { class: 'btn', type: 'submit', value: 'cancel' }, 'Cancel'), go)));
     document.body.append(dlg);
@@ -619,7 +716,8 @@
     $main.replaceChildren(h('div', { class: 'page' }, h('div', { class: 'page-inner' },
       h('h2', { text: 'Work state' }),
       h('p', { class: 'muted', text: 'Open lists agents keep per project, like todo or handoff. Later writes win; they are shown at the start of every session until closed.' }),
-      h('div', { class: 'toolbar' }, h('label', { class: 'field' }, h('span', { text: 'Scope' }), sel)), out)));
+      h('div', { class: 'toolbar' }, h('label', { class: 'field' }, h('span', { text: 'Scope' }), sel)), out,
+      statsPanel())));
     async function fill() {
       out.replaceChildren(h('div', { class: 'muted', text: 'Loading…' }));
       try {
@@ -635,13 +733,61 @@
     fill();
   }
 
+  // Tokens served per session start (by injection mode) and per recall (GET /v1/stats/recall).
+  const CALL_LABELS = { context: 'Session start', recall: 'Recall' };
+  function statsPanel() {
+    const days = h('select', { class: 'input', 'aria-label': 'Window', onchange: () => load() },
+      [1, 7, 30, 90].map((d) => h('option', { value: String(d), text: d === 1 ? 'Last day' : `Last ${d} days` })));
+    days.value = '7';
+    const all = state.admin ? h('input', { type: 'checkbox', onchange: () => load() }) : null;
+    const out = h('div', {});
+    async function load() {
+      out.replaceChildren(h('div', { class: 'muted', text: 'Loading…' }));
+      try {
+        const stats = await api(`/v1/stats/recall?days=${days.value}${all && all.checked ? '&all=true' : ''}`);
+        if (!stats.modes.length) { out.replaceChildren(h('div', { class: 'empty', text: 'No context or recall calls in this window.' })); return; }
+        const num = (v) => h('td', { class: 'num', text: Math.round(v).toLocaleString() });
+        out.replaceChildren(h('div', { class: 'scroll-x' }, h('table', { class: 't' },
+          h('thead', {}, h('tr', {}, ['Call', 'Mode', 'Calls', 'Avg tokens', 'p50', 'p95', 'Avg memories'].map((c) => h('th', { text: c })))),
+          h('tbody', {}, stats.modes.map((m) => h('tr', {},
+            h('td', { text: CALL_LABELS[m.mode] || m.mode }), h('td', { text: m.injection || '–' }),
+            num(m.calls), num(m.avg_tokens), num(m.p50_tokens), num(m.p95_tokens), h('td', { class: 'num', text: m.avg_hits.toFixed(1) })))))));
+      } catch (e) { if (e.status !== 401) out.replaceChildren(h('div', { class: 'error', text: e.message })); }
+    }
+    load();
+    return h('div', { class: 'page-inner' },
+      h('h2', { text: 'Tokens served' }),
+      h('p', { class: 'muted', text: 'Estimated tokens per call. The full context is a budgeted block with recent observations and sessions (about 1,000 tokens); the lean context is the profile, open work and a short rubric (about 400) and leaves the rest to the search tools. Change the default in the header.' }),
+      h('div', { class: 'toolbar' }, h('label', { class: 'field' }, h('span', { text: 'Window' }), days),
+        all ? h('label', { class: 'field' }, h('span', { text: 'All users' }), all) : null),
+      out);
+  }
+
   // ---------- admin ----------
   async function renderAdmin() {
     const own = (state.token.split('_')[1] || '');
-    const tokens = h('div', {}), packets = h('div', {}), jobs = h('div', {});
+    const health = h('div', {}), tokens = h('div', {}), runs = h('div', {}), packets = h('div', {}), jobs = h('div', {});
     $main.replaceChildren(h('div', { class: 'page' }, h('div', { class: 'page-inner' },
-      h('h2', { text: 'Tokens' }), tokens, h('h2', { text: 'Failed work packets' }), packets, h('h2', { text: 'Failed background jobs' }), jobs)));
+      h('div', { class: 'head-row' }, h('h2', { text: 'Health' }), h('button', { class: 'btn small', onclick: () => loadDoctor() }, 'Check again')), health,
+      h('h2', { text: 'Tokens' }), tokens,
+      h('h2', { text: 'Consolidation runs' }),
+      h('p', { class: 'muted', text: 'Planner runs, newest first, with what started them: the nightly pass, the end of a session, enough new observations in a scope, or an operator. Runs waiting in the queue come first.' }), runs,
+      h('h2', { text: 'Failed work packets' }), packets, h('h2', { text: 'Failed background jobs' }), jobs)));
 
+    // Server diagnosis (GET /v1/admin/doctor). detail and fix are server text: textContent only, the fix in <code>.
+    async function loadDoctor() {
+      health.replaceChildren(h('div', { class: 'muted', text: 'Checking…' }));
+      try {
+        const { checks } = await api('/v1/admin/doctor');
+        const level = { ok: 'ok', warn: 'warn', fail: 'bad' };
+        health.replaceChildren(h('div', { class: 'scroll-x' }, h('table', { class: 't' },
+          h('thead', {}, h('tr', {}, ['Check', 'Status', 'Detail'].map((c) => h('th', { text: c })))),
+          h('tbody', {}, checks.map((c) => h('tr', {},
+            h('td', { text: c.name }),
+            h('td', {}, h('i', { class: `dot ${level[c.status] || 'bad'}` }), ` ${c.status}`),
+            h('td', {}, c.detail, c.fix ? h('div', { class: 'muted' }, 'Fix: ', h('code', { text: c.fix })) : null)))))));
+      } catch (e) { if (e.status !== 401) health.replaceChildren(h('div', { class: 'error', text: e.message })); }
+    }
     async function loadTokens() {
       try {
         const list = await api('/v1/admin/tokens');
@@ -658,6 +804,21 @@
       if (!confirm(isOwn ? 'This is the token you are signed in with. Revoke it and sign out?' : `Revoke token mem_${t.prefix}_…? The device using it loses access.`)) return;
       try { await api(`/v1/admin/tokens/${t.id}`, { method: 'DELETE' }); toast('Token revoked'); if (isOwn) signOut('You revoked your own token.'); else loadTokens(); } catch (e) { if (e.status !== 401) toast(e.message, true); }
     }
+    // GET /v1/admin/consolidation (finished runs) and the queued `plan` jobs, each with its trigger.
+    async function loadRuns() {
+      try {
+        const [done, queued] = await Promise.all([api('/v1/admin/consolidation?limit=20'), api('/v1/admin/jobs?type=plan&status=queued&limit=20')]);
+        const counts = (o) => Object.entries(o || {}).map(([k, v]) => `${k} ${v}`).join(', ') || '–';
+        const trigger = (t) => h('span', { class: 'pill', text: t.replace('_', ' ') });
+        const rows = [
+          ...queued.map((j) => h('tr', {}, h('td', { title: fullTime(j.run_after), text: `queued for ${fullTime(j.run_after)}` }), h('td', {}, trigger(j.trigger || 'manual')), h('td', { text: j.scope || '' }), h('td', { text: '–' }), h('td', { text: '–' }))),
+          ...done.map((r) => h('tr', {}, h('td', { title: fullTime(r.created_at), text: ago(r.created_at) }), h('td', {}, trigger(r.trigger)), h('td', { text: r.scope || 'all scopes' }), h('td', { text: counts(r.packets) }), h('td', { text: counts(r.actions) }))),
+        ];
+        runs.replaceChildren(rows.length ? h('div', { class: 'scroll-x' }, h('table', { class: 't' },
+          h('thead', {}, h('tr', {}, ['When', 'Trigger', 'Scope', 'Packets', 'Actions'].map((c) => h('th', { text: c })))),
+          h('tbody', {}, rows))) : h('div', { class: 'muted', text: 'None yet.' }));
+      } catch (e) { if (e.status !== 401) runs.replaceChildren(h('div', { class: 'error', text: e.message })); }
+    }
     async function loadPackets() {
       try {
         const list = await api('/v1/admin/packets?status=failed&limit=20');
@@ -673,10 +834,10 @@
         const list = await api('/v1/admin/jobs?status=failed&limit=20');
         jobs.replaceChildren(list.length ? h('div', { class: 'scroll-x' }, h('table', { class: 't' },
           h('thead', {}, h('tr', {}, ['Type', 'Attempts', 'Created', 'Error'].map((c) => h('th', { text: c })))),
-          h('tbody', {}, list.map((j) => h('tr', {}, h('td', { text: j.type }), h('td', { text: j.attempts }), h('td', { text: ago(j.created_at) }), h('td', { text: j.last_error || '' })))))) : h('div', { class: 'muted', text: 'None.' }));
+          h('tbody', {}, list.map((j) => h('tr', {}, h('td', { text: j.trigger ? `${j.type} (${j.trigger})` : j.type }), h('td', { text: j.attempts }), h('td', { text: ago(j.created_at) }), h('td', { text: j.last_error || '' })))))) : h('div', { class: 'muted', text: 'None.' }));
       } catch (e) { if (e.status !== 401) jobs.replaceChildren(h('div', { class: 'error', text: e.message })); }
     }
-    loadTokens(); loadPackets(); loadJobs();
+    loadDoctor(); loadTokens(); loadRuns(); loadPackets(); loadJobs();
   }
 
   // ---------- keyboard ----------

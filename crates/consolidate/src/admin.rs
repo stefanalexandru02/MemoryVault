@@ -9,11 +9,11 @@ use axum::routing::{delete, get, post};
 use memvault_core::auth::{self, Identity, require_scope};
 use memvault_core::http::{Json, Path, Query};
 use memvault_core::schemas::admin::{
-    ConsolidateRequest, ConsolidateResponse, JobOut, MembershipCreate, MembershipOut, PacketRetryRequest,
-    ReindexRequest, ReindexResponse, RevertResponse, SpaceCreate, SpaceOut, TokenCreate, TokenMinted, TokenOut,
-    UserCreate, UserOut,
+    ConsolidateRequest, ConsolidateResponse, DoctorResponse, JobOut, MembershipCreate, MembershipOut,
+    PacketRetryRequest, PlannerRunOut, ReindexRequest, ReindexResponse, RevertResponse, SpaceCreate, SpaceOut,
+    TokenCreate, TokenMinted, TokenOut, UserCreate, UserOut,
 };
-use memvault_core::schemas::common::{PacketKind, PacketStatus};
+use memvault_core::schemas::common::{PacketKind, PacketStatus, PlanTrigger};
 use memvault_core::schemas::work::PacketRecord;
 use memvault_core::{ApiError, AppState};
 use serde::Deserialize;
@@ -21,7 +21,7 @@ use serde::de::DeserializeOwned;
 use uuid::Uuid;
 
 use crate::ops::{self, RemapRequest, RemapResponse};
-use crate::planner::run_planner;
+use crate::planner::{PlanOptions, run_planner_for};
 use crate::revert::revert_run;
 use memvault_core::system_tx;
 
@@ -33,10 +33,12 @@ pub fn router() -> Router<AppState> {
         .route("/admin/tokens", post(mint_token).get(list_tokens))
         .route("/admin/tokens/{id}", delete(revoke_token))
         .route("/admin/consolidate", post(consolidate))
+        .route("/admin/consolidation", get(list_runs))
         .route("/admin/consolidation/{run_id}/revert", post(revert))
         .route("/admin/jobs", get(list_jobs))
         .route("/admin/packets", get(list_packets))
         .route("/admin/packets/{id}/retry", post(retry_packet))
+        .route("/admin/doctor", get(doctor))
         .route("/admin/reindex", post(reindex))
         .route("/admin/project-remap", post(remap_project))
 }
@@ -158,15 +160,37 @@ async fn revoke_token(
     Ok(Json(out))
 }
 
-/// Plan now; an empty body means every space.
+/// Plan now (trigger `manual`); an empty body means every space and scope.
 async fn consolidate(
     State(state): State<AppState>,
     identity: Identity,
     body: Bytes,
 ) -> Result<Json<ConsolidateResponse>, ApiError> {
     admin(&state, &identity).await?;
-    let space_id = optional_body::<ConsolidateRequest>(&body)?.and_then(|b| b.space_id);
-    Ok(Json(run_planner(&state, space_id).await?))
+    let req = optional_body::<ConsolidateRequest>(&body)?.unwrap_or_default();
+    req.validate()?;
+    Ok(Json(run_planner_for(&state, &PlanOptions::manual(req.space_id, req.scope)).await?))
+}
+
+#[derive(Debug, Default, Deserialize)]
+struct RunsQuery {
+    #[serde(default, deserialize_with = "memvault_core::schemas::common::opt_from_str::deserialize")]
+    trigger: Option<PlanTrigger>,
+    #[serde(default)]
+    space_id: Option<Uuid>,
+    #[serde(default)]
+    limit: Option<i64>,
+}
+
+/// Planner runs, newest first, each with the trigger that started it.
+async fn list_runs(
+    State(state): State<AppState>,
+    identity: Identity,
+    Query(q): Query<RunsQuery>,
+) -> Result<Json<Vec<PlannerRunOut>>, ApiError> {
+    admin(&state, &identity).await?;
+    let mut tx = system_tx(&state.db.system).await?;
+    Ok(Json(ops::list_runs(&mut tx, q.trigger, q.space_id, q.limit).await?))
 }
 
 async fn revert(
@@ -235,6 +259,11 @@ async fn retry_packet(
     let out = ops::retry_packet(&mut tx, id, reset).await?;
     tx.commit().await?;
     Ok(Json(out))
+}
+
+async fn doctor(State(state): State<AppState>, identity: Identity) -> Result<Json<DoctorResponse>, ApiError> {
+    admin(&state, &identity).await?;
+    Ok(Json(crate::doctor::doctor(&state).await))
 }
 
 async fn reindex(

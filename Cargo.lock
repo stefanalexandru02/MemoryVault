@@ -1746,9 +1746,11 @@ dependencies = [
 name = "mem-hook"
 version = "0.1.0"
 dependencies = [
+ "hex",
  "libc",
  "serde",
  "serde_json",
+ "sha2 0.11.0",
  "tempfile",
  "ureq",
 ]
@@ -1940,6 +1942,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "memvault-consolidate",
  "memvault-core",
  "memvault-ingest",
  "memvault-recall",

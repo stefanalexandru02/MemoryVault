@@ -507,7 +507,7 @@ Window assignment at ingest (Section 9.1). When a window closes, the handler cre
 
 ### 6.3 Recall and context
 
-`POST /v1/recall` (memories:read)
+`POST /v1/recall` (memories:read); an optional `as_of` (RFC 3339) recalls what was valid at that instant
 ```json
 { "space_ids": ["…"], "scopes": [{"kind":"global","key":""},{"kind":"project","key":"github.com/alex/homelab"},{"kind":"device","key":"laptop-x1"}],
   "query": "redeploy the memory api after the migration", "task_state": {"intent":"deploy","entities":["memory-api"]},
@@ -523,10 +523,11 @@ Window assignment at ingest (Section 9.1). When a window closes, the handler cre
 
 ### 6.4 Memories
 
-- `GET /v1/search?q=…&space_ids=…&scopes=…&types=…&since=…&until=…&files=…&limit=20&offset=0` → index rows `{id, table, type, title, created_at, scope, token_estimate, score}`. Requires `q` or at least one filter.
+- `GET /v1/search?q=…&space_ids=…&scopes=…&types=…&since=…&until=…&files=…&as_of=…&limit=20&offset=0` → index rows `{id, table, type, title, created_at, scope, token_estimate, score}`. Requires `q` or at least one filter. `as_of` (RFC 3339) searches the memory as it stood at that instant (see `docs/deviations.md`).
 - `GET /v1/timeline?anchor_id=…&before=5&after=5` → observations and summaries around an anchor in time order, same scope.
 - `POST /v1/memories/get` `{ "ids": [...] }` (≤ 20) → full bodies; writes `access_log`.
 - `GET /v1/memories/{id}/explain` → Section 12.5 shape.
+- `GET /v1/memories/{id}/history` → `{id, table, entries[]}`: the supersession chain through the id, oldest first. Each entry has `id, table, text, status, valid_from, valid_to, supersedes_id, superseded_by, current` and, once it was replaced or retracted, `ended_at, ended_by, reason, model, run_id` from the audit log. 404 when the id is not visible.
 - `POST /v1/memories` (memories:write) `{ "kind": "fact|observation|procedure", "scope": {...}, "space_id": "…", ... }`. Facts land `active`, `confidence 0.95`, `written_by_client_id` set. Observations get `extracted_by = {"runner_kind":"explicit"}`.
 - `DELETE /v1/memories/{id}` → fact `retracted` / observation `archived_at` / procedure `retired`, audited. `?hard=true` requires `admin`.
 - `GET /v1/observations/by-file?path=…&project_key=…&limit=15` for the Phase 4 file-context hook.
@@ -556,10 +557,11 @@ Mounted at `/mcp`, streamable HTTP, stateless (new server instance per request; 
 
 | Tool | Arguments | Returns | Cap |
 |---|---|---|---|
-| `memory_search` | `query: string`, `types?: string[]`, `scope?: "project"\|"global"\|"all"`, `since?: string`, `files?: string[]`, `limit?: int (≤ 30)` | Index table: id, date, type glyph, title, ~tokens. Same renderer as the SessionStart index. | ~2k tokens |
+| `memory_search` | `query: string`, `types?: string[]`, `scope?: "project"\|"global"\|"all"`, `since?: string`, `files?: string[]`, `as_of?: string (RFC 3339)`, `limit?: int (≤ 30)` | Index table: id, date, type glyph, title, ~tokens. Same renderer as the SessionStart index. | ~2k tokens |
 | `memory_timeline` | `anchor_id: string`, `before?: int (≤ 10)`, `after?: int (≤ 10)` | Index rows around the anchor, with the anchor marked. | ~2k tokens |
 | `memory_get` | `ids: string[] (≤ 20)` | Full bodies, rendered with citation tags. | ~6k tokens, longer bodies truncated with a marker |
 | `memory_explain` | `id: string` | Provenance chain (Section 12.5) rendered as markdown. | ~2k tokens |
+| `memory_history` | `id: string` | Supersession chain of a fact or procedure, oldest first, with who replaced each version and why. | ~2k tokens |
 | `memory_remember` | `kind: "fact"\|"note"\|"procedure"`, `content: string`, `scope?: "project"\|"global"`, `subject?: string`, `predicate?: string` | Created id and how it will be shown. | small |
 | `memory_forget` | `id: string`, `reason?: string` | Confirmation. Soft only. | small |
 | `work_state_write` | `list: string`, `fields: object` | Folded list after write. | small |

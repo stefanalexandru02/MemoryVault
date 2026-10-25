@@ -11,10 +11,10 @@ use memvault_core::auth::{self, MintOptions};
 use memvault_core::ids::new_id;
 use memvault_core::invalidate::notify_invalidate;
 use memvault_core::schemas::admin::{
-    MembershipCreate, MembershipOut, ReindexRequest, ReindexResponse, SpaceCreate, SpaceOut, TokenCreate, TokenMinted,
-    TokenOut, UserCreate, UserOut,
+    MembershipCreate, MembershipOut, PlannerRunOut, ReindexRequest, ReindexResponse, SpaceCreate, SpaceOut,
+    TokenCreate, TokenMinted, TokenOut, UserCreate, UserOut,
 };
-use memvault_core::schemas::common::{EmbeddingOwnerTable, PacketKind, PacketStatus, ScopeKind};
+use memvault_core::schemas::common::{EmbeddingOwnerTable, PacketKind, PacketStatus, PlanTrigger, ScopeKind};
 use memvault_core::schemas::work::PacketRecord;
 use serde::{Deserialize, Serialize};
 use sqlx::PgConnection;
@@ -177,12 +177,33 @@ pub async fn list_jobs(
     limit: Option<i64>,
 ) -> Result<Vec<memvault_core::schemas::admin::JobOut>, ApiError> {
     Ok(sqlx::query_as(
-        "SELECT id, type, payload, status, attempts, run_after, locked_by, locked_until, last_error, created_at
+        "SELECT id, type, payload, status, attempts, run_after, locked_by, locked_until, last_error, created_at,
+                payload ->> 'trigger' AS trigger,
+                CASE WHEN payload ? 'scope' THEN (payload #>> '{scope,kind}') || ':' || (payload #>> '{scope,key}') END AS scope
            FROM jobs WHERE ($1::text IS NULL OR status = $1) AND ($2::text IS NULL OR type = $2)
           ORDER BY created_at DESC, id DESC LIMIT $3",
     )
     .bind(status)
     .bind(job_type)
+    .bind(clamp_limit(limit))
+    .fetch_all(conn)
+    .await?)
+}
+
+pub async fn list_runs(
+    conn: &mut PgConnection,
+    trigger: Option<PlanTrigger>,
+    space_id: Option<Uuid>,
+    limit: Option<i64>,
+) -> Result<Vec<PlannerRunOut>, ApiError> {
+    Ok(sqlx::query_as(
+        "SELECT run_id, space_id, CASE WHEN scope_kind IS NOT NULL THEN scope_kind::text || ':' || scope_key END AS scope,
+                trigger, packets, actions, created_at
+           FROM planner_runs WHERE ($1::text IS NULL OR trigger = $1) AND ($2::uuid IS NULL OR space_id = $2)
+          ORDER BY created_at DESC, run_id DESC LIMIT $3",
+    )
+    .bind(trigger)
+    .bind(space_id)
     .bind(clamp_limit(limit))
     .fetch_all(conn)
     .await?)
@@ -238,7 +259,18 @@ pub async fn retry_packet(conn: &mut PgConnection, id: Uuid, reset_attempts: boo
 
 // ---------- reindex ----------
 
-/// Queue `embed` jobs for every live row of the chosen tables (default: all five), optionally in one
+/// SQL condition selecting the rows of `table` that get embeddings (`true` when all do).
+pub(crate) fn live_filter(table: EmbeddingOwnerTable) -> &'static str {
+    match table {
+        EmbeddingOwnerTable::Observations => "archived_at IS NULL",
+        EmbeddingOwnerTable::Facts => "status IN ('candidate', 'active')",
+        EmbeddingOwnerTable::Procedures => "status = 'active'",
+        EmbeddingOwnerTable::Documents => "retired_at IS NULL",
+        EmbeddingOwnerTable::Summaries | EmbeddingOwnerTable::Entities => "true",
+    }
+}
+
+/// Queue `embed` jobs for every live row of the chosen tables (default: all six), optionally in one
 /// space. The payload carries the target `model` for the worker.
 pub async fn reindex(
     conn: &mut PgConnection,
@@ -249,14 +281,9 @@ pub async fn reindex(
     let tables: Vec<EmbeddingOwnerTable> = req.tables.clone().unwrap_or_else(|| EmbeddingOwnerTable::ALL.to_vec());
     let mut enqueued = 0_i64;
     for table in tables {
-        let live = match table {
-            EmbeddingOwnerTable::Observations => "AND archived_at IS NULL",
-            EmbeddingOwnerTable::Facts => "AND status IN ('candidate', 'active')",
-            EmbeddingOwnerTable::Procedures => "AND status = 'active'",
-            EmbeddingOwnerTable::Summaries | EmbeddingOwnerTable::Entities => "",
-        };
+        let live = live_filter(table);
         let owners: Vec<Uuid> = sqlx::query_scalar(&format!(
-            "SELECT id FROM {table} WHERE ($1::uuid IS NULL OR space_id = $1) {live} ORDER BY id"
+            "SELECT id FROM {table} WHERE ($1::uuid IS NULL OR space_id = $1) AND {live} ORDER BY id"
         ))
         .bind(req.space_id)
         .fetch_all(&mut *conn)

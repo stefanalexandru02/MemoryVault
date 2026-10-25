@@ -2,6 +2,7 @@
 
 use std::time::Duration;
 
+use chrono::{DateTime, Utc};
 use serde_json::Value;
 use sqlx::PgPool;
 use uuid::Uuid;
@@ -39,6 +40,20 @@ pub async fn claim(pool: &PgPool, worker: &str, types: &[&str], limit: i64) -> R
     .bind(limit)
     .fetch_all(pool)
     .await
+}
+
+/// Put a running job back in the queue to run again at `until`; the run does not count as an attempt.
+pub async fn defer(pool: &PgPool, id: Uuid, until: DateTime<Utc>) -> Result<(), sqlx::Error> {
+    sqlx::query(
+        "UPDATE jobs SET status = 'queued', run_after = $2, attempts = greatest(attempts - 1, 0),
+                         locked_by = NULL, locked_until = NULL
+          WHERE id = $1",
+    )
+    .bind(id)
+    .bind(until)
+    .execute(pool)
+    .await?;
+    Ok(())
 }
 
 pub async fn complete(pool: &PgPool, id: Uuid) -> Result<(), sqlx::Error> {

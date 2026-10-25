@@ -21,6 +21,16 @@ Then answer from what you read:
 
 - Say where it came from: the date, and the project or device when the entry shows one. Do not present a
   memory as certain when it may be out of date; code and the user's current instructions win over memory.
+- To see memory as it was on an earlier date, pass `as_of` (RFC 3339, e.g. `2026-09-01T00:00:00Z`) to
+  `memory_search`; it then also covers facts and procedures, and facts that were replaced since count again.
+  To see how one fact or procedure changed, call **`memory_history`** with its id.
+- Treat a memory tagged `disputed` or `unconfirmed N months` (in the context block, in search results and in
+  `memory_get`) with care: check it against the code or ask the user before relying on it, and say it is unconfirmed.
+- When a recalled memory turned out to be right, wrong or out of date, call **`memory_feedback`** with its `id`,
+  a `verdict` (`helpful`, `wrong` or `outdated`) and a short `note` saying what is true now. Do it once per memory
+  and only on evidence from this session or the user, not on a guess. Negative verdicts lower a fact's confidence,
+  and repeated ones queue it for the consolidation planner to retract or replace; nothing is deleted outright. If
+  the user asks to remove a memory, use `memory_forget` instead.
 - If the search finds nothing relevant, say so and carry on. Do not guess at what the memory might contain.
 - To answer "why do you think that?" about a memory, call **`memory_explain`** with its id. It shows the
   session, the events and the extractor behind it.

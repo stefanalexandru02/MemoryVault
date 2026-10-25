@@ -319,3 +319,40 @@ async fn invalidate_function_crosses_users(pool: PgPool) {
         sqlx::query_scalar(sql).bind(alice.space_id).bind("project").bind("local/p").fetch_one(&mut *tx).await.unwrap();
     assert_eq!(n, 1);
 }
+
+/// user_settings has no space_id, so the space-table checks do not cover it: each user sees and writes
+/// only their own row.
+#[sqlx::test(migrations = "../../migrations")]
+async fn user_settings_are_per_user(pool: PgPool) {
+    let alice = seed_identity(&pool, TokenKind::Device).await;
+    let bob = seed_identity(&pool, TokenKind::Device).await;
+    let (rls, forced): (bool, bool) = sqlx::query_as(
+        "SELECT relrowsecurity, relforcerowsecurity FROM pg_class WHERE oid = 'user_settings'::regclass",
+    )
+    .fetch_one(&pool)
+    .await
+    .unwrap();
+    assert!(rls && forced);
+
+    let insert = "INSERT INTO user_settings (user_id, injection_mode) VALUES ($1, 'lean')";
+    let mut tx = user_tx(&pool, &alice.identity).await.unwrap();
+    sqlx::query(insert).bind(alice.user_id).execute(&mut *tx).await.unwrap();
+    tx.commit().await.unwrap();
+    // another user's row cannot be written ...
+    let mut tx = user_tx(&pool, &alice.identity).await.unwrap();
+    let err = sqlx::query(insert).bind(bob.user_id).execute(&mut *tx).await.unwrap_err();
+    assert!(err.to_string().contains("row-level security"), "{err}");
+    drop(tx);
+
+    // ... nor seen or changed
+    let mut tx = user_tx(&pool, &bob.identity).await.unwrap();
+    assert_eq!(count(&mut tx, "SELECT count(*) FROM user_settings").await, 0);
+    let n = sqlx::query("UPDATE user_settings SET injection_mode = 'full'").execute(&mut *tx).await.unwrap();
+    assert_eq!(n.rows_affected(), 0);
+    let n = sqlx::query("DELETE FROM user_settings").execute(&mut *tx).await.unwrap();
+    assert_eq!(n.rows_affected(), 0);
+    tx.commit().await.unwrap();
+
+    let mut tx = user_tx(&pool, &alice.identity).await.unwrap();
+    assert_eq!(count(&mut tx, "SELECT count(*) FROM user_settings WHERE injection_mode = 'lean'").await, 1);
+}

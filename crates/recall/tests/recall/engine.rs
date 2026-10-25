@@ -4,8 +4,9 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use async_trait::async_trait;
+use chrono::{DateTime, Utc};
 use memvault_core::auth::scopes::TokenKind;
-use memvault_core::schemas::common::{MembershipRole, Scope, ScopeKind, Sensitivity, SummaryGrain};
+use memvault_core::schemas::common::{MembershipRole, MemoryTable, Scope, ScopeKind, Sensitivity, SummaryGrain};
 use memvault_core::schemas::memories::{ByFileQuery, MemoryItem, SearchQuery, TimelineQuery};
 use memvault_core::schemas::recall::{Budgets, FeedbackRequest, RecallRequest, TaskState};
 use memvault_core::tei::{Embedder, FakeTei, TeiError, TeiHealth};
@@ -172,7 +173,8 @@ async fn budgets_bound_every_slot(pool: PgPool) {
         .await;
         insert_fact(&w, Fact::new(space, &format!("prefers.tool_{i}"), "kubernetes deploy with helm")).await;
     }
-    let budgets = Budgets { profile: 0, facts: 40, procedures: 0, observations: 120, summaries: 0, work_state: 0 };
+    let budgets =
+        Budgets { profile: 0, facts: 40, procedures: 0, observations: 120, summaries: 0, work_state: 0, documents: 0 };
     let r = RecallRequest { budgets, expand_top_observations: 1, ..req("kubernetes deploy") };
     let resp = engine::recall(&w.state, &w.alice.identity, r).await.unwrap();
     let by = &resp.tokens.by_slot;
@@ -539,7 +541,15 @@ async fn rows_beyond_the_reranked_top_never_outrank_reranked_ones(pool: PgPool) 
         insert_summary(&w, space, &project(), None, SummaryGrain::Session, &format!("quokka survey {i}"), "next", 1.0)
             .await;
     }
-    let budgets = Budgets { profile: 0, facts: 0, procedures: 0, observations: 20000, summaries: 20000, work_state: 0 };
+    let budgets = Budgets {
+        profile: 0,
+        facts: 0,
+        procedures: 0,
+        observations: 20000,
+        summaries: 20000,
+        work_state: 0,
+        documents: 0,
+    };
     let r = RecallRequest { budgets, ..req("quokka") };
     let resp = engine::recall(&w.state, &w.alice.identity, r).await.unwrap();
     assert!(resp.reranked);
@@ -586,7 +596,7 @@ async fn recall_and_context_write_access_log_for_returned_content(pool: PgPool) 
     let index_only: Vec<Uuid> = resp.slots.observations.iter().filter(|o| !o.expanded).map(|o| o.item.id).collect();
     assert!(index_only.iter().all(|id| !logged.contains(id)), "index lines are not content reads");
 
-    memvault_recall::context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup")
+    memvault_recall::context::render_context(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", None)
         .await
         .unwrap();
     let ctx: Vec<Uuid> = sqlx::query_scalar("SELECT unnest(target_ids) FROM access_log WHERE action = 'context'")
@@ -614,7 +624,8 @@ async fn pinned_facts_compete_for_the_budget_by_importance_not_by_id(pool: PgPoo
             .unwrap();
         ids.push(id);
     }
-    let all = Budgets { profile: 0, facts: 1000, procedures: 0, observations: 0, summaries: 0, work_state: 0 };
+    let all =
+        Budgets { profile: 0, facts: 1000, procedures: 0, observations: 0, summaries: 0, work_state: 0, documents: 0 };
     let full = engine::recall(&w.state, &w.alice.identity, RecallRequest { budgets: all, ..req("zzzz nothing") })
         .await
         .unwrap();
@@ -626,4 +637,312 @@ async fn pinned_facts_compete_for_the_budget_by_importance_not_by_id(pool: PgPoo
         .unwrap();
     let got: Vec<Uuid> = resp.slots.facts.iter().map(|f| f.item.id).collect();
     assert_eq!(got, [ids[2]], "the most important pinned fact is the one that fits");
+}
+
+fn at(rfc3339: &str) -> Option<DateTime<Utc>> {
+    Some(rfc3339.parse().unwrap())
+}
+
+/// Sorted ids a search finds in `tables` as of `as_of`.
+async fn found_as_of(w: &World, q: &str, tables: &[MemoryTable], as_of: Option<DateTime<Utc>>) -> Vec<Uuid> {
+    let q =
+        SearchQuery { q: Some(q.into()), tables: Some(tables.to_vec()), as_of, limit: 50, ..SearchQuery::default() };
+    let mut ids: Vec<Uuid> =
+        engine::search(&w.state, &w.alice.identity, q).await.unwrap().rows.into_iter().map(|r| r.id).collect();
+    ids.sort();
+    ids
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn as_of_search_sees_facts_as_they_were(pool: PgPool) {
+    let w = world(pool).await;
+    let h = insert_editor_history(&w).await;
+    let search = |as_of| found_as_of(&w, "editor", &[MemoryTable::Facts], as_of);
+    // Today only the current fact counts.
+    assert_eq!(search(None).await, vec![h.helix]);
+    // Before the switch the superseded fact is back in force (its null valid_from falls back to first_seen_at).
+    assert_eq!(search(at("2026-02-01T00:00:00Z")).await, vec![h.vim]);
+    // The end instant belongs to the successor.
+    assert_eq!(search(at("2026-03-01T00:00:00Z")).await, vec![h.helix]);
+    // Before the first sighting nothing held; the merged duplicate never does.
+    assert!(search(at("2025-12-31T00:00:00Z")).await.is_empty());
+    assert!(!search(at("2026-02-01T00:00:00Z")).await.contains(&h.dup));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn as_of_search_applies_to_every_tier(pool: PgPool) {
+    let w = world(pool).await;
+    let space = w.alice.space_id;
+    let obs = insert_obs(&w, Obs::new(space, "Rotated the nginx certificate", "nginx certificate rotation")).await;
+    let archived = insert_obs(&w, Obs::new(space, "Rotated the nginx cache", "nginx cache purge")).await;
+    let summary = insert_summary(
+        &w,
+        space,
+        &project(),
+        None,
+        SummaryGrain::Session,
+        "nginx certificate work",
+        "renew nginx certificate",
+        1.0,
+    )
+    .await;
+    let old_proc = insert_procedure(&w, space, "Renew nginx certificate", "deploy", "run certbot v1").await;
+    let new_proc = insert_procedure(&w, space, "Renew nginx certificate", "deploy", "run certbot v2").await;
+    for (id, when) in [(obs, "2026-02-01"), (archived, "2026-02-01"), (summary, "2026-02-02"), (old_proc, "2026-01-01")]
+    {
+        let table = if id == summary {
+            "summaries"
+        } else if id == old_proc {
+            "procedures"
+        } else {
+            "observations"
+        };
+        sqlx::query(&format!("UPDATE {table} SET created_at = $2::timestamptz WHERE id = $1"))
+            .bind(id)
+            .bind(when)
+            .execute(&w.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE observations SET archived_at = '2026-04-01T00:00:00Z' WHERE id = $1")
+        .bind(archived)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE procedures SET created_at = '2026-03-01T00:00:00Z', supersedes_id = $2 WHERE id = $1")
+        .bind(new_proc)
+        .bind(old_proc)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE procedures SET status = 'retired' WHERE id = $1")
+        .bind(old_proc)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let search = |as_of| found_as_of(&w, "nginx certificate", MemoryTable::ALL, as_of);
+    let sorted = |mut v: Vec<Uuid>| {
+        v.sort();
+        v
+    };
+    // January: only the first procedure existed.
+    assert_eq!(search(at("2026-01-15T00:00:00Z")).await, vec![old_proc]);
+    // Mid February: the observations and the summary exist and the first procedure still holds.
+    assert_eq!(search(at("2026-02-15T00:00:00Z")).await, sorted(vec![obs, archived, summary, old_proc]));
+    // Mid March the new procedure replaced it; the observation archived in April is still there.
+    assert_eq!(search(at("2026-03-15T00:00:00Z")).await, sorted(vec![obs, archived, summary, new_proc]));
+    assert_eq!(search(at("2026-04-15T00:00:00Z")).await, sorted(vec![obs, summary, new_proc]));
+    // Without as_of the archived observation and the retired procedure are gone.
+    let now = search(None).await;
+    assert!(now.contains(&obs) && now.contains(&new_proc) && !now.contains(&old_proc));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn as_of_recall_uses_the_past(pool: PgPool) {
+    let w = world(pool).await;
+    let h = insert_editor_history(&w).await;
+    sqlx::query(
+        "INSERT INTO profiles (space_id, scope_kind, scope_key, body_md, token_estimate, facts_version)
+         VALUES ($1, 'global', '', '- Prefers helix [fact#abcdef · 0.80 · 2026-10-01]', 10, 1)",
+    )
+    .bind(w.alice.space_id)
+    .execute(&w.pool)
+    .await
+    .unwrap();
+    let recall = |as_of, profile| {
+        let budgets = Budgets { profile, ..Budgets::default() };
+        let r = RecallRequest { rerank: false, budgets, as_of, ..req("editor") };
+        engine::recall(&w.state, &w.alice.identity, r)
+    };
+    let facts = |resp: &memvault_core::schemas::recall::RecallResponse| {
+        resp.slots.facts.iter().map(|f| f.item.id).collect::<Vec<_>>()
+    };
+    assert_eq!(facts(&recall(None, 0).await.unwrap()), vec![h.helix]);
+    assert_eq!(facts(&recall(at("2026-02-01T00:00:00Z"), 0).await.unwrap()), vec![h.vim]);
+    // The rendered profile describes the present; a past recall rebuilds it from the facts valid then.
+    let now = recall(None, Budgets::default().profile).await.unwrap();
+    assert!(now.slots.profile.unwrap().body_md.contains("Prefers helix"));
+    let past = recall(at("2026-02-01T00:00:00Z"), Budgets::default().profile).await.unwrap();
+    let profile = past.slots.profile.unwrap().body_md;
+    assert!(profile.contains("vim") && !profile.contains("helix"), "{profile}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn history_walks_the_chain_both_ways(pool: PgPool) {
+    let w = world(pool).await;
+    let h = insert_editor_history(&w).await;
+    sqlx::query("UPDATE facts SET status = 'superseded', valid_to = '2026-05-01T00:00:00Z' WHERE id = $1")
+        .bind(h.helix)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let third = insert_fact(&w, Fact::new(w.alice.space_id, "prefers.editor", "zed")).await;
+    sqlx::query("UPDATE facts SET valid_from = '2026-05-01T00:00:00Z', supersedes_id = $2 WHERE id = $1")
+        .bind(third)
+        .bind(h.helix)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    // The same chain from any link, oldest first, the asked-for one marked.
+    for asked in [h.vim, h.helix, third] {
+        let hist = engine::history(&w.state, &w.alice.identity, asked).await.unwrap();
+        let ids: Vec<Uuid> = hist.entries.iter().map(|e| e.id).collect();
+        assert_eq!(ids, vec![h.vim, h.helix, third], "from {asked}");
+        assert_eq!(hist.entries.iter().filter(|e| e.current).map(|e| e.id).collect::<Vec<_>>(), vec![asked]);
+    }
+    let hist = engine::history(&w.state, &w.alice.identity, h.helix).await.unwrap();
+    let [vim, helix, zed] = &hist.entries[..] else { panic!("{:?}", hist.entries) };
+    assert_eq!((vim.text.as_str(), vim.status.as_str()), ("prefers.editor: vim", "superseded"));
+    assert_eq!(vim.superseded_by, Some(h.helix));
+    assert_eq!((vim.ended_by.as_deref(), vim.reason.as_deref()), (Some("planner"), Some("switched in March")));
+    assert_eq!(vim.model.as_deref(), Some("sonnet"));
+    assert_eq!(helix.supersedes_id, Some(h.vim));
+    assert_eq!(helix.superseded_by, Some(third), "filled from the chain when the column is empty");
+    assert!(helix.ended_by.is_none(), "no audit entry is known for it");
+    assert_eq!((zed.status.as_str(), zed.valid_to, zed.superseded_by), ("active", None, None));
+    // The merged duplicate is no link of the chain; asked for directly it stands alone.
+    let dup = engine::history(&w.state, &w.alice.identity, h.dup).await.unwrap();
+    assert_eq!(dup.entries.len(), 1);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn history_covers_procedures_and_single_memories(pool: PgPool) {
+    let w = world(pool).await;
+    let space = w.alice.space_id;
+    let v1 = insert_procedure(&w, space, "Deploy the site", "deploy", "rsync the build").await;
+    let v2 = insert_procedure(&w, space, "Deploy the site", "deploy", "run the pipeline").await;
+    sqlx::query("UPDATE procedures SET created_at = '2026-02-01T00:00:00Z' WHERE id = $1")
+        .bind(v1)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    sqlx::query("UPDATE procedures SET status = 'retired' WHERE id = $1").bind(v1).execute(&w.pool).await.unwrap();
+    sqlx::query("UPDATE procedures SET supersedes_id = $2, version = 2 WHERE id = $1")
+        .bind(v2)
+        .bind(v1)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    sqlx::query(
+        "INSERT INTO memory_audit (id, space_id, actor, action, target_table, target_id, reason, created_at)
+         VALUES ($1, $2, 'planner', 'proc.retire', 'procedures', $3, 'revised by a newer version',
+                 '2026-04-01T00:00:00Z')",
+    )
+    .bind(Uuid::now_v7())
+    .bind(space)
+    .bind(v1)
+    .execute(&w.pool)
+    .await
+    .unwrap();
+    let hist = engine::history(&w.state, &w.alice.identity, v2).await.unwrap();
+    let [first, second] = &hist.entries[..] else { panic!("{:?}", hist.entries) };
+    assert_eq!((first.id, second.id), (v1, v2));
+    assert!(second.text.starts_with("Deploy the site (v2): run the pipeline"), "{}", second.text);
+    assert_eq!((first.status.as_str(), first.superseded_by), ("retired", Some(v2)));
+    assert_eq!(first.valid_to, at("2026-04-01T00:00:00Z"), "the audited retirement ends it");
+    assert_eq!(first.ended_by.as_deref(), Some("planner"));
+
+    let obs = insert_obs(&w, Obs::new(space, "Plain note", "no chain")).await;
+    let hist = engine::history(&w.state, &w.alice.identity, obs).await.unwrap();
+    assert_eq!(hist.entries.len(), 1);
+    assert!(hist.entries[0].current && hist.entries[0].status == "active");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn history_respects_rls_and_hides_other_secrets(pool: PgPool) {
+    let w = world(pool).await;
+    let bob = seed_identity(&w.pool, TokenKind::Device).await;
+    let h = insert_editor_history(&w).await;
+    let err = engine::history(&w.state, &bob.identity, h.vim).await.unwrap_err();
+    assert_eq!((err.status.as_u16(), err.code.as_str()), (404, "not_found"));
+    sqlx::query("UPDATE facts SET sensitivity = 'secret' WHERE id = $1").bind(h.vim).execute(&w.pool).await.unwrap();
+    let from_helix = engine::history(&w.state, &w.alice.identity, h.helix).await.unwrap();
+    assert_eq!(from_helix.entries.iter().map(|e| e.id).collect::<Vec<_>>(), vec![h.helix]);
+    let from_vim = engine::history(&w.state, &w.alice.identity, h.vim).await.unwrap();
+    assert_eq!(from_vim.entries.iter().map(|e| e.id).collect::<Vec<_>>(), vec![h.vim, h.helix]);
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn stale_and_disputed_memories_carry_a_caution_everywhere_they_are_shown(pool: PgPool) {
+    let w = world(pool).await;
+    let space = w.alice.space_id;
+    let fresh = insert_fact(&w, Fact::new(space, "prefers.editor", "helix for editor work")).await;
+    let stale = insert_fact(&w, Fact::new(space, "prefers.shell", "fish for editor shells")).await;
+    let disputed = insert_fact(&w, Fact::new(space, "prefers.font", "mono for editor fonts")).await;
+    let weak =
+        insert_fact(&w, Fact { confidence: 0.3, ..Fact::new(space, "prefers.theme", "dark for editor themes") }).await;
+    let mut pin = Fact::new(space, "timezone", "Europe/Bucharest");
+    pin.pinned = true;
+    let pinned = insert_fact(&w, pin).await;
+    for id in [stale, pinned] {
+        sqlx::query("UPDATE facts SET last_confirmed_at = now() - interval '130 days' WHERE id = $1")
+            .bind(id)
+            .execute(&w.pool)
+            .await
+            .unwrap();
+    }
+    sqlx::query("UPDATE facts SET disputed_at = now() WHERE id = $1").bind(disputed).execute(&w.pool).await.unwrap();
+
+    // Recall: the fallback profile lists the facts with their tags.
+    let resp = engine::recall(&w.state, &w.alice.identity, req("editor")).await.unwrap();
+    let md = resp.rendered_markdown.unwrap();
+    let line = |id: Uuid| {
+        let tag = format!("[fact#{}", memvault_core::ids::short_id(&id));
+        md.lines().find(|l| l.contains(&tag)).unwrap_or_else(|| panic!("no line for {tag} in {md}")).to_string()
+    };
+    assert!(line(stale).ends_with("· unconfirmed 4 months]"), "{}", line(stale));
+    assert!(line(disputed).ends_with("· disputed]") && line(weak).ends_with("· disputed]"));
+    assert!(!line(fresh).contains("unconfirmed") && !line(fresh).contains("disputed"));
+    assert!(!line(pinned).contains("unconfirmed"), "pinned facts are the user's word: {}", line(pinned));
+
+    // Search results and memory_get bodies say the same.
+    let query = SearchQuery {
+        q: Some("editor".into()),
+        tables: Some(vec![MemoryTable::Facts]),
+        limit: 20,
+        ..SearchQuery::default()
+    };
+    let rows = engine::search(&w.state, &w.alice.identity, query).await.unwrap().rows;
+    let caution = |id: Uuid| rows.iter().find(|r| r.id == id).unwrap().caution.clone();
+    assert_eq!(caution(stale).as_deref(), Some("unconfirmed 4 months"));
+    assert_eq!(caution(disputed).as_deref(), Some("disputed"));
+    assert_eq!(caution(fresh), None);
+    let table = memvault_recall::render::index_rows_markdown(&rows);
+    assert!(table.contains("prefers.shell: fish for editor shells [unconfirmed 4 months]"), "{table}");
+
+    let got = engine::get_memories(&w.state, &w.alice.identity, &[stale, fresh]).await.unwrap();
+    let MemoryItem::Facts(full) = &got.items[0] else { panic!("fact expected") };
+    assert_eq!(full.caution.as_deref(), Some("unconfirmed 4 months"));
+    let body = memvault_recall::render::memory_item_markdown(&got.items[0]);
+    assert!(body.lines().next().unwrap().ends_with("· unconfirmed 4 months]"), "{body}");
+    assert!(got.feedback.is_empty());
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn a_procedure_that_failed_more_than_it_worked_is_flagged(pool: PgPool) {
+    let w = world(pool).await;
+    let space = w.alice.space_id;
+    let flaky = insert_procedure(&w, space, "Deploy flaky", "deploy", "steps: run it twice").await;
+    let solid = insert_procedure(&w, space, "Deploy solid", "deploy", "steps: run it once").await;
+    sqlx::query("UPDATE procedures SET failure_count = 2, success_count = 1 WHERE id = $1")
+        .bind(flaky)
+        .execute(&w.pool)
+        .await
+        .unwrap();
+    let query = SearchQuery {
+        q: Some("deploy".into()),
+        tables: Some(vec![MemoryTable::Procedures]),
+        limit: 20,
+        ..SearchQuery::default()
+    };
+    let rows = engine::search(&w.state, &w.alice.identity, query).await.unwrap().rows;
+    assert_eq!(rows.iter().find(|r| r.id == flaky).unwrap().caution.as_deref(), Some("disputed"));
+    assert_eq!(rows.iter().find(|r| r.id == solid).unwrap().caution, None);
+    let resp = engine::recall(&w.state, &w.alice.identity, req("deploy")).await.unwrap();
+    let md = resp.rendered_markdown.unwrap();
+    let tag = |id: Uuid| {
+        md.lines().find(|l| l.contains(&format!("[proc#{}", memvault_core::ids::short_id(&id)))).unwrap().to_string()
+    };
+    assert!(tag(flaky).ends_with("· disputed]"), "{md}");
+    assert!(!tag(solid).contains("disputed"));
 }

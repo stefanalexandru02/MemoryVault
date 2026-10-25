@@ -84,17 +84,21 @@ pub(crate) async fn write_scope(
     })
 }
 
-struct Audit<'a> {
-    space_id: Uuid,
-    action: &'a str,
-    table: MemoryTable,
-    target_id: Uuid,
-    before: Option<Value>,
-    after: Option<Value>,
-    reason: Option<&'a str>,
+pub(crate) struct Audit<'a> {
+    pub(crate) space_id: Uuid,
+    pub(crate) action: &'a str,
+    pub(crate) table: MemoryTable,
+    pub(crate) target_id: Uuid,
+    pub(crate) before: Option<Value>,
+    pub(crate) after: Option<Value>,
+    pub(crate) reason: Option<&'a str>,
 }
 
-async fn record_audit(conn: &mut PgConnection, identity: &Identity, a: Audit<'_>) -> Result<(), sqlx::Error> {
+pub(crate) async fn record_audit(
+    conn: &mut PgConnection,
+    identity: &Identity,
+    a: Audit<'_>,
+) -> Result<(), sqlx::Error> {
     sqlx::query(
         "INSERT INTO memory_audit (id, space_id, actor, action, target_table, target_id, before, after, reason)
          VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9)",
@@ -114,7 +118,11 @@ async fn record_audit(conn: &mut PgConnection, identity: &Identity, a: Audit<'_>
 }
 
 /// The row as JSON without its generated columns.
-async fn snapshot(conn: &mut PgConnection, table: MemoryTable, id: Uuid) -> Result<Option<Value>, sqlx::Error> {
+pub(crate) async fn snapshot(
+    conn: &mut PgConnection,
+    table: MemoryTable,
+    id: Uuid,
+) -> Result<Option<Value>, sqlx::Error> {
     sqlx::query_scalar(&format!("SELECT to_jsonb(t) - 'search_text' - 'search_tsv' FROM {table} t WHERE id = $1"))
         .bind(id)
         .fetch_optional(conn)
@@ -293,7 +301,7 @@ async fn remember_fact(
 
 fn fact_response(id: Uuid, f: &RememberFact) -> RememberResponse {
     let subject = if f.subject.kind == "user" { String::new() } else { format!("{} ", f.subject.name) };
-    let tag = render::fact_tag(&id, f64::from(EXPLICIT_CONFIDENCE), &[], Some(Utc::now()));
+    let tag = render::fact_tag(&id, f64::from(EXPLICIT_CONFIDENCE), &[], Some(Utc::now()), None);
     RememberResponse {
         id,
         table: MemoryTable::Facts,
@@ -359,6 +367,7 @@ async fn remember_observation(
         title: o.title.clone(),
         tokens,
         anchor: false,
+        caution: None,
     };
     Ok(RememberResponse {
         id,
@@ -432,7 +441,7 @@ async fn remember_procedure(
     };
     record_audit(conn, identity, audit).await?;
     enqueue_embed(conn, MemoryTable::Procedures.as_str(), id).await?;
-    let tag = render::procedure_tag(&id, version, Some(Utc::now()));
+    let tag = render::procedure_tag(&id, version, Some(Utc::now()), None);
     Ok(RememberResponse {
         id,
         table: MemoryTable::Procedures,
@@ -470,20 +479,8 @@ async fn forget_in(
     hard: bool,
     reason: Option<&str>,
 ) -> Result<(MemoryTable, ForgetAction), ApiError> {
-    let found: Option<(MemoryTable, Uuid, ScopeKind, String)> = sqlx::query_as(
-        "SELECT 'facts', space_id, scope_kind, scope_key FROM facts WHERE id = $1
-         UNION ALL SELECT 'observations', space_id, scope_kind, scope_key FROM observations WHERE id = $1
-         UNION ALL SELECT 'procedures', space_id, scope_kind, scope_key FROM procedures WHERE id = $1
-         UNION ALL SELECT 'summaries', space_id, scope_kind, scope_key FROM summaries WHERE id = $1",
-    )
-    .bind(id)
-    .fetch_optional(&mut *conn)
-    .await?;
-    let (table, space, kind, key) = found.ok_or_else(|| ApiError::not_found("memory not found"))?;
-    let writable = writable_space_ids(conn, identity.user_id).await?;
-    if !writable.contains(&space) {
-        return Err(ApiError::forbidden("space_forbidden", format!("no write access to space {space}")));
-    }
+    let (table, space, kind, key) = locate(conn, id).await?;
+    ensure_writable(conn, identity, space).await?;
     let scope = Scope::new(kind, key);
     let action = if hard {
         hard_delete(conn, identity, table, space, id, &scope, reason).await?
@@ -491,17 +488,48 @@ async fn forget_in(
         soft_delete(conn, identity, table, space, id, reason).await?
     };
     if table == MemoryTable::Facts {
-        // The scope's cached profile may render this fact. Drop it so context and recall fall back to
-        // the live facts until the planner re-renders it.
-        sqlx::query("DELETE FROM profiles WHERE space_id = $1 AND scope_kind = $2 AND scope_key = $3")
-            .bind(space)
-            .bind(scope.kind)
-            .bind(&scope.key)
-            .execute(&mut *conn)
-            .await?;
+        drop_profile(conn, space, &scope).await?;
     }
     notify_invalidate(conn, space, scope.kind, &scope.key).await?;
     Ok((table, action))
+}
+
+/// The table, space and scope of a memory the caller can see, else 404.
+pub(crate) async fn locate(
+    conn: &mut PgConnection,
+    id: Uuid,
+) -> Result<(MemoryTable, Uuid, ScopeKind, String), ApiError> {
+    let found: Option<(MemoryTable, Uuid, ScopeKind, String)> = sqlx::query_as(
+        "SELECT 'facts', space_id, scope_kind, scope_key FROM facts WHERE id = $1
+         UNION ALL SELECT 'observations', space_id, scope_kind, scope_key FROM observations WHERE id = $1
+         UNION ALL SELECT 'procedures', space_id, scope_kind, scope_key FROM procedures WHERE id = $1
+         UNION ALL SELECT 'summaries', space_id, scope_kind, scope_key FROM summaries WHERE id = $1
+         UNION ALL SELECT 'documents', space_id, scope_kind, scope_key FROM documents WHERE id = $1",
+    )
+    .bind(id)
+    .fetch_optional(conn)
+    .await?;
+    found.ok_or_else(|| ApiError::not_found("memory not found"))
+}
+
+/// 403 unless the caller may write to `space`.
+pub(crate) async fn ensure_writable(conn: &mut PgConnection, identity: &Identity, space: Uuid) -> Result<(), ApiError> {
+    if !writable_space_ids(conn, identity.user_id).await?.contains(&space) {
+        return Err(ApiError::forbidden("space_forbidden", format!("no write access to space {space}")));
+    }
+    Ok(())
+}
+
+/// The scope's cached profile may render a fact that changed. Drop it so context and recall fall back to
+/// the live facts until the planner re-renders it.
+pub(crate) async fn drop_profile(conn: &mut PgConnection, space: Uuid, scope: &Scope) -> Result<(), sqlx::Error> {
+    sqlx::query("DELETE FROM profiles WHERE space_id = $1 AND scope_kind = $2 AND scope_key = $3")
+        .bind(space)
+        .bind(scope.kind)
+        .bind(&scope.key)
+        .execute(conn)
+        .await?;
+    Ok(())
 }
 
 async fn soft_delete(
@@ -529,6 +557,11 @@ async fn soft_delete(
             "proc.retire",
             ForgetAction::Retired,
         ),
+        MemoryTable::Documents => (
+            "UPDATE documents SET retired_at = now() WHERE id = $1 AND retired_at IS NULL",
+            "doc.retire",
+            ForgetAction::Retired,
+        ),
         MemoryTable::Summaries => {
             return Err(ApiError::invalid("summaries cannot be forgotten; forget the observations they rest on"));
         }
@@ -546,6 +579,12 @@ async fn soft_delete(
             reason: Some(reason.unwrap_or("forgotten explicitly")),
         };
         record_audit(conn, identity, audit).await?;
+        if table == MemoryTable::Documents {
+            sqlx::query("DELETE FROM embeddings WHERE owner_table = 'documents' AND owner_id = $1")
+                .bind(id)
+                .execute(&mut *conn)
+                .await?;
+        }
     }
     Ok(action)
 }
@@ -574,7 +613,7 @@ async fn hard_delete(
             "UPDATE facts SET superseded_by = NULL WHERE superseded_by = $1",
         ],
         MemoryTable::Procedures => &["UPDATE procedures SET supersedes_id = NULL WHERE supersedes_id = $1"],
-        MemoryTable::Summaries => &[],
+        MemoryTable::Summaries | MemoryTable::Documents => &[],
     };
     for sql in cleanup {
         sqlx::query(sql).bind(id).execute(&mut *conn).await?;
@@ -584,6 +623,7 @@ async fn hard_delete(
         .bind(id)
         .execute(&mut *conn)
         .await?;
+    sqlx::query("DELETE FROM memory_feedback WHERE target_id = $1").bind(id).execute(&mut *conn).await?;
     // Work packets (consolidation inputs and results) that carry the row's id keep its content for
     // their retention period: blank them, and cancel the ones still waiting to run.
     sqlx::query(

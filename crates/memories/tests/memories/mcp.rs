@@ -124,8 +124,10 @@ async fn initialize_and_tools_list(pool: PgPool) {
             "memory_timeline",
             "memory_get",
             "memory_explain",
+            "memory_history",
             "memory_remember",
             "memory_forget",
+            "memory_feedback",
             "work_state_write"
         ]
     );
@@ -141,6 +143,10 @@ async fn initialize_and_tools_list(pool: PgPool) {
     }
     assert_eq!(by_name("memory_search")["inputSchema"]["required"], json!(["query"]));
     assert_eq!(by_name("memory_search")["inputSchema"]["properties"]["limit"]["maximum"], 30);
+    assert_eq!(by_name("memory_search")["inputSchema"]["properties"]["as_of"]["type"], "string");
+    assert_eq!(by_name("memory_history")["inputSchema"]["required"], json!(["id"]));
+    assert_eq!(by_name("memory_feedback")["inputSchema"]["required"], json!(["id", "verdict"]));
+    assert_eq!(by_name("memory_feedback")["inputSchema"]["properties"]["verdict"]["enum"].as_array().unwrap().len(), 3);
     assert_eq!(by_name("memory_get")["inputSchema"]["properties"]["ids"]["maxItems"], 20);
     assert_eq!(by_name("memory_timeline")["inputSchema"]["properties"]["before"]["maximum"], 10);
 }
@@ -230,6 +236,56 @@ async fn remember_search_timeline_get_explain_forget(pool: PgPool) {
     assert_eq!(reason.as_deref(), Some("obsolete"));
     let (_, after) = call(&app, alice, "memory_search", json!({"query": "router firmware"})).await;
     assert!(!after.contains(&first_id) && after.contains(&second_id), "{after}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn as_of_search_and_history(pool: PgPool) {
+    let w = world(pool).await;
+    let app = mcp_app(&w);
+    let alice = &w.alice;
+    let remember = |value: &'static str| {
+        call(
+            &app,
+            alice,
+            "memory_remember",
+            json!({"kind": "fact", "content": value, "subject": "alex", "predicate": "prefers.editor", "scope": "global"}),
+        )
+    };
+    let (_, first) = remember("vim").await;
+    let (first_id, between) = (id_in(&first), chrono::Utc::now().to_rfc3339());
+    tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+    let (_, second) = remember("helix").await;
+    let second_id = id_in(&second);
+
+    // Facts are not in the default search; with as_of they are, as they stood then.
+    let (err, now) = call(&app, alice, "memory_search", json!({"query": "vim helix"})).await;
+    assert!(!err && !now.contains(&second_id), "{now}");
+    let (err, past) = call(&app, alice, "memory_search", json!({"query": "vim helix", "as_of": between})).await;
+    assert!(!err && past.contains(&first_id) && !past.contains(&second_id), "{past}");
+    let (_, present) =
+        call(&app, alice, "memory_search", json!({"query": "vim helix", "as_of": chrono::Utc::now().to_rfc3339()}))
+            .await;
+    assert!(present.contains(&second_id) && !present.contains(&first_id), "{present}");
+    for bad in ["yesterday", "2026-10-01", "7d"] {
+        let (err, text) = call(&app, alice, "memory_search", json!({"query": "vim helix", "as_of": bad})).await;
+        assert!(err && text.contains("error (invalid_request)") && text.contains("as_of"), "{bad}: {text}");
+    }
+
+    // The chain from either end, by full id or short citation id, oldest first with the audit reason.
+    let short = &second_id[second_id.len() - 6..];
+    for reference in [first_id.clone(), second_id.clone(), format!("fact#{short}")] {
+        let (err, chain) = call(&app, alice, "memory_history", json!({"id": reference})).await;
+        assert!(!err && chain.contains("2 versions"), "{chain}");
+        let (vim, helix) = (chain.find("prefers.editor: vim"), chain.find("prefers.editor: helix"));
+        assert!(vim.is_some() && helix.is_some() && vim < helix, "{chain}");
+        assert!(chain.contains("replaced by an explicit write"), "{chain}");
+    }
+    let (err, text) = call(&app, alice, "memory_history", json!({"id": "ffffffff-ffff-ffff-ffff-ffffffffffff"})).await;
+    assert!(err && text.contains("not_found"), "{text}");
+    // Another user cannot see the chain.
+    let bob = seed_identity(&w.pool, TokenKind::Device).await;
+    let (err, text) = call(&app, &bob, "memory_history", json!({"id": first_id})).await;
+    assert!(err && text.contains("not_found"), "{text}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -380,4 +436,67 @@ async fn get_truncates_long_bodies_to_the_cap(pool: PgPool) {
     assert!(text.chars().count() <= 24_000 + 20 * 100, "{} chars", text.chars().count());
     assert_eq!(text.matches("#### ").count(), 20, "every body is present, none dropped");
     assert!(text.contains("truncated"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn feedback_tool_records_a_verdict_once_and_explains_the_outcome(pool: PgPool) {
+    let w = world(pool).await;
+    let app = mcp_app(&w);
+    let alice = &w.alice;
+    let (_, fact) = call(
+        &app,
+        alice,
+        "memory_remember",
+        json!({"kind": "fact", "content": "neovim", "predicate": "prefers.editor", "scope": "global"}),
+    )
+    .await;
+    let id = id_in(&fact);
+
+    let (err, wrong) =
+        call(&app, alice, "memory_feedback", json!({"id": id, "verdict": "wrong", "note": "it is helix"})).await;
+    assert!(!err, "{wrong}");
+    assert!(wrong.starts_with(&format!("Recorded wrong on facts `{id}`.")), "{wrong}");
+    assert!(
+        wrong.contains("Confidence is now 0.75.") && wrong.contains("queued for the consolidation planner"),
+        "{wrong}"
+    );
+
+    // The short id from the context block works, and a repeat changes nothing.
+    let short = &id[id.len() - 6..];
+    let (err, again) = call(&app, alice, "memory_feedback", json!({"id": short, "verdict": "wrong"})).await;
+    assert!(!err && again.contains("already gave wrong"), "{again}");
+
+    // The result of memory_get carries the tag a model should read.
+    let (_, got) = call(&app, alice, "memory_get", json!({"ids": [id]})).await;
+    assert!(got.contains("· disputed]"), "{got}");
+    let (_, explained) = call(&app, alice, "memory_explain", json!({"id": id})).await;
+    assert!(explained.contains("fact.feedback") && explained.contains("wrong: it is helix"), "{explained}");
+
+    let (err, bad) = call(&app, alice, "memory_feedback", json!({"id": id, "verdict": "meh"})).await;
+    assert!(err && bad.contains("invalid arguments"), "{bad}");
+    let (err, missing) = call(&app, alice, "memory_feedback", json!({"id": "zzzz", "verdict": "helpful"})).await;
+    assert!(err && missing.contains("not_found"), "{missing}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn documents_are_found_by_type_and_read_with_their_source(pool: PgPool) {
+    let w = world(pool).await;
+    let app = mcp_app(&w);
+    let source = json!({
+        "scope": {"kind": "project", "key": PROJECT}, "uri": "docs/runbook.md", "content_type": "markdown",
+        "content_hash": "h1", "content": "# Runbook\n\n## Rollback\n\nRoll back the migration with the down script first.",
+    });
+    assert_eq!(w.post(&w.alice.token, "/sources", source).await.status, StatusCode::CREATED);
+
+    let (is_error, found) =
+        call(&app, &w.alice, "memory_search", json!({"query": "roll back migration", "types": ["document"]})).await;
+    assert!(!is_error, "{found}");
+    assert!(found.contains("docs/runbook.md#Runbook"), "{found}");
+    let (_, other) = call(&app, &w.alice, "memory_search", json!({"query": "roll back migration"})).await;
+    assert!(!other.contains("runbook.md"), "documents are searched on request: {other}");
+
+    let id: String = sqlx::query_scalar("SELECT id::text FROM documents").fetch_one(&w.pool).await.unwrap();
+    let (is_error, body) = call(&app, &w.alice, "memory_get", json!({"ids": [id]})).await;
+    assert!(!is_error, "{body}");
+    assert!(body.contains("source: docs/runbook.md#Runbook") && body.contains("down script"), "{body}");
 }

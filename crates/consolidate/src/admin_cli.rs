@@ -7,10 +7,12 @@
 //! memvault admin membership add --space team --user alex --role writer
 //! memvault admin token create --user alex --client laptop-x1 --kind device
 //! memvault admin token revoke <id|prefix>
-//! memvault admin consolidate now [--space-id <uuid>]
+//! memvault admin consolidate now [--space-id <uuid> [--scope project:<key>]]
+//! memvault admin consolidate runs [--trigger nightly|session_end|threshold|manual] [--space-id <uuid>]
 //! memvault admin consolidate revert <run_id>
 //! memvault admin packets list --status failed | packets retry <id>
 //! memvault admin reindex [--model m] [--table facts]... [--space-id <uuid>]
+//! memvault admin doctor [--json]
 //! memvault admin project remap --from <old> --to <new> [--space-id <uuid>]
 //! ```
 
@@ -22,13 +24,13 @@ use memvault_core::AppState;
 use memvault_core::auth::TokenKind;
 use memvault_core::schemas::admin::{MembershipCreate, ReindexRequest, SpaceCreate, TokenCreate, UserCreate};
 use memvault_core::schemas::common::{
-    ClientKind, EmbeddingOwnerTable, MembershipRole, PacketKind, PacketStatus, SpaceKind,
+    ClientKind, EmbeddingOwnerTable, MembershipRole, PacketKind, PacketStatus, PlanTrigger, Scope, SpaceKind,
 };
 use serde::Serialize;
 use uuid::Uuid;
 
 use crate::ops::{self, RemapRequest};
-use crate::planner::run_planner;
+use crate::planner::{PlanOptions, run_planner_for};
 use crate::revert::revert_run;
 use memvault_core::system_tx;
 
@@ -79,6 +81,12 @@ enum Command {
     /// Project keys.
     #[command(subcommand)]
     Project(ProjectCommand),
+    /// Diagnose the server side (database, extensions, embeddings, queues); exits 1 if a check fails.
+    Doctor {
+        /// Print the checks as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 #[derive(Debug, Subcommand)]
@@ -156,10 +164,22 @@ enum TokenCommand {
 
 #[derive(Debug, Subcommand)]
 enum ConsolidateCommand {
-    /// Run the planner now.
+    /// Run the planner now (trigger `manual`).
     Now {
         #[arg(long)]
         space_id: Option<Uuid>,
+        /// Plan only this scope (`kind:key`, e.g. `project:github.com/a/b`); needs --space-id.
+        #[arg(long, requires = "space_id", value_parser = parse_scope)]
+        scope: Option<Scope>,
+    },
+    /// Planner runs, newest first, with the trigger that started each.
+    Runs {
+        #[arg(long, value_parser = parse_trigger)]
+        trigger: Option<PlanTrigger>,
+        #[arg(long)]
+        space_id: Option<Uuid>,
+        #[arg(long, default_value_t = 50)]
+        limit: i64,
     },
     /// Undo a run from its audit rows.
     Revert { run_id: Uuid },
@@ -220,6 +240,12 @@ fn parse_space_kind(s: &str) -> Result<SpaceKind, String> {
 fn parse_role(s: &str) -> Result<MembershipRole, String> {
     s.parse().map_err(|e| format!("{e}"))
 }
+fn parse_scope(s: &str) -> Result<Scope, String> {
+    s.parse().map_err(|e| format!("{e}"))
+}
+fn parse_trigger(s: &str) -> Result<PlanTrigger, String> {
+    s.parse().map_err(|e| format!("{e}"))
+}
 fn parse_packet_status(s: &str) -> Result<PacketStatus, String> {
     s.parse().map_err(|e| format!("{e}"))
 }
@@ -263,8 +289,22 @@ fn api<T>(r: Result<T, memvault_core::ApiError>) -> Result<T> {
 async fn execute(state: &AppState, command: Command, out: &mut dyn Write) -> Result<()> {
     let pool = &state.db.system;
     match command {
-        Command::Consolidate(ConsolidateCommand::Now { space_id }) => {
-            print(out, &api(run_planner(state, space_id).await)?)
+        Command::Consolidate(ConsolidateCommand::Now { space_id, scope }) => {
+            print(out, &api(run_planner_for(state, &PlanOptions::manual(space_id, scope)).await)?)
+        }
+        Command::Doctor { json } => {
+            let report = crate::doctor::doctor(state).await;
+            if json {
+                print(out, &report)?;
+            } else {
+                for c in &report.checks {
+                    writeln!(out, "{:<4} {:<18} {}", c.status.as_str(), c.name, c.detail)?;
+                    if let Some(fix) = &c.fix {
+                        writeln!(out, "     fix: {fix}")?;
+                    }
+                }
+            }
+            if report.healthy() { Ok(()) } else { bail!("doctor: at least one check failed") }
         }
         command => {
             let mut tx = system_tx(pool).await.context("connecting to the database")?;
@@ -329,6 +369,9 @@ async fn execute(state: &AppState, command: Command, out: &mut dyn Write) -> Res
                 Command::Consolidate(ConsolidateCommand::Revert { run_id }) => {
                     print(out, &api(revert_run(conn, run_id, CLI_ACTOR).await)?)?
                 }
+                Command::Consolidate(ConsolidateCommand::Runs { trigger, space_id, limit }) => {
+                    print(out, &api(ops::list_runs(conn, trigger, space_id, Some(limit)).await)?)?
+                }
                 Command::Packets(PacketsCommand::List { status, kind, space_id, limit }) => {
                     print(out, &api(ops::list_packets(conn, status, kind, space_id, Some(limit)).await)?)?
                 }
@@ -345,7 +388,7 @@ async fn execute(state: &AppState, command: Command, out: &mut dyn Write) -> Res
                 Command::Project(ProjectCommand::Remap { from, to, space_id }) => {
                     print(out, &api(ops::remap_project(conn, &RemapRequest { from, to, space_id }, CLI_ACTOR).await)?)?
                 }
-                Command::Consolidate(ConsolidateCommand::Now { .. }) => bail!("unreachable"),
+                Command::Consolidate(ConsolidateCommand::Now { .. }) | Command::Doctor { .. } => bail!("unreachable"),
             }
             tx.commit().await?;
             Ok(())

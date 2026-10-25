@@ -14,7 +14,10 @@
 use std::collections::HashMap;
 
 use chrono::{DateTime, Utc};
-use memvault_core::schemas::common::{FactStatus, MemoryTable, Scope, ScopeKind, Sensitivity, SummaryGrain};
+use memvault_core::schemas::common::{
+    ContentType, FactStatus, MemoryTable, Scope, ScopeKind, Sensitivity, SummaryGrain,
+};
+use memvault_core::schemas::memories::{fact_caution, source_label};
 use pgvector::Vector;
 use serde_json::Value;
 use sqlx::{PgConnection, Postgres, QueryBuilder};
@@ -47,8 +50,8 @@ pub fn query_terms(text: &str) -> Vec<String> {
 /// Per-tier SQL fragments.
 struct TierSpec {
     sql_table: &'static str,
-    /// Column matched by the `types` filter (and shown as `IndexRow.type`).
-    type_col: &'static str,
+    /// SQL expression matched by the `types` filter (and shown as `IndexRow.type`).
+    type_expr: &'static str,
     time_col: &'static str,
     has_sensitivity: bool,
     /// Rows that may be shown at all.
@@ -63,7 +66,7 @@ fn spec(table: MemoryTable) -> TierSpec {
     match table {
         MemoryTable::Observations => TierSpec {
             sql_table: "observations",
-            type_col: "type",
+            type_expr: "t.type",
             time_col: "created_at",
             has_sensitivity: true,
             live: "t.archived_at IS NULL AND t.superseded_by IS NULL",
@@ -72,7 +75,7 @@ fn spec(table: MemoryTable) -> TierSpec {
         },
         MemoryTable::Summaries => TierSpec {
             sql_table: "summaries",
-            type_col: "grain",
+            type_expr: "t.grain",
             time_col: "created_at",
             has_sensitivity: false,
             live: "true",
@@ -81,7 +84,7 @@ fn spec(table: MemoryTable) -> TierSpec {
         },
         MemoryTable::Facts => TierSpec {
             sql_table: "facts",
-            type_col: "predicate",
+            type_expr: "t.predicate",
             time_col: "first_seen_at",
             has_sensitivity: true,
             live: "t.status = 'active' AND (t.valid_to IS NULL OR t.valid_to > now())",
@@ -90,12 +93,21 @@ fn spec(table: MemoryTable) -> TierSpec {
         },
         MemoryTable::Procedures => TierSpec {
             sql_table: "procedures",
-            type_col: "task_class",
+            type_expr: "t.task_class",
             time_col: "created_at",
             has_sensitivity: false,
             live: "t.status = 'active'",
             vector_window_days: None,
             recent_order: "t.last_used_at DESC NULLS LAST, t.success_count DESC, t.created_at DESC, t.id DESC",
+        },
+        MemoryTable::Documents => TierSpec {
+            sql_table: "documents",
+            type_expr: "'document'",
+            time_col: "created_at",
+            has_sensitivity: false,
+            live: "t.retired_at IS NULL",
+            vector_window_days: None,
+            recent_order: "t.created_at DESC, t.source_uri, t.chunk_index, t.id",
         },
     }
 }
@@ -116,11 +128,62 @@ pub struct Filters {
     pub exclude_subagent: bool,
     /// Facts: pinned only.
     pub pinned_only: bool,
+    /// Point in time: rows valid then replace the live rows (see [`push_live`]).
+    pub as_of: Option<DateTime<Utc>>,
+}
+
+/// Retirement time of a procedure: the audited `proc.retire`, else when its successor was created.
+const PROCEDURE_ENDED_AT: &str = "coalesce(
+    (SELECT max(a.created_at) FROM memory_audit a
+      WHERE a.target_table = 'procedures' AND a.target_id = t.id AND a.action = 'proc.retire'),
+    (SELECT min(n.created_at) FROM procedures n WHERE n.supersedes_id = t.id))";
+
+/// Rows that may be shown: the live ones, or with `as_of` the ones that were valid at that instant.
+/// A fact counts from `valid_from` (else `first_seen_at`) until `valid_to`; candidates and merged
+/// duplicates (superseded without an end) never held. A procedure counts from `created_at` until
+/// it was retired. Observations and summaries count from `created_at`, observations until archived,
+/// document chunks until retired.
+fn push_live(qb: &mut QueryBuilder<'_, Postgres>, table: MemoryTable, as_of: Option<DateTime<Utc>>) {
+    let Some(at) = as_of else {
+        qb.push(spec(table).live);
+        return;
+    };
+    match table {
+        MemoryTable::Observations => {
+            qb.push("t.created_at <= ").push_bind(at).push(" AND (t.archived_at IS NULL OR t.archived_at > ");
+            qb.push_bind(at).push(")");
+        }
+        MemoryTable::Summaries => {
+            qb.push("t.created_at <= ").push_bind(at);
+        }
+        MemoryTable::Facts => {
+            qb.push(
+                "t.status <> 'candidate' AND NOT (t.status = 'superseded' AND t.valid_to IS NULL) \
+                 AND coalesce(t.valid_from, t.first_seen_at) <= ",
+            )
+            .push_bind(at)
+            .push(" AND (t.valid_to IS NULL OR t.valid_to > ")
+            .push_bind(at)
+            .push(")");
+        }
+        MemoryTable::Procedures => {
+            qb.push("t.created_at <= ")
+                .push_bind(at)
+                .push(format_args!(" AND (t.status = 'active' OR {PROCEDURE_ENDED_AT} > "))
+                .push_bind(at)
+                .push(")");
+        }
+        MemoryTable::Documents => {
+            qb.push("t.created_at <= ").push_bind(at).push(" AND (t.retired_at IS NULL OR t.retired_at > ");
+            qb.push_bind(at).push(")");
+        }
+    }
 }
 
 fn push_where(qb: &mut QueryBuilder<'_, Postgres>, table: MemoryTable, f: &Filters) {
     let s = spec(table);
-    qb.push("t.space_id = ANY(").push_bind(f.spaces.clone()).push(") AND ").push(s.live);
+    qb.push("t.space_id = ANY(").push_bind(f.spaces.clone()).push(") AND ");
+    push_live(qb, table, f.as_of);
     if let Some(scopes) = &f.scopes {
         let kinds: Vec<ScopeKind> = scopes.iter().map(|s| s.kind).collect();
         let keys: Vec<String> = scopes.iter().map(|s| s.key.clone()).collect();
@@ -134,7 +197,7 @@ fn push_where(qb: &mut QueryBuilder<'_, Postgres>, table: MemoryTable, f: &Filte
         qb.push(" AND t.sensitivity <> ALL(").push_bind(f.exclude_sensitivity.clone()).push("::text[])");
     }
     if let Some(types) = f.types.as_ref().filter(|t| !t.is_empty()) {
-        qb.push(format_args!(" AND t.{}::text = ANY(", s.type_col)).push_bind(types.clone()).push("::text[])");
+        qb.push(format_args!(" AND {}::text = ANY(", s.type_expr)).push_bind(types.clone()).push("::text[])");
     }
     if let Some(since) = f.since {
         qb.push(format_args!(" AND t.{} >= ", s.time_col)).push_bind(since);
@@ -232,7 +295,12 @@ pub async fn vector_leg(
         .push(") AND ");
     push_where(&mut qb, table, f);
     if let Some(days) = s.vector_window_days.filter(|_| windows) {
-        qb.push(format_args!(" AND t.{} > now() - make_interval(days => ", s.time_col)).push_bind(days).push(")");
+        qb.push(format_args!(" AND t.{} > ", s.time_col));
+        match f.as_of {
+            Some(at) => qb.push_bind(at),
+            None => qb.push("now()"),
+        };
+        qb.push(" - make_interval(days => ").push_bind(days).push(")");
     }
     qb.push(" ORDER BY d LIMIT ")
         .push_bind(limit * VECTOR_PART_FANOUT)
@@ -342,8 +410,17 @@ pub struct FactRow {
     pub sensitivity: Sensitivity,
     pub written_by_client_id: Option<Uuid>,
     pub extracted_by: Option<Value>,
+    /// Set while the fact waits for the planner to act on negative feedback.
+    pub disputed_at: Option<DateTime<Utc>>,
     /// Device ids the fact was learned on (sorted).
     pub devices: Vec<String>,
+}
+
+impl FactRow {
+    /// Why to treat the fact with care at `now`, if so.
+    pub fn caution(&self, now: DateTime<Utc>) -> Option<String> {
+        fact_caution(f64::from(self.confidence), self.last_confirmed_at, self.disputed_at.is_some(), self.pinned, now)
+    }
 }
 
 #[derive(Debug, Clone, sqlx::FromRow)]
@@ -367,6 +444,32 @@ pub struct ProcRow {
     pub created_at: DateTime<Utc>,
 }
 
+#[derive(Debug, Clone, sqlx::FromRow)]
+pub struct DocRow {
+    pub id: Uuid,
+    pub space_id: Uuid,
+    pub scope_kind: ScopeKind,
+    pub scope_key: String,
+    pub source_uri: String,
+    pub title: String,
+    pub content_type: ContentType,
+    pub chunk_index: i32,
+    pub heading_path: Vec<String>,
+    pub content: String,
+    pub content_hash: String,
+    pub token_estimate: i32,
+    pub ingested_by: Option<Uuid>,
+    pub created_at: DateTime<Utc>,
+    pub retired_at: Option<DateTime<Utc>>,
+}
+
+impl DocRow {
+    /// `uri#Heading > Subheading`.
+    pub fn source(&self) -> String {
+        source_label(&self.source_uri, &self.heading_path)
+    }
+}
+
 /// A hydrated row of any tier.
 #[derive(Debug, Clone)]
 pub enum TierRow {
@@ -374,6 +477,7 @@ pub enum TierRow {
     Sum(SumRow),
     Fact(FactRow),
     Proc(ProcRow),
+    Doc(DocRow),
 }
 
 impl TierRow {
@@ -383,6 +487,7 @@ impl TierRow {
             TierRow::Sum(r) => r.id,
             TierRow::Fact(r) => r.id,
             TierRow::Proc(r) => r.id,
+            TierRow::Doc(r) => r.id,
         }
     }
 
@@ -392,6 +497,7 @@ impl TierRow {
             TierRow::Sum(r) => r.space_id,
             TierRow::Fact(r) => r.space_id,
             TierRow::Proc(r) => r.space_id,
+            TierRow::Doc(r) => r.space_id,
         }
     }
 
@@ -401,6 +507,7 @@ impl TierRow {
             TierRow::Sum(r) => (r.scope_kind, &r.scope_key),
             TierRow::Fact(r) => (r.scope_kind, &r.scope_key),
             TierRow::Proc(r) => (r.scope_kind, &r.scope_key),
+            TierRow::Doc(r) => (r.scope_kind, &r.scope_key),
         };
         Scope::new(kind, key.clone())
     }
@@ -429,6 +536,7 @@ const FACT_SELECT: &str = "SELECT t.id, t.space_id, t.scope_kind, t.scope_key, t
         t.importance, t.status, t.conflict, t.supersedes_id, t.superseded_by, t.valid_from, t.valid_to,
         t.first_seen_at, t.last_confirmed_at, t.confirmations, t.evidence_observation_ids, t.learned_on_client_ids,
         t.access_count, t.last_accessed_at, t.pinned, t.sensitivity, t.written_by_client_id, t.extracted_by,
+        t.disputed_at,
         ARRAY(SELECT DISTINCT c.device_id FROM clients c
                WHERE c.id = ANY(CASE WHEN cardinality(t.learned_on_client_ids) > 0 THEN t.learned_on_client_ids
                                      ELSE ARRAY[t.written_by_client_id] END)
@@ -440,6 +548,12 @@ const PROC_SELECT: &str = "SELECT t.id, t.space_id, t.scope_kind, t.scope_key, t
         t.body_md, t.version, t.status, t.supersedes_id, t.success_count, t.failure_count, t.last_used_at,
         t.source_observation_ids, t.token_estimate, t.created_at
    FROM procedures t
+  WHERE t.id = ANY($1)";
+
+const DOC_SELECT: &str = "SELECT t.id, t.space_id, t.scope_kind, t.scope_key, t.source_uri, t.title, t.content_type,
+        t.chunk_index, t.heading_path, t.content, t.content_hash, t.token_estimate, t.ingested_by, t.created_at,
+        t.retired_at
+   FROM documents t
   WHERE t.id = ANY($1)";
 
 /// Full rows of `table` for `ids` (whatever RLS lets the caller see), keyed by id.
@@ -480,6 +594,13 @@ pub async fn hydrate(
             .await?
             .into_iter()
             .map(TierRow::Proc)
+            .collect(),
+        MemoryTable::Documents => sqlx::query_as::<_, DocRow>(DOC_SELECT)
+            .bind(ids)
+            .fetch_all(conn)
+            .await?
+            .into_iter()
+            .map(TierRow::Doc)
             .collect(),
     };
     Ok(rows.into_iter().map(|r| (r.id(), r)).collect())

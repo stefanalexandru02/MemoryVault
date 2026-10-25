@@ -13,7 +13,7 @@ pub struct RetentionReport {
 }
 
 /// Trim old event payloads to `{"kind", "excerpt"}` (rows are kept: observations reference them),
-/// delete settled work packets and old log rows, and prune finished jobs and rate-limit windows.
+/// delete settled work packets and old log rows (including planner runs), and prune finished jobs and rate-limit windows.
 pub async fn run_retention(pool: &PgPool, settings: &Settings) -> Result<RetentionReport, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let events_trimmed = sqlx::query(
@@ -39,7 +39,7 @@ pub async fn run_retention(pool: &PgPool, settings: &Settings) -> Result<Retenti
         .rows_affected();
 
     let mut logs_deleted = 0;
-    for table in ["retrieval_log", "access_log"] {
+    for table in ["retrieval_log", "access_log", "planner_runs"] {
         logs_deleted +=
             sqlx::query(&format!("DELETE FROM {table} WHERE created_at < now() - make_interval(days => $1::int)"))
                 .bind(settings.retention_logs_days as i32)

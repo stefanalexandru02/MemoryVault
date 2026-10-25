@@ -174,6 +174,28 @@ pub fn parse_scopes_param(value: &str) -> Result<Vec<Scope>, UnknownVariant> {
 
 str_enum!(Sensitivity { Normal = "normal", Sensitive = "sensitive", Secret = "secret" });
 
+str_enum!(
+    /// How `GET /v1/context` injects memory at session start: `full` is the budgeted block, `lean` only the
+    /// profile, open work and a rubric on when to call the pull tools.
+    #[derive(Default)]
+    InjectionMode {
+        #[default]
+        Full = "full",
+        Lean = "lean",
+    }
+);
+
+str_enum!(
+    /// What started a planner run: the nightly pass, the end of a session, enough new observations in a scope, or
+    /// an operator (`POST /v1/admin/consolidate`, `memvault admin consolidate now`).
+    PlanTrigger {
+        Nightly = "nightly",
+        SessionEnd = "session_end",
+        Threshold = "threshold",
+        Manual = "manual",
+    }
+);
+
 str_enum!(EventKind {
     UserPrompt = "user_prompt",
     AssistantMessage = "assistant_message",
@@ -218,6 +240,7 @@ str_enum!(MemoryTable {
     Summaries = "summaries",
     Facts = "facts",
     Procedures = "procedures",
+    Documents = "documents",
 });
 
 str_enum!(EmbeddingOwnerTable {
@@ -226,9 +249,15 @@ str_enum!(EmbeddingOwnerTable {
     Facts = "facts",
     Procedures = "procedures",
     Entities = "entities",
+    Documents = "documents",
 });
 
 str_enum!(SummaryGrain { Prompt = "prompt", Session = "session", Day = "day", Week = "week" });
+
+str_enum!(
+    /// How an ingested source is split into chunks: by headings (`markdown`) or by paragraphs (`text`).
+    ContentType { Markdown = "markdown", Text = "text" }
+);
 
 str_enum!(FactStatus {
     Candidate = "candidate",
@@ -236,6 +265,8 @@ str_enum!(FactStatus {
     Superseded = "superseded",
     Retracted = "retracted",
 });
+
+str_enum!(FeedbackVerdict { Helpful = "helpful", Wrong = "wrong", Outdated = "outdated" });
 
 str_enum!(MembershipRole { Owner = "owner", Writer = "writer", Reader = "reader" });
 

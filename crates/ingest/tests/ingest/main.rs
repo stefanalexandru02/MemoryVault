@@ -7,4 +7,5 @@ mod results;
 mod rls;
 mod sessions;
 mod sweep;
+mod triggers;
 mod work;

@@ -12,6 +12,7 @@ use memvault_core::schemas::common::ScopeKind;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use super::scope::ScopeFilter;
 use crate::audit::{AuditCtx, record, snapshot};
 
 /// Half-life in days of `change` and `discovery` observations.
@@ -47,9 +48,16 @@ pub fn decayed_importance(importance: f64, elapsed_days: f64, half_life_days: f6
 }
 
 /// Decay observations and facts of the space as of `now`; returns `(observations, facts)` updated.
-pub async fn decay(conn: &mut PgConnection, space_id: Uuid, now: DateTime<Utc>) -> Result<(u64, u64), sqlx::Error> {
+pub async fn decay(
+    conn: &mut PgConnection,
+    space_id: Uuid,
+    now: DateTime<Utc>,
+    filter: &ScopeFilter,
+) -> Result<(u64, u64), sqlx::Error> {
     let min_age = Duration::hours(MIN_DECAY_INTERVAL_HOURS).num_seconds() as f64;
-    let observations = sqlx::query(
+    let observation_scope = ScopeFilter::condition("scope_kind", "scope_key", 8);
+    let fact_scope = ScopeFilter::condition("scope_kind", "scope_key", 6);
+    let observations = sqlx::query(&format!(
         "UPDATE observations SET
            importance = GREATEST(
              importance * power(0.5::float8, extract(epoch FROM ($2 - coalesce(decayed_at, created_at))) / 86400.0
@@ -57,9 +65,9 @@ pub async fn decay(conn: &mut PgConnection, space_id: Uuid, now: DateTime<Utc>) 
                             WHEN 'bugfix' THEN $4 ELSE $5 END)),
              $6::float8)::real,
            decayed_at = $2
-         WHERE space_id = $1 AND archived_at IS NULL
+         WHERE space_id = $1 AND archived_at IS NULL AND {observation_scope}
            AND extract(epoch FROM ($2 - coalesce(decayed_at, created_at))) >= $7",
-    )
+    ))
     .bind(space_id)
     .bind(now)
     .bind(HALF_LIFE_FLEETING_DAYS)
@@ -67,26 +75,32 @@ pub async fn decay(conn: &mut PgConnection, space_id: Uuid, now: DateTime<Utc>) 
     .bind(HALF_LIFE_DEFAULT_DAYS)
     .bind(OBSERVATION_FLOOR)
     .bind(min_age)
+    .bind(filter.only_kind())
+    .bind(filter.only_key())
+    .bind(filter.skipped())
     .execute(&mut *conn)
     .await?
     .rows_affected();
     // ref = the later of last access/creation and last decay
-    let facts = sqlx::query(
+    let facts = sqlx::query(&format!(
         "UPDATE facts SET
            importance = GREATEST(
              importance * power(0.5::float8, extract(epoch FROM ($2 - greatest(coalesce(last_accessed_at, first_seen_at),
                                                                               coalesce(decayed_at, first_seen_at)))) / 86400.0 / $3),
              LEAST(importance::float8, $4::float8))::real,
            decayed_at = $2
-         WHERE space_id = $1 AND status IN ('active', 'candidate') AND NOT pinned
+         WHERE space_id = $1 AND status IN ('active', 'candidate') AND NOT pinned AND {fact_scope}
            AND extract(epoch FROM ($2 - greatest(coalesce(last_accessed_at, first_seen_at),
                                                  coalesce(decayed_at, first_seen_at)))) >= $5",
-    )
+    ))
     .bind(space_id)
     .bind(now)
     .bind(HALF_LIFE_FACT_DAYS)
     .bind(FACT_FLOOR)
     .bind(min_age)
+    .bind(filter.only_kind())
+    .bind(filter.only_key())
+    .bind(filter.skipped())
     .execute(&mut *conn)
     .await?
     .rows_affected();
@@ -95,15 +109,24 @@ pub async fn decay(conn: &mut PgConnection, space_id: Uuid, now: DateTime<Utc>) 
 
 /// Archive observations below the importance threshold and past the age limit; each is audited
 /// `obs.archive` with before/after snapshots. Returns how many.
-pub async fn archive(conn: &mut PgConnection, ctx: &AuditCtx, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
-    let rows: Vec<(Uuid, ScopeKind, String)> = sqlx::query_as(
+pub async fn archive(
+    conn: &mut PgConnection,
+    ctx: &AuditCtx,
+    now: DateTime<Utc>,
+    filter: &ScopeFilter,
+) -> Result<u64, sqlx::Error> {
+    let scope = ScopeFilter::condition("scope_kind", "scope_key", 4);
+    let rows: Vec<(Uuid, ScopeKind, String)> = sqlx::query_as(&format!(
         "SELECT id, scope_kind, scope_key FROM observations
-          WHERE space_id = $1 AND archived_at IS NULL AND importance < $2 AND created_at < $3
+          WHERE space_id = $1 AND archived_at IS NULL AND importance < $2 AND created_at < $3 AND {scope}
           ORDER BY created_at, id FOR UPDATE",
-    )
+    ))
     .bind(ctx.space_id)
     .bind(ARCHIVE_IMPORTANCE_BELOW)
     .bind(now - Duration::days(ARCHIVE_AFTER_DAYS))
+    .bind(filter.only_kind())
+    .bind(filter.only_key())
+    .bind(filter.skipped())
     .fetch_all(&mut *conn)
     .await?;
     for (id, kind, key) in &rows {

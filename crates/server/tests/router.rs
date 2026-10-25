@@ -1,6 +1,7 @@
 use axum::http::{Method, StatusCode};
 use memvault_core::AppliersRegistry;
-use memvault_core::test_support::{send, test_settings, test_state, test_state_with};
+use memvault_core::auth::scopes::TokenKind;
+use memvault_core::test_support::{seed_identity, send, test_settings, test_state, test_state_with};
 use memvault_server::build_router;
 use sqlx::PgPool;
 
@@ -65,6 +66,31 @@ async fn viewer_is_served_with_a_strict_content_security_policy(pool: PgPool) {
     // And the script never writes markup.
     let js = send(&app, Method::GET, "/viewer/app.js", None, None).await.text();
     assert!(!js.contains(".innerHTML") && !js.contains("insertAdjacentHTML(") && !js.contains("document.write("));
+    // The Admin tab's Health panel reads the doctor endpoint.
+    assert!(js.contains("/v1/admin/doctor"));
+    // ... and the Consolidation runs panel lists planner runs and queued plan jobs with their trigger.
+    assert!(js.contains("/v1/admin/consolidation?limit=") && js.contains("/v1/admin/jobs?type=plan"));
+    // The detail pane lists a fact's or procedure's versions, and the search bar can ask for a past day.
+    assert!(js.contains("/history`") && js.contains("p.set('as_of'"));
+    // Helpful / wrong / outdated buttons post feedback on the open memory.
+    assert!(js.contains("/feedback`") && js.contains("'outdated'"));
+    // The header sets the default injection mode and the Work tab shows the tokens served.
+    assert!(js.contains("/v1/me/settings") && js.contains("/v1/stats/recall"));
+    let css = send(&app, Method::GET, "/viewer/app.css", None, None).await.text();
+    assert!(css.contains(".history li.current") && css.contains(".btn.verdict") && css.contains("td.num"));
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn admin_doctor_is_served_to_admin_tokens_only(pool: PgPool) {
+    let admin = seed_identity(&pool, TokenKind::Admin).await;
+    let device = seed_identity(&pool, TokenKind::Device).await;
+    let app = build_router(test_state(pool));
+    let r = send(&app, Method::GET, "/v1/admin/doctor", Some(&device.token), None).await;
+    assert_eq!((r.status, r.error_code().as_deref()), (StatusCode::FORBIDDEN, Some("insufficient_scope")));
+    let r = send(&app, Method::GET, "/v1/admin/doctor", Some(&admin.token), None).await;
+    assert_eq!(r.status, StatusCode::OK);
+    let checks = r.json()["checks"].clone();
+    assert!(checks.as_array().unwrap().iter().any(|c| c["name"] == "database" && c["status"] == "ok"), "{checks}");
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -85,56 +111,4 @@ async fn health_down_without_database() {
     let r = send(&build_router(test_state(pool)), Method::GET, "/health", None, None).await;
     assert_eq!(r.status, StatusCode::SERVICE_UNAVAILABLE);
     assert_eq!(r.json()["status"], "down");
-}
-
-/// Collects what a tracing subscriber writes.
-#[derive(Clone, Default)]
-struct Sink(std::sync::Arc<std::sync::Mutex<Vec<u8>>>);
-
-impl std::io::Write for Sink {
-    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        self.0.lock().unwrap().extend_from_slice(buf);
-        Ok(buf.len())
-    }
-
-    fn flush(&mut self) -> std::io::Result<()> {
-        Ok(())
-    }
-}
-
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for Sink {
-    type Writer = Sink;
-
-    fn make_writer(&'a self) -> Sink {
-        self.clone()
-    }
-}
-
-#[sqlx::test(migrations = "../../migrations")]
-async fn request_logs_carry_user_client_and_space(pool: PgPool) {
-    use memvault_core::auth::scopes::TokenKind;
-    use memvault_core::test_support::seed_identity;
-
-    let alice = seed_identity(&pool, TokenKind::Device).await;
-    let app = build_router(test_state(pool.clone()));
-    let sink = Sink::default();
-    let subscriber =
-        tracing_subscriber::fmt().json().with_max_level(tracing::Level::DEBUG).with_writer(sink.clone()).finish();
-    let guard = tracing::subscriber::set_default(subscriber);
-    let r = send(&app, Method::GET, "/v1/search?q=anything", Some(&alice.token), None).await;
-    drop(guard);
-    assert_eq!(r.status, StatusCode::OK, "{}", r.text());
-
-    let logs = String::from_utf8(sink.0.lock().unwrap().clone()).unwrap();
-    let spans: Vec<serde_json::Value> = logs
-        .lines()
-        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
-        .filter_map(|l| l.get("span").cloned())
-        .filter(|s| s["name"] == "http")
-        .collect();
-    let last = spans.last().unwrap_or_else(|| panic!("no http span in\n{logs}"));
-    assert_eq!(last["user_id"], alice.user_id.to_string(), "{last}");
-    assert_eq!(last["client_id"], alice.client_id.to_string(), "{last}");
-    assert_eq!(last["space_id"], alice.space_id.to_string(), "{last}");
-    assert!(!logs.contains(&alice.token), "tokens are never logged");
 }

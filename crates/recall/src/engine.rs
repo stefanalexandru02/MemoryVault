@@ -13,15 +13,16 @@ use chrono::{DateTime, Utc};
 use memvault_core::auth::resolve_read_spaces;
 use memvault_core::db::caps;
 use memvault_core::ids::new_id;
-use memvault_core::schemas::common::{MemoryTable, Scope, ScopeKind, Sensitivity, SummaryGrain};
+use memvault_core::schemas::common::{InjectionMode, MemoryTable, Scope, ScopeKind, Sensitivity, SummaryGrain};
 use memvault_core::schemas::memories::{
-    AuditEntry, ByFileQuery, EntityRef, EvidenceObservation, ExplainResponse, FactFull, GetResponse, IndexRow,
-    MAX_GET_IDS, MemoryItem, ObservationFull, ProcedureFull, ProcedureStatus, Provenance, SearchQuery, SearchResponse,
-    SessionInfo, SummaryFull, TimelineQuery, TimelineResponse,
+    AuditEntry, ByFileQuery, DocumentFull, EntityRef, EvidenceObservation, ExplainResponse, FactFull, FeedbackCounts,
+    GetResponse, HistoryEntry, HistoryResponse, IndexRow, MAX_GET_IDS, MemoryItem, ObservationFull, ProcedureFull,
+    ProcedureStatus, Provenance, SearchQuery, SearchResponse, SessionInfo, SummaryFull, TimelineQuery,
+    TimelineResponse, procedure_caution,
 };
 use memvault_core::schemas::recall::{
-    Budgets, FactItem, FeedbackRequest, FeedbackResponse, ObservationItem, ProcedureItem, ProfileSlot, RecallFormat,
-    RecallRequest, RecallResponse, RecallSlots, SlotItem, SummaryItem, TokenUsage, WorkStateList,
+    Budgets, DocumentItem, FactItem, FeedbackRequest, FeedbackResponse, ObservationItem, ProcedureItem, ProfileSlot,
+    RecallFormat, RecallRequest, RecallResponse, RecallSlots, SlotItem, SummaryItem, TokenUsage, WorkStateList,
 };
 use memvault_core::{ApiError, AppState, Identity, estimate_tokens};
 use serde_json::{Value, json};
@@ -38,11 +39,18 @@ use memvault_core::db::tune_vector_search;
 use memvault_core::user_tx;
 
 /// Tier order of candidate generation and of `selected` in `retrieval_log`.
-const TIER_ORDER: [MemoryTable; 4] =
-    [MemoryTable::Facts, MemoryTable::Procedures, MemoryTable::Observations, MemoryTable::Summaries];
+const TIER_ORDER: [MemoryTable; 5] = [
+    MemoryTable::Facts,
+    MemoryTable::Procedures,
+    MemoryTable::Observations,
+    MemoryTable::Summaries,
+    MemoryTable::Documents,
+];
 /// Fused candidates kept per tier (11.2 `LIMIT 40`) and sent to the reranker across tiers (11.3).
 const FUSED_LIMIT: usize = 40;
 const RERANK_TOP: usize = 40;
+/// Characters of a document chunk sent to the reranker.
+const RERANK_DOCUMENT_CHARS: usize = 1500;
 const NO_QUERY_LIMIT: i64 = 40;
 const NO_QUERY_OBS_LIMIT: i64 = 60;
 const PINNED_LIMIT: i64 = 20;
@@ -105,9 +113,11 @@ pub struct PackOptions {
     pub expand: u32,
     pub rerank: bool,
     pub exclude_sensitivity: Vec<Sensitivity>,
-    /// SessionStart: no query, pinned facts only, subagent observations hidden, session summaries
-    /// only (at most [`CONTEXT_SUMMARIES`]), at most [`CONTEXT_OBS_ROWS`] index rows.
+    /// SessionStart: no query, pinned facts only, no documents, subagent observations hidden, session
+    /// summaries only (at most [`CONTEXT_SUMMARIES`]), at most [`CONTEXT_OBS_ROWS`] index rows.
     pub context: bool,
+    /// Rank and filter as of this instant instead of now.
+    pub as_of: Option<DateTime<Utc>>,
 }
 
 pub const CONTEXT_OBS_ROWS: usize = 30;
@@ -132,6 +142,10 @@ fn rerank_text(row: &TierRow) -> String {
         }
         TierRow::Fact(f) => format!("{} {} {}", f.subject_name, f.predicate, f.value_text),
         TierRow::Proc(p) => format!("{} {}", p.name, p.trigger_text),
+        // A chunk is long and the reranker has 250 ms: its opening is what it judges.
+        TierRow::Doc(d) => {
+            format!("{} {}", d.heading_path.join(" "), render::excerpt(&d.content, RERANK_DOCUMENT_CHARS))
+        }
     }
 }
 
@@ -185,6 +199,7 @@ fn budget_of(b: &Budgets, table: MemoryTable) -> u32 {
         MemoryTable::Procedures => b.procedures,
         MemoryTable::Observations => b.observations,
         MemoryTable::Summaries => b.summaries,
+        MemoryTable::Documents => b.documents,
     }
 }
 
@@ -196,7 +211,7 @@ pub async fn build_pack(
     scopes: &[Scope],
     opts: &PackOptions,
 ) -> Result<Pack, ApiError> {
-    let now = Utc::now();
+    let now = opts.as_of.unwrap_or_else(Utc::now);
     let budgets = opts.budgets;
     let query = opts.query.as_deref().map(str::trim).filter(|q| !q.is_empty());
     let qvec = match query {
@@ -217,13 +232,16 @@ pub async fn build_pack(
         exclude_sensitivity: opts.exclude_sensitivity.clone(),
         summary_grains: Some(if opts.context { vec![SummaryGrain::Session] } else { RECALL_SUMMARY_GRAINS.to_vec() }),
         exclude_subagent: opts.context,
+        as_of: opts.as_of,
         ..Filters::default()
     };
 
     let mut by_tier: BTreeMap<MemoryTable, Vec<Candidate>> = BTreeMap::new();
     for table in TIER_ORDER {
         let mut cands = Vec::new();
-        if budget_of(&budgets, table) > 0 && !(table == MemoryTable::Facts && opts.context) {
+        // The SessionStart block never carries facts beyond the pinned ones, nor documents.
+        let in_context = matches!(table, MemoryTable::Facts | MemoryTable::Documents);
+        if budget_of(&budgets, table) > 0 && !(in_context && opts.context) {
             if query.is_some() {
                 let kw = if terms.is_empty() && entity_terms.is_empty() {
                     Vec::new()
@@ -340,7 +358,14 @@ pub async fn build_pack(
     slots.summaries = summaries;
     by_slot.insert("summaries".into(), used);
 
-    if budgets.work_state > 0 {
+    let doc_items: Vec<DocumentItem> =
+        mmr_order(take(MemoryTable::Documents)).iter().filter_map(document_item).collect();
+    let (documents, used) = budget_fill(doc_items, budgets.documents, |d| estimate_tokens(&render::document_line(d)));
+    slots.documents = documents;
+    by_slot.insert("documents".into(), used);
+
+    // Work state has no history, so a recall of the past leaves it out.
+    if budgets.work_state > 0 && opts.as_of.is_none() {
         let lists = fold_work_state(conn, spaces, scopes).await?;
         let (lists, used) = budget_fill(lists, budgets.work_state, |w| w.token_estimate);
         slots.work_state = lists;
@@ -355,6 +380,7 @@ pub async fn build_pack(
     selected.extend(slots.procedures.iter().map(|i| entry("procedures", &i.item)));
     selected.extend(slots.observations.iter().map(|i| entry("observations", &i.item)));
     selected.extend(slots.summaries.iter().map(|i| entry("summaries", &i.item)));
+    selected.extend(slots.documents.iter().map(|i| entry("documents", &i.item)));
     selected.extend(profile_fact_ids.iter().map(|id| json!({ "id": id, "slot": "profile" })));
 
     Ok(Pack { slots, by_slot, candidates, selected, reranked })
@@ -415,16 +441,21 @@ async fn profile_slot(
     }
     let kinds: Vec<ScopeKind> = scopes.iter().map(|s| s.kind).collect();
     let keys: Vec<String> = scopes.iter().map(|s| s.key.clone()).collect();
-    let mut rows: Vec<(Uuid, ScopeKind, String, String)> = sqlx::query_as(
-        "SELECT space_id, scope_kind, scope_key, body_md FROM profiles
-          WHERE space_id = ANY($1)
-            AND (scope_kind, scope_key) IN (SELECT * FROM unnest($2::scope_kind[], $3::text[]))",
-    )
-    .bind(spaces.to_vec())
-    .bind(kinds)
-    .bind(keys)
-    .fetch_all(&mut *conn)
-    .await?;
+    // Rendered profiles describe the present; a past instant is rebuilt from the facts valid then.
+    let mut rows: Vec<(Uuid, ScopeKind, String, String)> = if opts.as_of.is_some() {
+        Vec::new()
+    } else {
+        sqlx::query_as(
+            "SELECT space_id, scope_kind, scope_key, body_md FROM profiles
+              WHERE space_id = ANY($1)
+                AND (scope_kind, scope_key) IN (SELECT * FROM unnest($2::scope_kind[], $3::text[]))",
+        )
+        .bind(spaces.to_vec())
+        .bind(kinds)
+        .bind(keys)
+        .fetch_all(&mut *conn)
+        .await?
+    };
     if !rows.is_empty() {
         let pos = |r: &(Uuid, ScopeKind, String, String)| {
             let scope = Scope::new(r.1, r.2.clone());
@@ -467,6 +498,7 @@ async fn profile_slot(
         spaces: spaces.to_vec(),
         scopes: Some(scopes.to_vec()),
         exclude_sensitivity: opts.exclude_sensitivity.clone(),
+        as_of: opts.as_of,
         ..Filters::default()
     };
     let ids = recent_leg(conn, MemoryTable::Facts, &f, PINNED_LIMIT, 0).await?;
@@ -570,7 +602,8 @@ fn slot_item(c: &Candidate, row: &TierRow, token_estimate: i32, citation: String
 fn fact_item(c: &Candidate) -> Option<FactItem> {
     let row @ TierRow::Fact(r) = c.row.as_ref()? else { return None };
     let confidence = f64::from(r.confidence);
-    let citation = render::fact_tag(&r.id, confidence, &r.devices, Some(r.first_seen_at));
+    let citation =
+        render::fact_tag(&r.id, confidence, &r.devices, Some(r.first_seen_at), r.caution(Utc::now()).as_deref());
     Some(FactItem {
         item: slot_item(c, row, estimate_tokens(&r.value_text), citation),
         subject: r.subject_name.clone(),
@@ -591,7 +624,17 @@ fn procedure_item(c: &Candidate) -> Option<ProcedureItem> {
     let row @ TierRow::Proc(r) = c.row.as_ref()? else { return None };
     let tokens = if r.token_estimate > 0 { r.token_estimate } else { estimate_tokens(&r.body_md) };
     Some(ProcedureItem {
-        item: slot_item(c, row, tokens, render::procedure_tag(&r.id, r.version, Some(r.created_at))),
+        item: slot_item(
+            c,
+            row,
+            tokens,
+            render::procedure_tag(
+                &r.id,
+                r.version,
+                Some(r.created_at),
+                procedure_caution(r.success_count, r.failure_count).as_deref(),
+            ),
+        ),
         name: r.name.clone(),
         task_class: r.task_class.clone(),
         trigger_text: r.trigger_text.clone(),
@@ -648,6 +691,22 @@ fn summary_item(c: &Candidate) -> Option<SummaryItem> {
     })
 }
 
+fn document_item(c: &Candidate) -> Option<DocumentItem> {
+    let row @ TierRow::Doc(r) = c.row.as_ref()? else { return None };
+    let source = r.source();
+    let citation = render::document_tag(&r.id, &source, Some(r.created_at));
+    Some(DocumentItem {
+        item: slot_item(c, row, r.token_estimate, citation),
+        source,
+        uri: r.source_uri.clone(),
+        title: r.title.clone(),
+        heading_path: r.heading_path.clone(),
+        chunk_index: r.chunk_index,
+        content: r.content.clone(),
+        created_at: r.created_at,
+    })
+}
+
 // ---------- POST /v1/recall ----------
 
 /// What a `retrieval_log` row records.
@@ -658,6 +717,12 @@ pub struct RetrievalRecord<'a> {
     pub scopes: &'a [Scope],
     pub budgets: Option<&'a Budgets>,
     pub latency_ms: i64,
+    /// Injection mode of a `context` call; `None` for `recall`.
+    pub injection: Option<InjectionMode>,
+    /// Tokens of the text returned (estimated).
+    pub tokens: i32,
+    /// Memories selected into the response.
+    pub hits: i32,
 }
 
 /// Insert a `retrieval_log` row (in the caller's `user_tx`) and return its id.
@@ -667,15 +732,37 @@ pub async fn log_retrieval(
     rec: RetrievalRecord<'_>,
     pack: &Pack,
 ) -> Result<Uuid, sqlx::Error> {
-    let id = new_id();
     let mut cands: Vec<&Candidate> = pack.candidates.iter().collect();
     cands.sort_by(|a, b| a.table.cmp(&b.table).then(by_score(a, b)));
     let logged: Vec<Value> = cands.iter().take(MAX_LOGGED_CANDIDATES).map(|c| c.log()).collect();
+    insert_retrieval(conn, identity, rec, Value::Array(logged), Value::Array(pack.selected.clone()), pack.reranked)
+        .await
+}
+
+/// Insert a `retrieval_log` row for a context block served from the cache: no candidates were ranked, so
+/// only what was served is recorded (the stats count every call, not only the renders).
+pub async fn log_cached_retrieval(
+    conn: &mut PgConnection,
+    identity: &Identity,
+    rec: RetrievalRecord<'_>,
+) -> Result<Uuid, sqlx::Error> {
+    insert_retrieval(conn, identity, rec, json!([]), json!([]), false).await
+}
+
+async fn insert_retrieval(
+    conn: &mut PgConnection,
+    identity: &Identity,
+    rec: RetrievalRecord<'_>,
+    candidates: Value,
+    selected: Value,
+    reranked: bool,
+) -> Result<Uuid, sqlx::Error> {
+    let id = new_id();
     let scopes: Vec<String> = rec.scopes.iter().map(Scope::as_text).collect();
     sqlx::query(
         "INSERT INTO retrieval_log (id, space_id, client_id, mode, query, scopes, budgets, candidates, selected,
-                                    latency_ms, reranked)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11)",
+                                    latency_ms, reranked, injection, tokens, hits)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14)",
     )
     .bind(id)
     .bind(rec.spaces[0])
@@ -684,10 +771,13 @@ pub async fn log_retrieval(
     .bind(rec.query)
     .bind(json!({ "space_ids": rec.spaces, "scopes": scopes }))
     .bind(rec.budgets.map(|b| json!(b)))
-    .bind(Value::Array(logged))
-    .bind(Value::Array(pack.selected.clone()))
+    .bind(candidates)
+    .bind(selected)
     .bind(i32::try_from(rec.latency_ms).unwrap_or(i32::MAX))
-    .bind(pack.reranked)
+    .bind(reranked)
+    .bind(rec.injection)
+    .bind(rec.tokens)
+    .bind(rec.hits)
     .execute(conn)
     .await?;
     Ok(id)
@@ -729,6 +819,7 @@ pub async fn recall(state: &AppState, identity: &Identity, req: RecallRequest) -
         rerank: req.rerank,
         exclude_sensitivity: req.exclude_sensitivity.clone(),
         context: false,
+        as_of: req.as_of,
     };
     let pack = build_pack(state, &mut tx, &spaces, &scopes, &opts).await?;
     let rendered = (req.format != RecallFormat::Json).then(|| render::recall_markdown(&pack.slots));
@@ -740,6 +831,9 @@ pub async fn recall(state: &AppState, identity: &Identity, req: RecallRequest) -
         scopes: &scopes,
         budgets: Some(&req.budgets),
         latency_ms,
+        injection: None,
+        tokens: pack.by_slot.values().sum(),
+        hits: i32::try_from(pack.selected.len()).unwrap_or(i32::MAX),
     };
     let retrieval_id = log_retrieval(&mut tx, identity, rec, &pack).await?;
     log_pack_access(&mut tx, identity, "recall", &pack.slots).await?;
@@ -838,6 +932,12 @@ fn index_row(row: &TierRow, score: Option<f64>, anchor: bool) -> IndexRow {
             let tokens = if r.token_estimate > 0 { r.token_estimate } else { estimate_tokens(&r.body_md) };
             (MemoryTable::Procedures, r.task_class.clone(), r.name.clone(), r.created_at, tokens)
         }
+        TierRow::Doc(r) => (MemoryTable::Documents, "document".to_string(), r.source(), r.created_at, r.token_estimate),
+    };
+    let caution = match row {
+        TierRow::Fact(r) => r.caution(Utc::now()),
+        TierRow::Proc(r) => procedure_caution(r.success_count, r.failure_count),
+        TierRow::Obs(_) | TierRow::Sum(_) | TierRow::Doc(_) => None,
     };
     IndexRow {
         id: row.id(),
@@ -849,6 +949,7 @@ fn index_row(row: &TierRow, score: Option<f64>, anchor: bool) -> IndexRow {
         token_estimate: tokens,
         score: score.map(round6),
         is_anchor: anchor,
+        caution,
     }
 }
 
@@ -858,7 +959,14 @@ pub async fn search(state: &AppState, identity: &Identity, query: SearchQuery) -
     let mut tx = user_tx(&state.db.app, identity).await?;
     let spaces = resolve_read_spaces(&mut tx, identity, query.space_ids.as_deref()).await?;
     let scopes = query.scopes.as_deref().map(validate_scopes).transpose()?;
-    let mut tables = query.tables.clone().unwrap_or_else(|| vec![MemoryTable::Observations, MemoryTable::Summaries]);
+    let mut tables = query.tables.clone().unwrap_or_else(|| {
+        let mut tables = vec![MemoryTable::Observations, MemoryTable::Summaries];
+        // Asking for the `document` type is asking for the ingested docs.
+        if query.types.as_ref().is_some_and(|t| t.iter().any(|t| t == "document")) {
+            tables.push(MemoryTable::Documents);
+        }
+        tables
+    });
     if query.files.is_some() {
         tables.retain(|t| *t == MemoryTable::Observations);
     }
@@ -875,9 +983,10 @@ pub async fn search(state: &AppState, identity: &Identity, query: SearchQuery) -
         since: query.since,
         until: query.until,
         files: query.files.clone(),
+        as_of: query.as_of,
         ..Filters::default()
     };
-    let now = Utc::now();
+    let now = query.as_of.unwrap_or_else(Utc::now);
     // (sort key, row): score descending or newest first, then id.
     let mut rows: Vec<((f64, Uuid), IndexRow)> = Vec::new();
     match query.q.as_deref().map(str::trim).filter(|q| !q.is_empty()) {
@@ -1064,34 +1173,38 @@ fn memory_item(row: TierRow) -> MemoryItem {
             token_estimate: r.token_estimate,
             created_at: r.created_at,
         }),
-        TierRow::Fact(r) => MemoryItem::Facts(FactFull {
-            id: r.id,
-            space_id: r.space_id,
-            scope: Scope::new(r.scope_kind, r.scope_key),
-            subject: EntityRef { id: r.subject_id, kind: r.subject_kind, canonical_name: r.subject_name },
-            predicate: r.predicate,
-            value: r.value,
-            value_text: r.value_text,
-            confidence: f64::from(r.confidence),
-            importance: f64::from(r.importance),
-            status: r.status,
-            conflict: r.conflict,
-            supersedes_id: r.supersedes_id,
-            superseded_by: r.superseded_by,
-            valid_from: r.valid_from,
-            valid_to: r.valid_to,
-            first_seen_at: r.first_seen_at,
-            last_confirmed_at: r.last_confirmed_at,
-            confirmations: r.confirmations,
-            evidence_observation_ids: r.evidence_observation_ids,
-            learned_on_client_ids: r.learned_on_client_ids,
-            access_count: r.access_count,
-            last_accessed_at: r.last_accessed_at,
-            pinned: r.pinned,
-            sensitivity: r.sensitivity,
-            written_by_client_id: r.written_by_client_id,
-            extracted_by: r.extracted_by,
-        }),
+        TierRow::Fact(r) => {
+            let caution = r.caution(Utc::now());
+            MemoryItem::Facts(FactFull {
+                id: r.id,
+                space_id: r.space_id,
+                scope: Scope::new(r.scope_kind, r.scope_key),
+                subject: EntityRef { id: r.subject_id, kind: r.subject_kind, canonical_name: r.subject_name },
+                predicate: r.predicate,
+                value: r.value,
+                value_text: r.value_text,
+                confidence: f64::from(r.confidence),
+                importance: f64::from(r.importance),
+                status: r.status,
+                conflict: r.conflict,
+                supersedes_id: r.supersedes_id,
+                superseded_by: r.superseded_by,
+                valid_from: r.valid_from,
+                valid_to: r.valid_to,
+                first_seen_at: r.first_seen_at,
+                last_confirmed_at: r.last_confirmed_at,
+                confirmations: r.confirmations,
+                evidence_observation_ids: r.evidence_observation_ids,
+                learned_on_client_ids: r.learned_on_client_ids,
+                access_count: r.access_count,
+                last_accessed_at: r.last_accessed_at,
+                pinned: r.pinned,
+                sensitivity: r.sensitivity,
+                written_by_client_id: r.written_by_client_id,
+                extracted_by: r.extracted_by,
+                caution,
+            })
+        }
         TierRow::Proc(r) => MemoryItem::Procedures(ProcedureFull {
             id: r.id,
             space_id: r.space_id,
@@ -1110,10 +1223,26 @@ fn memory_item(row: TierRow) -> MemoryItem {
             token_estimate: r.token_estimate,
             created_at: r.created_at,
         }),
+        TierRow::Doc(r) => MemoryItem::Documents(DocumentFull {
+            id: r.id,
+            space_id: r.space_id,
+            scope: Scope::new(r.scope_kind, r.scope_key),
+            source_uri: r.source_uri,
+            title: r.title,
+            content_type: r.content_type,
+            chunk_index: r.chunk_index,
+            heading_path: r.heading_path,
+            content: r.content,
+            content_hash: r.content_hash,
+            token_estimate: r.token_estimate,
+            ingested_by: r.ingested_by,
+            created_at: r.created_at,
+            retired_at: r.retired_at,
+        }),
     }
 }
 
-/// Full bodies for ids across the four tiers (whatever RLS lets the caller see).
+/// Full bodies for ids across the five tiers (whatever RLS lets the caller see).
 pub async fn load_items(conn: &mut PgConnection, ids: &[Uuid]) -> Result<HashMap<Uuid, MemoryItem>, sqlx::Error> {
     let mut out = HashMap::new();
     for table in TIER_ORDER {
@@ -1130,6 +1259,7 @@ fn item_space(item: &MemoryItem) -> Uuid {
         MemoryItem::Summaries(s) => s.space_id,
         MemoryItem::Facts(f) => f.space_id,
         MemoryItem::Procedures(p) => p.space_id,
+        MemoryItem::Documents(d) => d.space_id,
     }
 }
 
@@ -1145,8 +1275,8 @@ pub async fn log_access(
 }
 
 /// `access_log` for what a recall or context pack returned: fact values (also the ones rendered in
-/// the profile, found again by their `fact#` tags), procedure bodies, summaries and expanded
-/// observation narratives. Index-only observation lines (titles) are not content reads.
+/// the profile, found again by their `fact#` tags), procedure bodies, summaries, document chunks and
+/// expanded observation narratives. Index-only observation lines (titles) are not content reads.
 pub async fn log_pack_access(
     conn: &mut PgConnection,
     identity: &Identity,
@@ -1157,6 +1287,7 @@ pub async fn log_pack_access(
     targets.extend(slots.facts.iter().map(|f| (f.item.space_id, f.item.id)));
     targets.extend(slots.procedures.iter().map(|p| (p.item.space_id, p.item.id)));
     targets.extend(slots.summaries.iter().map(|s| (s.item.space_id, s.item.id)));
+    targets.extend(slots.documents.iter().map(|d| (d.item.space_id, d.item.id)));
     targets.extend(slots.observations.iter().filter(|o| o.expanded).map(|o| (o.item.space_id, o.item.id)));
     if let Some(profile) = &slots.profile {
         let tags: Vec<String> = profile
@@ -1219,8 +1350,26 @@ pub async fn get_memories(state: &AppState, identity: &Identity, ids: &[Uuid]) -
     let items: Vec<MemoryItem> = wanted.iter().filter_map(|id| found.remove(id)).collect();
     let missing = wanted.iter().filter(|id| !items.iter().any(|i| i.id() == **id)).copied().collect();
     log_access(&mut tx, identity, "get", &items.iter().collect::<Vec<_>>()).await?;
+    let found_ids: Vec<Uuid> = items.iter().map(MemoryItem::id).collect();
+    let feedback = feedback_counts(&mut tx, &found_ids).await?;
     tx.commit().await?;
-    Ok(GetResponse { items, missing })
+    Ok(GetResponse { items, missing, feedback })
+}
+
+/// Verdicts given on each of `ids`, for the ones that have any (RLS bounds them to the caller's spaces).
+async fn feedback_counts(conn: &mut PgConnection, ids: &[Uuid]) -> Result<BTreeMap<Uuid, FeedbackCounts>, sqlx::Error> {
+    let rows: Vec<(Uuid, i64, i64, i64)> = sqlx::query_as(
+        "SELECT target_id, count(*) FILTER (WHERE verdict = 'helpful'), count(*) FILTER (WHERE verdict = 'wrong'),
+                count(*) FILTER (WHERE verdict = 'outdated')
+           FROM memory_feedback WHERE target_id = ANY($1) GROUP BY target_id",
+    )
+    .bind(ids)
+    .fetch_all(conn)
+    .await?;
+    Ok(rows
+        .into_iter()
+        .map(|(id, helpful, wrong, outdated)| (id, FeedbackCounts { helpful, wrong, outdated }))
+        .collect())
 }
 
 /// Map display refs (`obs#a1b2c3`, the 6-hex short id, or a full id) to visible row ids, for the
@@ -1249,6 +1398,7 @@ pub async fn resolve_refs(
              UNION ALL SELECT id FROM summaries WHERE replace(id::text, '-', '') LIKE '%' || $1
              UNION ALL SELECT id FROM facts WHERE replace(id::text, '-', '') LIKE '%' || $1
              UNION ALL SELECT id FROM procedures WHERE replace(id::text, '-', '') LIKE '%' || $1
+             UNION ALL SELECT id FROM documents WHERE replace(id::text, '-', '') LIKE '%' || $1
              LIMIT 2",
         )
         .bind(&text)
@@ -1323,6 +1473,14 @@ pub async fn explain(state: &AppState, identity: &Identity, id: Uuid) -> Result<
             f.evidence_observation_ids.clone()
         }
         MemoryItem::Procedures(p) => p.source_observation_ids.clone(),
+        MemoryItem::Documents(d) => {
+            let extracted_by = json!({
+                "runner_kind": "ingest", "source_uri": d.source_uri, "chunk_index": d.chunk_index,
+                "content_hash": d.content_hash, "ingested_by": d.ingested_by,
+            });
+            prov = Some(Provenance { extracted_by, ..Provenance::default() });
+            Vec::new()
+        }
     };
     let mut ev_rows = hydrate(&mut tx, MemoryTable::Observations, &evidence_ids).await?;
     for oid in &evidence_ids {
@@ -1375,4 +1533,138 @@ pub async fn explain(state: &AppState, identity: &Identity, id: Uuid) -> Result<
         })
         .collect();
     Ok(ExplainResponse { id, table: item.table(), item, provenance: prov, evidence, audit })
+}
+
+// ---------- history ----------
+
+/// Links followed from the asked-for memory in each direction.
+const HISTORY_DEPTH: i32 = 50;
+
+/// When a chain entry started to hold: a fact's `valid_from` (else `first_seen_at`), otherwise `created_at`.
+fn history_started(row: &TierRow) -> DateTime<Utc> {
+    match row {
+        TierRow::Obs(r) => r.created_at,
+        TierRow::Sum(r) => r.created_at,
+        TierRow::Fact(r) => r.valid_from.unwrap_or(r.first_seen_at),
+        TierRow::Proc(r) => r.created_at,
+        TierRow::Doc(r) => r.created_at,
+    }
+}
+
+fn history_entry(row: &TierRow, current: bool) -> HistoryEntry {
+    let (table, status, text, valid_from, valid_to, supersedes_id, superseded_by) = match row {
+        TierRow::Obs(r) => {
+            let status = if r.archived_at.is_some() { "archived" } else { "active" };
+            (
+                MemoryTable::Observations,
+                status.to_string(),
+                None,
+                Some(r.created_at),
+                r.archived_at,
+                None,
+                r.superseded_by,
+            )
+        }
+        TierRow::Sum(r) => (MemoryTable::Summaries, "active".to_string(), None, Some(r.created_at), None, None, None),
+        TierRow::Fact(r) => {
+            (MemoryTable::Facts, r.status.to_string(), None, r.valid_from, r.valid_to, r.supersedes_id, r.superseded_by)
+        }
+        TierRow::Proc(r) => {
+            let text = format!("{} (v{}): {}", r.name, r.version, render::excerpt(&r.body_md, 160));
+            (MemoryTable::Procedures, r.status.clone(), Some(text), Some(r.created_at), None, r.supersedes_id, None)
+        }
+        TierRow::Doc(r) => {
+            let status = if r.retired_at.is_some() { "retired" } else { "active" };
+            (MemoryTable::Documents, status.to_string(), None, Some(r.created_at), r.retired_at, None, None)
+        }
+    };
+    HistoryEntry {
+        id: row.id(),
+        table,
+        text: text.unwrap_or_else(|| index_row(row, None, false).title),
+        status,
+        valid_from,
+        valid_to,
+        supersedes_id,
+        superseded_by,
+        current,
+        ended_at: None,
+        ended_by: None,
+        reason: None,
+        model: None,
+        run_id: None,
+    }
+}
+
+/// Ids of the supersession chain through `id`: its ancestors by `supersedes_id`, its descendants, itself.
+async fn chain_ids(conn: &mut PgConnection, table: MemoryTable, id: Uuid) -> Result<Vec<Uuid>, sqlx::Error> {
+    let t = table.as_str();
+    sqlx::query_scalar(&format!(
+        "WITH RECURSIVE up(id, depth) AS (
+           SELECT id, 0 FROM {t} WHERE id = $1
+           UNION
+           SELECT p.supersedes_id, up.depth + 1 FROM up JOIN {t} p ON p.id = up.id
+            WHERE p.supersedes_id IS NOT NULL AND up.depth < $2),
+         down(id, depth) AS (
+           SELECT id, 0 FROM {t} WHERE id = $1
+           UNION
+           SELECT n.id, down.depth + 1 FROM down JOIN {t} n ON n.supersedes_id = down.id WHERE down.depth < $2)
+         SELECT id FROM {t} WHERE id IN (SELECT id FROM up UNION SELECT id FROM down)"
+    ))
+    .bind(id)
+    .bind(HISTORY_DEPTH)
+    .fetch_all(conn)
+    .await
+}
+
+/// `GET /v1/memories/{id}/history`: the supersession chain through `id`, oldest first, with who ended
+/// each link and why where the audit trail knows. Facts and procedures chain; an observation or a
+/// summary is a chain of one. Other secret rows in the chain are left out.
+pub async fn history(state: &AppState, identity: &Identity, id: Uuid) -> Result<HistoryResponse, ApiError> {
+    let mut tx = user_tx(&state.db.app, identity).await?;
+    let table =
+        load_items(&mut tx, &[id]).await?.remove(&id).ok_or_else(|| ApiError::not_found("memory not found"))?.table();
+    let ids = match table {
+        MemoryTable::Facts | MemoryTable::Procedures => chain_ids(&mut tx, table, id).await?,
+        MemoryTable::Observations | MemoryTable::Summaries | MemoryTable::Documents => vec![id],
+    };
+    let mut rows: Vec<TierRow> = hydrate(&mut tx, table, &ids)
+        .await?
+        .into_values()
+        .filter(|row| {
+            let secret = match row {
+                TierRow::Obs(r) => r.sensitivity == Sensitivity::Secret,
+                TierRow::Fact(r) => r.sensitivity == Sensitivity::Secret,
+                TierRow::Sum(_) | TierRow::Proc(_) | TierRow::Doc(_) => false,
+            };
+            row.id() == id || !secret
+        })
+        .collect();
+    rows.sort_by_key(|row| (history_started(row), row.id()));
+    type EndRow = (Uuid, String, Option<String>, Option<String>, Option<Uuid>, DateTime<Utc>);
+    let ends: Vec<EndRow> = sqlx::query_as(
+        "SELECT DISTINCT ON (target_id) target_id, actor, reason, model, run_id, created_at
+           FROM memory_audit
+          WHERE target_table = $1 AND target_id = ANY($2) AND action IN ('fact.supersede', 'fact.retract', 'proc.retire')
+          ORDER BY target_id, created_at DESC, id DESC",
+    )
+    .bind(table)
+    .bind(&ids)
+    .fetch_all(&mut *tx)
+    .await?;
+    tx.commit().await?;
+    let mut ends: HashMap<Uuid, EndRow> = ends.into_iter().map(|e| (e.0, e)).collect();
+    let mut entries: Vec<HistoryEntry> = rows.iter().map(|row| history_entry(row, row.id() == id)).collect();
+    let successors: HashMap<Uuid, Uuid> = entries.iter().filter_map(|e| e.supersedes_id.map(|p| (p, e.id))).collect();
+    for e in &mut entries {
+        e.superseded_by = e.superseded_by.or_else(|| successors.get(&e.id).copied());
+        if !matches!(e.status.as_str(), "superseded" | "retracted" | "retired") {
+            continue;
+        }
+        if let Some((_, actor, reason, model, run_id, at)) = ends.remove(&e.id) {
+            e.valid_to = e.valid_to.or(Some(at));
+            (e.ended_at, e.ended_by, e.reason, e.model, e.run_id) = (Some(at), Some(actor), reason, model, run_id);
+        }
+    }
+    Ok(HistoryResponse { id, table, entries })
 }

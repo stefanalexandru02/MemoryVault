@@ -149,7 +149,8 @@ pub async fn embed_targets_with(
 
 /// Queue embed jobs for every row lacking a vector for `model` (spec 13 backfill), at backfill
 /// priority so live embed jobs are not delayed behind them. Rows that already have a queued or
-/// running embed job are skipped. Returns the number of jobs queued.
+/// running embed job are skipped, and so are retired document chunks, which keep no vectors.
+/// Returns the number of jobs queued.
 pub async fn reindex(pool: &PgPool, model: &str) -> Result<u64, sqlx::Error> {
     let mut queued = 0;
     for table in EmbeddingOwnerTable::ALL.iter() {
@@ -157,11 +158,13 @@ pub async fn reindex(pool: &PgPool, model: &str) -> Result<u64, sqlx::Error> {
             "SELECT t.id FROM {} t
               WHERE NOT EXISTS (SELECT 1 FROM embeddings e
                                  WHERE e.owner_table = $1 AND e.owner_id = t.id AND e.model = $2)
+                AND {embeddable}
                 AND NOT EXISTS (SELECT 1 FROM jobs j
                                  WHERE j.type = 'embed' AND j.status IN ('queued', 'running')
                                    AND j.payload->>'owner_table' = $1 AND j.payload->>'owner_id' = t.id::text)
               ORDER BY t.id",
-            table.as_str()
+            table.as_str(),
+            embeddable = if *table == EmbeddingOwnerTable::Documents { "t.retired_at IS NULL" } else { "true" },
         ))
         .bind(table.as_str())
         .bind(model)

@@ -6,6 +6,8 @@ use std::time::Duration;
 
 use axum::Router;
 use axum::routing::get;
+use chrono::{DateTime, Utc};
+use memvault_consolidate::planner::{JobOutcome, run_plan_job};
 use memvault_core::AppState;
 use memvault_core::tei::{Embedder, TeiClient};
 use tokio_util::sync::CancellationToken;
@@ -23,6 +25,8 @@ use queue::Job;
 const POLL_INTERVAL: Duration = Duration::from_millis(500);
 const RENDER_JOB_TYPES: &[&str] = &["render_context"];
 const BULK_JOB_TYPES: &[&str] = &["reindex", "retention"];
+/// Planner runs have a lane of their own so a long reindex cannot hold them up.
+const PLAN_JOB_TYPES: &[&str] = &[memvault_core::jobs::PLAN_JOB];
 
 /// Embedder for worker batches: same model as `state.tei` but with `TEI_EMBED_BATCH_TIMEOUT_S`
 /// instead of the 2 s single-query timeout. With `FAKE_TEI` it is `state.tei` itself.
@@ -120,9 +124,13 @@ pub async fn job_pass(state: &AppState, worker: &str, types: &[&str]) -> anyhow:
     for job in &jobs {
         let kind = job.kind.as_str();
         match queue::with_heartbeat(pool, &[job.id], run_other(state, job)).await {
-            Ok(()) => {
+            Ok(JobEnd::Done) => {
                 queue::complete(pool, job.id).await?;
                 record_job(kind, "done");
+            }
+            Ok(JobEnd::Deferred(until)) => {
+                queue::defer(pool, job.id, until).await?;
+                record_job(kind, "deferred");
             }
             Err(e) => {
                 tracing::warn!(job = %job.id, kind, error = %e, "job failed");
@@ -134,7 +142,14 @@ pub async fn job_pass(state: &AppState, worker: &str, types: &[&str]) -> anyhow:
     Ok(jobs.len())
 }
 
-async fn run_other(state: &AppState, job: &Job) -> anyhow::Result<()> {
+/// How a job that ran without error ends.
+enum JobEnd {
+    Done,
+    /// Not due yet: queue it again to run at this time.
+    Deferred(DateTime<Utc>),
+}
+
+async fn run_other(state: &AppState, job: &Job) -> anyhow::Result<JobEnd> {
     match job.kind.as_str() {
         "render_context" => {
             memvault_recall::cache::rerender(state, &job.payload).await?;
@@ -148,9 +163,14 @@ async fn run_other(state: &AppState, job: &Job) -> anyhow::Result<()> {
             let report = retention::run_retention(&state.db.system, &state.settings).await?;
             tracing::info!(?report, "retention done");
         }
+        "plan" => {
+            if let JobOutcome::Deferred(until) = run_plan_job(state, &job.payload, Utc::now()).await? {
+                return Ok(JobEnd::Deferred(until));
+            }
+        }
         other => anyhow::bail!("unknown job type {other}"),
     }
-    Ok(())
+    Ok(JobEnd::Done)
 }
 
 fn record_job(kind: &str, outcome: &'static str) {
@@ -228,7 +248,8 @@ pub async fn run_worker(state: AppState, shutdown: CancellationToken) -> anyhow:
 }
 
 /// The `memvault worker` loop: `EMBED_CONCURRENCY` embed workers using `batch_tei`, one lane for
-/// `render_context` (so the 2 s debounce is not held up), one for `reindex` and `retention`, the
+/// `render_context` (so the 2 s debounce is not held up), one for `reindex` and `retention`, one for
+/// scoped `plan` jobs, the
 /// sweep every `WORKER_SWEEP_INTERVAL_S` (idle windows, expired leases, retention scheduling,
 /// gauges) and `/metrics` + `/health` on `WORKER_METRICS_ADDR` (default `HOST:PORT`). Returns once
 /// `shutdown` is cancelled and the in-flight jobs finished.
@@ -258,6 +279,7 @@ pub async fn run_worker_with(
     }
     tasks.spawn(job_loop(state.clone(), format!("{id}-render"), Lane::Jobs(RENDER_JOB_TYPES), shutdown.clone()));
     tasks.spawn(job_loop(state.clone(), format!("{id}-bulk"), Lane::Jobs(BULK_JOB_TYPES), shutdown.clone()));
+    tasks.spawn(job_loop(state.clone(), format!("{id}-plan"), Lane::Jobs(PLAN_JOB_TYPES), shutdown.clone()));
     tasks.spawn(sweep_loop(state.clone(), shutdown.clone()));
     while let Some(r) = tasks.join_next().await {
         if let Err(e) = r {

@@ -93,6 +93,16 @@ impl TestEnv {
         Self::finish(self.command(&[event]), Some(input.to_string()))
     }
 
+    /// Runs `mem-hook event --client <client>` with the JSON on stdin.
+    pub fn event(&self, client: &str, input: &Value) -> Out {
+        Self::finish(self.command(&["event", "--client", client]), Some(input.to_string()))
+    }
+
+    /// Runs `mem-hook <args>` with `stdin`.
+    pub fn run(&self, args: &[&str], stdin: &str) -> Out {
+        Self::finish(self.command(args), Some(stdin.to_string()))
+    }
+
     pub fn hook_raw(&self, event: &str, stdin: &str) -> Out {
         Self::finish(self.command(&[event]), Some(stdin.to_string()))
     }
@@ -101,6 +111,31 @@ impl TestEnv {
         let mut cmd = self.command(&[event]);
         cmd.env(key, value);
         Self::finish(cmd, Some(input.to_string()))
+    }
+
+    /// Runs `mem-hook doctor <args>` to completion.
+    pub fn doctor(&self, args: &[&str]) -> Out {
+        let mut all = vec!["doctor"];
+        all.extend_from_slice(args);
+        let mut cmd = self.command(&all);
+        cmd.current_dir(&self.cwd);
+        Self::finish(cmd, None)
+    }
+
+    /// Runs `mem-hook ingest <args>` to completion, in the project directory.
+    pub fn ingest(&self, args: &[&str]) -> Out {
+        let mut all = vec!["ingest"];
+        all.extend_from_slice(args);
+        let mut cmd = self.command(&all);
+        cmd.current_dir(&self.cwd);
+        Self::finish(cmd, None)
+    }
+
+    /// Writes Claude Code's user settings (`$HOME/.claude/settings.json`).
+    pub fn write_claude_settings(&self, settings: &Value) {
+        let dir = self.dir.path().join(".claude");
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("settings.json"), settings.to_string()).unwrap();
     }
 
     /// Runs `mem-hook observe ...` to completion.
