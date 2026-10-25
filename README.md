@@ -19,10 +19,10 @@ and the rationale is in [docs/architecture.md](docs/architecture.md).
 | `crates/consolidate` | Planner, consolidation appliers, revert, admin CLI and admin API |
 | `crates/worker` | Embedding jobs, sweeps, context re-render, retention, metrics |
 | `crates/evals` | Session recorder, redaction, replay, comparison with claude-mem |
-| `crates/server` | The `memvault` binary: `serve`, `worker`, `planner`, `migrate`, `admin`, `evals` |
+| `crates/server` | The `memvault` binary: `serve`, `worker`, `planner`, `admin`, `evals` (and `migrate`, which `serve` already runs at start-up) |
 | `crates/mem-hook` | The `mem-hook` binary for Claude Code hooks and the observer |
 | `clients/claude-code-plugin` | Plugin manifest, hook wiring, `install.sh`, plugin README |
-| `migrations` | SQL migrations, applied in order by `memvault migrate` |
+| `migrations` | SQL migrations, applied in order by `memvault serve` as it starts |
 | `prompts`, `schemas` | Observer and consolidation prompts (YAML) and their JSON output schemas |
 | `evals` | Recorded sessions, questions, gold facts and the recall baseline |
 | `deploy/k8s` | Kustomize base and the `home` overlay |
@@ -111,9 +111,8 @@ export DATABASE_SYSTEM_URL=$DATABASE_URL
 export TOKEN_PEPPER=$(openssl rand -hex 32)   # required by serve and admin; keep it stable
 export FAKE_TEI=1                             # deterministic embeddings, no TEI needed
 
-cargo run -p memvault -- migrate              # applies migrations (system URL, else DATABASE_URL)
-cargo run -p memvault -- serve --port 8000    # HTTP API and MCP server
-cargo run -p memvault -- worker               # embed jobs, sweeps, re-render, retention
+cargo run -p memvault -- serve --port 8000    # applies pending migrations, then serves the HTTP API and MCP server
+cargo run -p memvault -- worker               # embed jobs, sweeps, re-render, retention (waits for the schema)
 cargo run -p memvault -- planner              # one consolidation planning pass
 cargo run -p memvault -- admin --help         # users, spaces, tokens, consolidation, reindex
 cargo run -p memvault -- evals --help         # record, redact, replay, compare
@@ -267,8 +266,7 @@ and for later device tokens. Create device tokens with `--kind device` and a cli
 
 | Object | Kind | Role |
 |---|---|---|
-| `memory-migrate` | Job | Applies migrations as `memsvc_system` |
-| `memory-api` | Deployment, Service, HPA | HTTP API and MCP server |
+| `memory-api` | Deployment, Service, HPA | HTTP API and MCP server; applies pending migrations as it starts |
 | `memory-worker` | Deployment | Embedding, sweeps, re-render, retention. Metrics and health on `WORKER_METRICS_ADDR` |
 | `memory-consolidate` | CronJob (03:00 daily) | Consolidation planner |
 | `tei-embed`, `tei-rerank` | Deployment, Service | TEI servers on port 8080 behind services on port 80 |

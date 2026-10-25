@@ -1,7 +1,8 @@
 use std::collections::BTreeSet;
+use std::time::Duration;
 
 use memvault_core::auth::TokenKind;
-use memvault_core::db::MIGRATOR;
+use memvault_core::db::{MIGRATOR, applied_migrations, migrate, wait_for_schema};
 use memvault_core::test_support::seed_identity;
 use memvault_core::{ids::new_id, system_tx};
 use sqlx::PgPool;
@@ -195,4 +196,53 @@ async fn generated_search_columns(pool: PgPool) {
     .unwrap();
     assert_eq!(text, "Chose pgvector  over Chroma one store RLS covers vectors");
     assert!(hit);
+}
+
+/// What `serve` runs at start-up: every migration once, however many processes start together.
+#[sqlx::test(migrations = false)]
+async fn startup_migration_applies_everything_once_even_when_replicas_race(pool: PgPool) {
+    let total = MIGRATOR.iter().count() as i64;
+    assert_eq!(applied_migrations(&pool).await, 0);
+
+    let (a, b, c) = tokio::join!(migrate(&pool), migrate(&pool), migrate(&pool));
+    for result in [a, b, c] {
+        result.unwrap();
+    }
+    // One row per migration: a double run would have failed on the primary key or left duplicates.
+    assert_eq!(applied_migrations(&pool).await, total);
+    let rows: i64 =
+        sqlx::query_scalar("SELECT count(DISTINCT version) FROM _sqlx_migrations").fetch_one(&pool).await.unwrap();
+    assert_eq!(rows, total);
+
+    migrate(&pool).await.expect("a second start-up finds nothing to do");
+    assert_eq!(applied_migrations(&pool).await, total);
+}
+
+/// A rollback to an older image must still start against a database a newer image migrated.
+#[sqlx::test(migrations = "../../migrations")]
+async fn startup_migration_tolerates_a_newer_database(pool: PgPool) {
+    sqlx::query(
+        "INSERT INTO _sqlx_migrations (version, description, success, checksum, execution_time)
+         VALUES (99999999999999, 'from the future', true, '\\x00', 1)",
+    )
+    .execute(&pool)
+    .await
+    .unwrap();
+    migrate(&pool).await.unwrap();
+}
+
+#[sqlx::test(migrations = false)]
+async fn the_worker_waits_for_the_schema(pool: PgPool) {
+    let err = wait_for_schema(&pool, Duration::from_millis(300)).await.unwrap_err().to_string();
+    assert!(err.contains("0 of"), "{err}");
+
+    // Another process (the API) migrates while the worker waits.
+    let migrating = pool.clone();
+    let api = tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(500)).await;
+        migrate(&migrating).await.unwrap();
+    });
+    wait_for_schema(&pool, Duration::from_secs(20)).await.unwrap();
+    api.await.unwrap();
+    wait_for_schema(&pool, Duration::ZERO).await.expect("an up-to-date schema needs no waiting");
 }

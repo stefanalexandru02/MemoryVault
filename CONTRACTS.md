@@ -14,8 +14,8 @@ cargo test -p <your-crate>                       # needs the test Postgres at 12
 cargo clippy -p <your-crate> --all-targets -- -D warnings
 cargo fmt -p <your-crate>                         # rustfmt.toml: max_width 120
 
-cargo run -p memvault -- migrate                  # DATABASE_SYSTEM_URL, else DATABASE_URL; or --dsn
-FAKE_TEI=1 DATABASE_URL=... DATABASE_SYSTEM_URL=... cargo run -p memvault -- serve --port 8000
+FAKE_TEI=1 DATABASE_URL=... DATABASE_SYSTEM_URL=... cargo run -p memvault -- serve --port 8000   # migrates first
+cargo run -p memvault -- migrate                  # the same step by hand: DATABASE_SYSTEM_URL, else DATABASE_URL; or --dsn
 ```
 
 `.cargo/config.toml` sets `DATABASE_URL=postgres://postgres@127.0.0.1:55432/postgres` for cargo; `#[sqlx::test]`
@@ -56,8 +56,10 @@ serde_urlencoded.
 ## Migrations
 
 `migrations/NNNN_name.sql`, applied by `sqlx::migrate` in version order, **one transaction per file**, tracked in
-`_sqlx_migrations` with a checksum: never edit an applied file, add a new one. `memvault migrate` and
-`memvault_core::db::MIGRATOR` embed the directory at compile time.
+`_sqlx_migrations` with a checksum: never edit an applied file, add a new one. `memvault_core::db::MIGRATOR`
+embeds the directory at compile time. `serve` runs `db::migrate` on the system pool before it takes traffic (replicas
+take turns on sqlx's advisory lock; migrations the binary does not know are ignored, so a rollback still starts);
+`worker` and `planner` call `db::wait_for_schema`. `memvault migrate` is the same step by hand.
 
 | Range | Owner |
 |---|---|
@@ -323,7 +325,7 @@ TeiError::{Timeout(String), Failed(String)}   // rerank timeout -> fall back to 
 `memvault_memories::mcp::service(state)` (nested service, 8 MB body limit), `/health` (DB `SELECT 1` with 2 s
 timeout + TEI health: `ok` / `degraded` when TEI is down / 503 `down` when the DB is), `/metrics` (Prometheus),
 JSON 404/405 fallbacks, `DefaultBodyLimit` 8 MB, request ids (`x-request-id`), tracing span, 60 s timeout.
-`serve(state, TcpListener, shutdown) -> anyhow::Result<()>`: the router plus the context-cache listener
+`serve(state, TcpListener, shutdown) -> anyhow::Result<()>`: first `db::migrate`, then the router plus the context-cache listener
 (`memvault_recall::cache::spawn_listener`) and recorder upkeep; `memvault serve` and the end-to-end test use it.
 CLI `memvault`: `serve [--host] [--port]` (graceful shutdown on SIGINT/SIGTERM), `worker`
 (`memvault_worker::run_worker_with(state, batch_embedder(&state), shutdown)`), `planner [--space-id]`,

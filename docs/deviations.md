@@ -71,7 +71,7 @@ and repeated items are merged. The last section lists the gaps that are still op
 
 ## 4. Schema, migrations and data model
 
-- **Migration runner.** Migrations run through `sqlx::migrate` (`_sqlx_migrations`), not Alembic. The grant step is
+- **Migration runner.** Migrations run through `sqlx::migrate` (`_sqlx_migrations`), not Alembic, from the API process at start-up (see the deployment section). The grant step is
   `0099_grants.sql`, which uses `ALTER DEFAULT PRIVILEGES`.
 - **Token hash.** The token hash is `HMAC-SHA256(TOKEN_PEPPER, secret)`, not `sha256(secret)`. `api_tokens.kind`
   is added. The `agent` kind is dropped. Reason: the pepper makes a leaked table useless, and the foundation kept
@@ -424,9 +424,14 @@ and repeated items are merged. The last section lists the gaps that are still op
   `memsvc_app` and `memsvc_system` basic-auth Secrets are templated in `secret-template.yaml` and created out of band.
 - **`INITIAL_ADMIN_TOKEN_HASH`** is left out of `memory-secrets`. `core/config.rs` reads no such variable. The template
   carries `TOKEN_PEPPER` only.
-- **Migrate job** runs as `memsvc_system`, as the spec's role says. The migrate and planner pods carry the
-  `memvault.io/db-client` label, so the network policy allows their Postgres egress. The spec named only the API and
-  the worker.
+- **No migrate Job.** The spec runs migrations in a Job before the rollout. `memvault serve` applies them as it starts,
+  as `memsvc_system` over `DATABASE_SYSTEM_URL` (the API already holds that URL for the broker), so the cluster has no
+  Job, no Argo CD PreSync hook and no ordering to get right. Replicas that start together take turns on sqlx's advisory
+  lock. The worker and the consolidation planner wait up to five minutes for the schema to be current
+  (`db::wait_for_schema`). The migrator ignores applied migrations it does not know, so rolling the image back does not
+  stop the API from starting. The API pod gets a `startupProbe` (five minutes) so a long migration is not killed by the
+  liveness probe. `memvault migrate` stays for running the step by hand. The planner pod keeps the `memvault.io/db-client`
+  label for its Postgres egress; the spec named only the API and the worker.
 - **Network policy additions.** Beyond spec 14:
   - kube-dns egress, required for any name resolution;
   - Postgres egress to MinIO on 9000, and to the kube API on 443 and 6443, for CNPG backups and the instance manager;

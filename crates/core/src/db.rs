@@ -10,7 +10,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use sqlx::migrate::Migrator;
+use sqlx::migrate::{MigrateError, Migrator};
 use sqlx::postgres::{PgConnectOptions, PgPoolOptions};
 use sqlx::{PgConnection, PgPool, Postgres, Transaction};
 
@@ -22,6 +22,47 @@ pub const SYSTEM_ROLE: &str = "memsvc_system";
 
 /// Every file in the top-level `migrations/` directory, embedded at compile time.
 pub static MIGRATOR: Migrator = sqlx::migrate!("../../migrations");
+
+/// Migrations this binary knows about.
+fn known_migrations() -> i64 {
+    MIGRATOR.iter().filter(|m| !m.migration_type.is_down_migration()).count() as i64
+}
+
+/// Migrations recorded as applied, 0 when the database has never been migrated.
+pub async fn applied_migrations(pool: &PgPool) -> i64 {
+    sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE success").fetch_one(pool).await.unwrap_or(0)
+}
+
+/// Applies the pending migrations. Run it on the owner role's pool (`memsvc_system`).
+///
+/// Safe to call from several processes at once: they take turns on a Postgres advisory lock, so each
+/// migration runs once and the late callers find nothing to do. Safe from a binary older than the database
+/// (a rollback): migrations the binary does not know are ignored rather than refused.
+pub async fn migrate(pool: &PgPool) -> Result<(), MigrateError> {
+    Migrator { migrations: MIGRATOR.migrations.clone(), ignore_missing: true, ..Migrator::DEFAULT }.run(pool).await
+}
+
+/// Waits until every migration this binary knows is applied, for processes that start beside the one that
+/// migrates (the worker next to the API). Fails after `timeout`.
+pub async fn wait_for_schema(pool: &PgPool, timeout: std::time::Duration) -> anyhow::Result<()> {
+    let want = known_migrations();
+    let end = tokio::time::Instant::now() + timeout;
+    let mut announced = false;
+    loop {
+        let have = applied_migrations(pool).await;
+        if have >= want {
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= end {
+            anyhow::bail!("the database has {have} of {want} migrations after {timeout:?}; is the API running?");
+        }
+        if !announced {
+            tracing::info!(have, want, "waiting for the API to finish migrating");
+            announced = true;
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+    }
+}
 
 /// The process's pools. `system` is the same pool as `app` when `DATABASE_SYSTEM_URL` is unset.
 #[derive(Debug, Clone)]
