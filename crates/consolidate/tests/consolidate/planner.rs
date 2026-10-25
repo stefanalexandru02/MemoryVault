@@ -594,7 +594,8 @@ async fn profiles_follow_the_active_facts(pool: PgPool) {
         lines[0]
     );
     assert!(lines[1].contains("vim") && lines[2].contains("zsh"));
-    assert!(lines[1].starts_with("- alex: prefers.editor = vim [fact#") && lines[1].contains(" · 0.90 · "));
+    let tag = format!("[fact#{}]", memvault_core::ids::short_id(&strong));
+    assert_eq!(lines[1], format!("- alex: prefers.editor = vim {tag}"), "short id only, no provenance");
     assert!(!project.0.contains("retracted-value"));
     assert!(project.1 <= 400);
     let _ = (strong, weak);

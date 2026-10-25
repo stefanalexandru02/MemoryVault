@@ -163,7 +163,7 @@ async fn get_and_explain_show_the_source(pool: PgPool) {
     let got = engine::get_memories(&w.state, &w.alice.identity, &[id]).await.unwrap();
     let MemoryItem::Documents(doc) = &got.items[0] else { panic!("{:?}", got.items) };
     assert_eq!((doc.source_uri.as_str(), doc.content.as_str()), (URI, ADR));
-    let md = render::memory_item_markdown(&got.items[0]);
+    let md = render::memory_items_markdown(&got.items);
     assert!(md.contains("source: docs/adr/0003-postgres.md#ADR 3 > Decision") && md.ends_with(ADR), "{md}");
 
     let explained = engine::explain(&w.state, &w.alice.identity, id).await.unwrap();
@@ -175,7 +175,7 @@ async fn get_and_explain_show_the_source(pool: PgPool) {
         engine::resolve_refs(&w.state, &w.alice.identity, &[format!("doc#{}", memvault_core::ids::short_id(&id))])
             .await
             .unwrap();
-    assert_eq!(refs[0].1, Some(id));
+    assert_eq!(refs[0].1, engine::RefMatch::One(id));
     let history = engine::history(&w.state, &w.alice.identity, id).await.unwrap();
     assert_eq!((history.entries.len(), history.entries[0].status.as_str()), (1, "active"));
 }

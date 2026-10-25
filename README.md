@@ -179,8 +179,8 @@ Every session start fetches `GET /v1/context`. Two modes trade tokens against re
 
 | Mode | What the session starts with | About |
 |---|---|---|
-| `full` (default) | profile, open work, procedures, an index of recent observations, recent sessions and what other devices did since your last visit here | 1,000 tokens, paid at every session start, `clear` and `compact` |
-| `lean` | profile, open work and a short rubric saying when and how to call `memory_search`, `memory_timeline`, `memory_get` and `memory_remember` | 300 to 400 tokens |
+| `full` (default) | profile, open work, procedures, an index of recent observations, recent sessions and what other devices did since your last visit here | under 1,000 tokens, paid at every session start, `clear` and `compact` |
+| `lean` | profile, open work and a short rubric saying when to call `memory_search`, `memory_timeline`, `memory_get` and `memory_remember` | up to about 350 tokens |
 
 Lean starts cheaper but the agent has to ask: it sees recent work only if it searches, and it searches only
 when the task or the rubric tells it to. Full costs more on every start whether or not the session needs the

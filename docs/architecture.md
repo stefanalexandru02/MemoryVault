@@ -444,9 +444,9 @@ Additions to the schema from Section 4:
 - `facts.evidence_observation_ids[]` is already present; add `facts.learned_on_clients uuid[]` as a denormalized cache so "learned on laptop and desktop" is one column read, refreshed by consolidation.
 - Every `memory_audit` row carries `actor` (`user:<id>`, `job:extract`, `job:consolidate`), `model`, `prompt_version` and `run_id`.
 
-**Explain endpoint.** `GET /v1/memories/{id}/explain` returns the fact, each observation it rests on with its session, client and raw event ids, the model and prompt that produced it, and the audit history. The MCP tool `memory_explain(id)` wraps it so the agent can answer "why do you think that?" from the same data a human sees.
+**Explain endpoint.** `GET /v1/memories/{id}/explain` returns the fact, each observation it rests on with its session, client and raw event ids, the model and prompt that produced it, and the audit history. The MCP tool `memory_get(ids, trace: true)` appends the same provenance (and the supersession chain) to the bodies so the agent can answer "why do you think that?" from the same data a human sees.
 
-**Citations in context packs.** Each injected fact ends with a compact tag: `[fact#a91 · 0.83 · laptop+desktop · 2026-10-02]` (id, confidence, devices it was learned on, first seen). The model can hedge on low-confidence items without being told to, and `retrieval_log` records which tags were in the prompt. `POST /v1/recall/{id}/feedback` records which were used.
+**Citations in context packs.** Each injected fact ends with a compact tag: `[fact#a91c2e]`, the short id, followed by `disputed` or `unconfirmed 4 months` when the fact is to be treated with care. The model can hedge on those without being told to, confidence, devices and first-seen date come with `memory_get` and `trace`, and `retrieval_log` records which tags were in the prompt. `POST /v1/recall/{id}/feedback` records which were used.
 
 ## 13. Multi-user tenancy
 

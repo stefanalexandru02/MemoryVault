@@ -7,7 +7,7 @@
 //!   worker through [`cache::rerender`].
 //! - [`cache`]: context cache, `LISTEN memory_invalidate` loop.
 //! - [`settings`]: `GET`/`PUT /v1/me/settings` (the default injection mode); [`stats`]: `GET /v1/stats/recall`.
-//! - [`render`]: deterministic markdown (citations, index with glyph legend, bodies, explain).
+//! - [`render`]: deterministic markdown (citations, index with glyph legend, bodies, trace).
 
 pub mod cache;
 pub mod candidates;

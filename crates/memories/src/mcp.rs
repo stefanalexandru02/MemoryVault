@@ -15,11 +15,11 @@ use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use chrono::{DateTime, Duration, NaiveDate, Utc};
 use memvault_core::auth::{MEMORIES_READ, MEMORIES_WRITE, authenticate_header};
+use memvault_core::ids::{short_id, short_ids};
 use memvault_core::schemas::common::{Concept, MemoryTable, ObservationType, Scope, ScopeKind, Sensitivity};
 use memvault_core::schemas::mcp::{
-    MAX_RESULT_CHARS, McpScope, MemoryExplainArgs, MemoryFeedbackArgs, MemoryForgetArgs, MemoryGetArgs,
-    MemoryHistoryArgs, MemoryRememberArgs, MemorySearchArgs, MemoryTimelineArgs, RememberKind, RememberScope,
-    WorkStateWriteArgs,
+    MAX_RESULT_CHARS, McpScope, MemoryFeedbackArgs, MemoryForgetArgs, MemoryGetArgs, MemoryRememberArgs,
+    MemorySearchArgs, MemoryTimelineArgs, RememberKind, RememberScope, WorkStateWriteArgs,
 };
 use memvault_core::schemas::memories::{
     FactSubject, MemoryFeedbackRequest, RememberFact, RememberObservation, RememberProcedure, RememberRequest,
@@ -27,7 +27,8 @@ use memvault_core::schemas::memories::{
 };
 use memvault_core::schemas::work_state::WorkStateWrite;
 use memvault_core::{ApiError, AppState, Identity, require_scope};
-use memvault_recall::{engine, render};
+use memvault_recall::engine::{self, RefMatch};
+use memvault_recall::render;
 use rmcp::ServerHandler;
 use rmcp::model::{
     CallToolRequestParams, CallToolResponse, CallToolResult, ContentBlock, ErrorData as McpError, Implementation,
@@ -48,11 +49,9 @@ use memvault_core::user_tx;
 
 /// Header the plugin may set to name the project of the request.
 const PROJECT_HEADER: &str = "x-memory-project";
-/// Result caps in characters (4 characters per estimated token): search, timeline and explain ~2k
-/// tokens, get ~6k.
+/// Result caps in characters (4 characters per estimated token): search and timeline ~2k tokens, get ~6k.
 const INDEX_CAP_CHARS: usize = 8_000;
 const GET_CAP_CHARS: usize = 24_000;
-const NEXT_STEP_HINT: &str = "\n\n_Next: `memory_timeline` for the neighbours of a row, `memory_get` for full bodies (ids above), `memory_history` for how a fact changed._";
 
 /// The streamable-HTTP MCP service mounted by the server at `/mcp` (stateless: a new server value
 /// per request, no session affinity; same bearer auth as REST via `authenticate_header`).
@@ -125,8 +124,7 @@ impl ServerHandler for MemoryServer {
         ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::new("memvault", env!("CARGO_PKG_VERSION")))
             .with_instructions(
-                "Shared memory across devices. Search first (memory_search), then memory_timeline around a hit, \
-                 then memory_get for the full bodies you need.",
+                "Shared memory across devices: memory_search, then memory_timeline around a hit, then memory_get.",
             )
     }
 
@@ -150,8 +148,6 @@ impl ServerHandler for MemoryServer {
                 "memory_search" => self.search(&caller, parse(args)?).await,
                 "memory_timeline" => self.timeline(&caller, parse(args)?).await,
                 "memory_get" => self.get(&caller, parse(args)?).await,
-                "memory_explain" => self.explain(&caller, parse(args)?).await,
-                "memory_history" => self.history(&caller, parse(args)?).await,
                 "memory_remember" => self.remember(&caller, parse(args)?).await,
                 "memory_forget" => self.forget(&caller, parse(args)?).await,
                 "memory_feedback" => self.feedback(&caller, parse(args)?).await,
@@ -212,8 +208,7 @@ impl MemoryServer {
             ..SearchQuery::default()
         };
         let rows = engine::search(&self.state, &caller.identity, query).await?.rows;
-        let hint = if rows.is_empty() { "" } else { NEXT_STEP_HINT };
-        Ok(cap(format!("{}{hint}", render::index_rows_markdown(&rows)), INDEX_CAP_CHARS))
+        Ok(cap(render::search_rows_markdown(&rows), INDEX_CAP_CHARS))
     }
 
     async fn timeline(&self, caller: &Caller, args: MemoryTimelineArgs) -> ToolResult {
@@ -222,44 +217,51 @@ impl MemoryServer {
         let anchor_id = self.resolve_one(caller, &args.anchor_id).await?;
         let query = TimelineQuery { anchor_id, before: args.before, after: args.after };
         let rows = engine::timeline(&self.state, &caller.identity, query).await?.rows;
-        Ok(cap(render::index_rows_markdown(&rows), INDEX_CAP_CHARS))
+        Ok(cap(render::timeline_rows_markdown(&rows), INDEX_CAP_CHARS))
     }
 
     async fn get(&self, caller: &Caller, args: MemoryGetArgs) -> ToolResult {
         require_scope(&self.state, &caller.identity, MEMORIES_READ).await?;
         args.validate()?;
         let resolved = engine::resolve_refs(&self.state, &caller.identity, &args.ids).await?;
-        let ids: Vec<Uuid> = resolved.iter().filter_map(|(_, id)| *id).collect();
-        let mut unknown: Vec<String> = resolved.iter().filter(|(_, id)| id.is_none()).map(|(r, _)| r.clone()).collect();
-        if ids.is_empty() {
-            return Err(ApiError::not_found(format!("no memory matches {}", unknown.join(", "))));
+        let (mut ids, mut unknown, mut ambiguous) = (Vec::new(), Vec::new(), Vec::new());
+        for (reference, found) in resolved {
+            match found {
+                RefMatch::One(id) => ids.push(id),
+                RefMatch::Missing => unknown.push(reference),
+                RefMatch::Ambiguous(candidates) => ambiguous.push(ambiguity(&reference, &candidates)),
+            }
         }
-        let found = engine::get_memories(&self.state, &caller.identity, &ids).await?;
-        unknown.extend(found.missing.iter().map(Uuid::to_string));
-        if found.items.is_empty() {
-            return Err(ApiError::not_found(format!("no memory matches {}", unknown.join(", "))));
+        let mut items = Vec::new();
+        if !ids.is_empty() {
+            let found = engine::get_memories(&self.state, &caller.identity, &ids).await?;
+            unknown.extend(found.missing.iter().map(short_id));
+            items = found.items;
         }
-        let mut bodies: Vec<String> = found.items.iter().map(render::memory_item_markdown).collect();
+        if items.is_empty() {
+            return Err(match ambiguous.is_empty() {
+                true => ApiError::not_found(format!("no memory matches {}", unknown.join(", "))),
+                false => ApiError::invalid(ambiguous.join("; ")),
+            });
+        }
+        let mut bodies = render::memory_item_markdowns(&items);
+        if args.trace {
+            for (body, item) in bodies.iter_mut().zip(&items) {
+                let explained = engine::explain(&self.state, &caller.identity, item.id()).await?;
+                let history = engine::history(&self.state, &caller.identity, item.id()).await?;
+                body.push('\n');
+                body.push_str(&render::trace_markdown(&explained, &history));
+            }
+        }
         truncate_fairly(&mut bodies, GET_CAP_CHARS);
         let mut out = bodies.join("\n\n");
         if !unknown.is_empty() {
             out.push_str(&format!("\n\n_Not found: {}_", unknown.join(", ")));
         }
+        if !ambiguous.is_empty() {
+            out.push_str(&format!("\n\n_{}_", ambiguous.join("; ")));
+        }
         Ok(out)
-    }
-
-    async fn explain(&self, caller: &Caller, args: MemoryExplainArgs) -> ToolResult {
-        require_scope(&self.state, &caller.identity, MEMORIES_READ).await?;
-        let id = self.resolve_one(caller, &args.id).await?;
-        let explained = engine::explain(&self.state, &caller.identity, id).await?;
-        Ok(cap(render::explain_markdown(&explained), INDEX_CAP_CHARS))
-    }
-
-    async fn history(&self, caller: &Caller, args: MemoryHistoryArgs) -> ToolResult {
-        require_scope(&self.state, &caller.identity, MEMORIES_READ).await?;
-        let id = self.resolve_one(caller, &args.id).await?;
-        let chain = engine::history(&self.state, &caller.identity, id).await?;
-        Ok(cap(render::history_markdown(&chain), INDEX_CAP_CHARS))
     }
 
     async fn remember(&self, caller: &Caller, args: MemoryRememberArgs) -> ToolResult {
@@ -319,7 +321,7 @@ impl MemoryServer {
             }
         };
         let saved = remember(&self.state, &caller.identity, request).await?;
-        Ok(format!("Remembered {} `{}`. It will show up as:\n{}", saved.table, saved.id, saved.rendered))
+        Ok(format!("Remembered {} `{}`. It will show up as:\n{}", saved.table, short_id(&saved.id), saved.rendered))
     }
 
     async fn forget(&self, caller: &Caller, args: MemoryForgetArgs) -> ToolResult {
@@ -327,7 +329,7 @@ impl MemoryServer {
         let id = self.resolve_one(caller, &args.id).await?;
         let done = forget(&self.state, &caller.identity, id, false, args.reason.as_deref()).await?;
         let action = serde_json::to_value(done.action).ok().and_then(|v| v.as_str().map(String::from));
-        Ok(format!("Forgot {} `{}` ({}).", done.table, done.id, action.unwrap_or_default()))
+        Ok(format!("Forgot {} `{}` ({}).", done.table, short_id(&done.id), action.unwrap_or_default()))
     }
 
     async fn feedback(&self, caller: &Caller, args: MemoryFeedbackArgs) -> ToolResult {
@@ -336,12 +338,13 @@ impl MemoryServer {
         let request = MemoryFeedbackRequest { verdict: args.verdict, note: args.note };
         let done = feedback(&self.state, &caller.identity, id, request).await?;
         if !done.applied {
-            return Ok(format!("You already gave {} on {} `{}`; nothing changed.", done.verdict, done.table, done.id));
+            let (verdict, table, id) = (done.verdict, done.table, short_id(&done.id));
+            return Ok(format!("You already gave {verdict} on {table} `{id}`; nothing changed."));
         }
         let confidence = done.confidence.map(|c| format!(" Confidence is now {c:.2}.")).unwrap_or_default();
         let queued =
             if done.queued { " It is queued for the consolidation planner to retract or replace." } else { "" };
-        Ok(format!("Recorded {} on {} `{}`.{confidence}{queued}", done.verdict, done.table, done.id))
+        Ok(format!("Recorded {} on {} `{}`.{confidence}{queued}", done.verdict, done.table, short_id(&done.id)))
     }
 
     async fn work_state_write(&self, caller: &Caller, args: WorkStateWriteArgs) -> ToolResult {
@@ -356,17 +359,23 @@ impl MemoryServer {
         Ok(lists.iter().map(render::work_state_line).collect::<Vec<_>>().join("\n"))
     }
 
-    /// A full id, `obs#a1b2c3` or the 6-hex short id as shown in the index, to one visible row id.
+    /// A full id, `obs#a1b2c3` or the short id as shown in a table, to one visible row id.
     async fn resolve_one(&self, caller: &Caller, reference: &str) -> Result<Uuid, ApiError> {
         let resolved = engine::resolve_refs(&self.state, &caller.identity, &[reference.to_string()]).await?;
-        resolved
-            .into_iter()
-            .find_map(|(_, id)| id)
-            .ok_or_else(|| ApiError::not_found(format!("no single memory matches {reference}")))
+        match resolved.into_iter().next().map(|(_, found)| found) {
+            Some(RefMatch::One(id)) => Ok(id),
+            Some(RefMatch::Ambiguous(candidates)) => Err(ApiError::invalid(ambiguity(reference, &candidates))),
+            _ => Err(ApiError::not_found(format!("no memory matches {reference}"))),
+        }
     }
 }
 
 // ---------- output helpers ----------
+
+/// Which memories a short id matched, each with enough of its id to tell them apart.
+fn ambiguity(reference: &str, candidates: &[Uuid]) -> String {
+    format!("{reference} is ambiguous, it matches {}; use more characters", short_ids(candidates).join(", "))
+}
 
 /// Cut `text` to `max_chars`, at a line end when possible, with a marker.
 fn cap(text: String, max_chars: usize) -> String {
@@ -447,18 +456,18 @@ fn parse_as_of(text: &str) -> Result<DateTime<Utc>, ApiError> {
 
 fn tools() -> Vec<Tool> {
     let read = ToolAnnotations::new().read_only(true);
-    let write = ToolAnnotations::new().read_only(false).destructive(false);
+    let write = ToolAnnotations::new().destructive(false);
     vec![
         tool(
             "memory_search",
-            "Search shared memory for a compact index of matching observations and summaries (ids, dates, titles, token costs), or with types [\"document\"] the ingested repository docs (ADRs, READMEs, runbooks); use it first, then memory_timeline around a hit, then memory_get for full bodies (search → timeline → get).",
+            "Index of matching memories, the first of search → timeline → get.",
             json!({
-                "query": {"type": "string", "description": "What to look for."},
-                "types": {"type": "array", "items": {"type": "string"}, "description": "Observation types, e.g. decision, bugfix, or document for ingested docs."},
-                "scope": {"type": "string", "enum": ["project", "global", "all"], "description": "Default: the current project when the client reports one, else all."},
-                "since": {"type": "string", "description": "RFC 3339 time, a date like 2026-10-01, or a span like 7d."},
-                "files": {"type": "array", "items": {"type": "string"}, "description": "Only observations touching these paths."},
-                "as_of": {"type": "string", "description": "RFC 3339 time: search the memory as it stood then, facts and procedures included, with superseded ones back in force."},
+                "query": {"type": "string"},
+                "types": {"type": "array", "items": {"type": "string"}, "description": "E.g. decision, bugfix; document for ingested docs."},
+                "scope": {"type": "string", "enum": ["project", "global", "all"], "description": "Default: current project, else all."},
+                "since": {"type": "string", "description": "RFC 3339 time, date or span like 7d."},
+                "files": {"type": "array", "items": {"type": "string"}, "description": "Paths touched."},
+                "as_of": {"type": "string", "description": "RFC 3339 time: memory as of then, facts and procedures included."},
                 "limit": {"type": "integer", "minimum": 1, "maximum": 30, "description": "Default 20."}
             }),
             &["query"],
@@ -466,78 +475,65 @@ fn tools() -> Vec<Tool> {
         ),
         tool(
             "memory_timeline",
-            "Show the index rows around an anchor id in time order, the second step of search → timeline → get.",
+            "Index rows around an id in time order, the second of search → timeline → get.",
             json!({
-                "anchor_id": {"type": "string", "description": "An id from memory_search."},
-                "before": {"type": "integer", "minimum": 0, "maximum": 10, "description": "Default 5."},
-                "after": {"type": "integer", "minimum": 0, "maximum": 10, "description": "Default 5."}
+                "anchor_id": {"type": "string"},
+                "before": {"type": "integer", "minimum": 0, "maximum": 10},
+                "after": {"type": "integer", "minimum": 0, "maximum": 10}
             }),
             &["anchor_id"],
             read.clone(),
         ),
         tool(
             "memory_get",
-            "Fetch full memory bodies by id (at most 20), the last step of search → timeline → get; fetch only the ids you need.",
+            "Full bodies by id, the last of search → timeline → get; only the ids you need.",
             json!({
-                "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20, "description": "Ids from memory_search or memory_timeline."}
+                "ids": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 20},
+                "trace": {"type": "boolean", "description": "Add provenance and version history."}
             }),
             &["ids"],
-            read.clone(),
-        ),
-        tool(
-            "memory_explain",
-            "Show where a memory came from (session, events, extractor, audit history) for an id found by search → timeline → get.",
-            json!({"id": {"type": "string", "description": "A memory id."}}),
-            &["id"],
-            read.clone(),
-        ),
-        tool(
-            "memory_history",
-            "Show how a fact or procedure changed over time: the chain of versions it replaced and was replaced by, with who changed it and why.",
-            json!({"id": {"type": "string", "description": "A memory id from memory_search or memory_get."}}),
-            &["id"],
             read,
         ),
         tool(
             "memory_remember",
-            "Store a durable memory the user asked you to keep: a fact (needs a predicate like prefers.editor), a note, or a procedure.",
+            "Store what the user asked you to keep: a fact, note or procedure.",
             json!({
                 "kind": {"type": "string", "enum": ["fact", "note", "procedure"]},
-                "content": {"type": "string", "description": "The text to remember (a fact's value is at most 300 characters)."},
-                "scope": {"type": "string", "enum": ["project", "global"], "description": "Default: the current project, else global."},
-                "subject": {"type": "string", "description": "Fact: who or what it is about (default user). Procedure: its name."},
-                "predicate": {"type": "string", "description": "Fact: dotted lowercase key, e.g. prefers.editor. Procedure: its task class."}
+                "content": {"type": "string", "description": "A fact's value: 300 characters max."},
+                "scope": {"type": "string", "enum": ["project", "global"], "description": "Default: current project, else global."},
+                "subject": {"type": "string", "description": "Fact: its subject (default user). Procedure: its name."},
+                "predicate": {"type": "string", "description": "Fact: key like prefers.editor. Procedure: task class."}
             }),
             &["kind", "content"],
             write.clone(),
         ),
         tool(
             "memory_forget",
-            "Soft-delete a memory by id (retract a fact, archive an observation, retire a procedure) after confirming it with search → timeline → get.",
+            "Soft-delete a memory by id after confirming it with memory_get.",
             json!({
-                "id": {"type": "string", "description": "The memory id."},
-                "reason": {"type": "string", "description": "Why it is being forgotten."}
+                "id": {"type": "string"},
+                "reason": {"type": "string"}
             }),
             &["id"],
-            ToolAnnotations::new().read_only(false).destructive(true),
+            ToolAnnotations::new().destructive(true),
         ),
         tool(
             "memory_feedback",
-            "Record that a recalled memory was helpful, wrong or outdated (once per verdict), which nudges a fact's confidence and, when negative feedback adds up, queues the fact to be retracted or replaced without deleting anything.",
+            "Mark a memory helpful, wrong or outdated; enough negative marks queue a fact for retraction.",
             json!({
-                "id": {"type": "string", "description": "The memory id, or the short id from the context block."},
+                "id": {"type": "string"},
                 "verdict": {"type": "string", "enum": ["helpful", "wrong", "outdated"]},
-                "note": {"type": "string", "description": "What was wrong or what is true now (at most 500 characters)."}
+                "note": {"type": "string", "description": "What is true now."}
             }),
             &["id", "verdict"],
             write.clone(),
         ),
         tool(
             "work_state_write",
-            "Update a named work list (such as todo) for the current project with key/value fields, where later writes win and a null value removes a key.",
+            "Set keys of a work list for the current project; null removes a key.",
             json!({
-                "list": {"type": "string", "description": "List name, e.g. todo."},
-                "fields": {"type": "object", "description": "Keys to set, e.g. {\"item-3\": \"done\"}; null removes a key."}
+                "list": {"type": "string", "description": "E.g. todo."},
+                "fields": {"type": "object", "description": "E.g. item-3: done."}
             }),
             &["list", "fields"],
             write,

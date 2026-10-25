@@ -50,9 +50,22 @@ async fn call(app: &Router, who: &Seeded, name: &str, args: Value) -> (bool, Str
     call_with(app, who, &[], name, args).await
 }
 
-/// The id in a `Remembered ... `<id>`` confirmation.
+/// The short id in a `Remembered ... `<id>`` confirmation.
 fn id_in(text: &str) -> String {
     text.split('`').nth(1).unwrap_or_else(|| panic!("no id in {text}")).to_string()
+}
+
+/// The full id of the row (of any table) a short id ends.
+async fn full_id(pool: &PgPool, short: &str) -> String {
+    sqlx::query_scalar(
+        "SELECT id::text FROM (SELECT id FROM observations UNION ALL SELECT id FROM facts
+                               UNION ALL SELECT id FROM procedures) t
+          WHERE replace(id::text, '-', '') LIKE '%' || $1",
+    )
+    .bind(short)
+    .fetch_one(pool)
+    .await
+    .unwrap()
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -123,8 +136,6 @@ async fn initialize_and_tools_list(pool: PgPool) {
             "memory_search",
             "memory_timeline",
             "memory_get",
-            "memory_explain",
-            "memory_history",
             "memory_remember",
             "memory_forget",
             "memory_feedback",
@@ -144,7 +155,8 @@ async fn initialize_and_tools_list(pool: PgPool) {
     assert_eq!(by_name("memory_search")["inputSchema"]["required"], json!(["query"]));
     assert_eq!(by_name("memory_search")["inputSchema"]["properties"]["limit"]["maximum"], 30);
     assert_eq!(by_name("memory_search")["inputSchema"]["properties"]["as_of"]["type"], "string");
-    assert_eq!(by_name("memory_history")["inputSchema"]["required"], json!(["id"]));
+    assert_eq!(by_name("memory_get")["inputSchema"]["required"], json!(["ids"]));
+    assert_eq!(by_name("memory_get")["inputSchema"]["properties"]["trace"]["type"], "boolean");
     assert_eq!(by_name("memory_feedback")["inputSchema"]["required"], json!(["id", "verdict"]));
     assert_eq!(by_name("memory_feedback")["inputSchema"]["properties"]["verdict"]["enum"].as_array().unwrap().len(), 3);
     assert_eq!(by_name("memory_get")["inputSchema"]["properties"]["ids"]["maxItems"], 20);
@@ -152,7 +164,20 @@ async fn initialize_and_tools_list(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn remember_search_timeline_get_explain_forget(pool: PgPool) {
+async fn tool_definitions_stay_within_budget(pool: PgPool) {
+    let w = world(pool).await;
+    let app = mcp_app(&w);
+    let list = rpc(&app, Some(&w.alice.token), &[], request(2, "tools/list", json!({}))).await;
+    let tools = list.json()["result"]["tools"].clone();
+    // Every session pays for these definitions: they were 5,654 characters for nine tools.
+    let size = serde_json::to_string(&tools).unwrap().chars().count();
+    assert!(size <= 3_600, "tools/list is {size} characters; keep descriptions tight");
+    let names: Vec<&str> = tools.as_array().unwrap().iter().map(|t| t["name"].as_str().unwrap()).collect();
+    assert!(!names.contains(&"memory_explain") && !names.contains(&"memory_history"), "merged into memory_get");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn remember_search_timeline_get_trace_forget(pool: PgPool) {
     let w = world(pool).await;
     let app = mcp_app(&w);
     let alice = &w.alice;
@@ -192,10 +217,14 @@ async fn remember_search_timeline_get_explain_forget(pool: PgPool) {
     .await;
     assert!(proc.contains("Update the router"), "{proc}");
 
+    // Confirmations name the memory by its short id.
+    assert_eq!(first_id.len(), 6, "{first}");
+    let first_full = full_id(&w.pool, &first_id).await;
+
     // Stored the way the REST path stores them.
     let (extracted, client): (Value, Option<uuid::Uuid>) =
         sqlx::query_as("SELECT extracted_by, written_by_client_id FROM observations WHERE id = $1::uuid")
-            .bind(&first_id)
+            .bind(&first_full)
             .fetch_one(&w.pool)
             .await
             .unwrap();
@@ -205,27 +234,30 @@ async fn remember_search_timeline_get_explain_forget(pool: PgPool) {
     let (err, found) = call(&app, alice, "memory_search", json!({"query": "router firmware"})).await;
     assert!(!err, "{found}");
     assert!(found.contains(&first_id) && found.contains(&second_id), "{found}");
-    assert!(found.contains("memory_timeline") && found.contains("memory_get"), "next-step hint: {found}");
+    assert!(!found.contains(&first_full), "tables show short ids: {found}");
+    assert!(!found.contains("Next:") && !found.contains("Legend"), "no footer, no legend: {found}");
 
     let (err, timeline) =
         call(&app, alice, "memory_timeline", json!({"anchor_id": second_id, "before": 3, "after": 3})).await;
     assert!(!err, "{timeline}");
     assert!(timeline.contains(&format!("**▶ {second_id}**")) && timeline.contains(&first_id), "{timeline}");
 
-    // The short id shown in citations works too.
-    let short = &first_id[first_id.len() - 6..];
+    // The short id, the citation form and the full id all name the same row; one header line each.
     let (err, got) = call(
         &app,
         alice,
         "memory_get",
-        json!({"ids": [first_id, format!("obs#{short}"), "ffffffff-ffff-ffff-ffff-ffffffffffff"]}),
+        json!({"ids": [first_id, format!("obs#{first_id}"), first_full, "ffffffff-ffff-ffff-ffff-ffffffffffff"]}),
     )
     .await;
     assert!(!err, "{got}");
     assert!(got.contains("reboot after firmware updates") && got.contains("Not found"), "{got}");
+    assert!(got.contains(&format!("[obs#{first_id} · discovery · ")) && !got.contains(&first_full), "{got}");
+    assert!(!got.contains("Provenance"), "no trace unless asked: {got}");
 
-    let (err, explained) = call(&app, alice, "memory_explain", json!({"id": first_id})).await;
-    assert!(!err && explained.contains("Provenance") && explained.contains("runner_kind=explicit"), "{explained}");
+    let (err, traced) = call(&app, alice, "memory_get", json!({"ids": [first_id], "trace": true})).await;
+    assert!(!err && traced.contains("reboot after firmware") && traced.contains("**Provenance**"), "{traced}");
+    assert!(traced.contains("runner_kind=explicit") && traced.contains("obs.create"), "{traced}");
 
     let (err, gone) = call(&app, alice, "memory_forget", json!({"id": first_id, "reason": "obsolete"})).await;
     assert!(!err && gone.contains("archived"), "{gone}");
@@ -239,7 +271,7 @@ async fn remember_search_timeline_get_explain_forget(pool: PgPool) {
 }
 
 #[sqlx::test(migrations = "../../migrations")]
-async fn as_of_search_and_history(pool: PgPool) {
+async fn as_of_search_and_trace_history(pool: PgPool) {
     let w = world(pool).await;
     let app = mcp_app(&w);
     let alice = &w.alice;
@@ -252,39 +284,40 @@ async fn as_of_search_and_history(pool: PgPool) {
         )
     };
     let (_, first) = remember("vim").await;
-    let (first_id, between) = (id_in(&first), chrono::Utc::now().to_rfc3339());
+    let (first_id, between) = (full_id(&w.pool, &id_in(&first)).await, chrono::Utc::now().to_rfc3339());
     tokio::time::sleep(std::time::Duration::from_millis(20)).await;
     let (_, second) = remember("helix").await;
-    let second_id = id_in(&second);
+    let second_id = full_id(&w.pool, &id_in(&second)).await;
+    let (first_short, second_short) = (&first_id[first_id.len() - 6..], &second_id[second_id.len() - 6..]);
 
     // Facts are not in the default search; with as_of they are, as they stood then.
     let (err, now) = call(&app, alice, "memory_search", json!({"query": "vim helix"})).await;
-    assert!(!err && !now.contains(&second_id), "{now}");
+    assert!(!err && !now.contains(second_short), "{now}");
     let (err, past) = call(&app, alice, "memory_search", json!({"query": "vim helix", "as_of": between})).await;
-    assert!(!err && past.contains(&first_id) && !past.contains(&second_id), "{past}");
+    assert!(!err && past.contains(first_short) && !past.contains(second_short), "{past}");
     let (_, present) =
         call(&app, alice, "memory_search", json!({"query": "vim helix", "as_of": chrono::Utc::now().to_rfc3339()}))
             .await;
-    assert!(present.contains(&second_id) && !present.contains(&first_id), "{present}");
+    assert!(present.contains(second_short) && !present.contains(first_short), "{present}");
     for bad in ["yesterday", "2026-10-01", "7d"] {
         let (err, text) = call(&app, alice, "memory_search", json!({"query": "vim helix", "as_of": bad})).await;
         assert!(err && text.contains("error (invalid_request)") && text.contains("as_of"), "{bad}: {text}");
     }
 
     // The chain from either end, by full id or short citation id, oldest first with the audit reason.
-    let short = &second_id[second_id.len() - 6..];
-    for reference in [first_id.clone(), second_id.clone(), format!("fact#{short}")] {
-        let (err, chain) = call(&app, alice, "memory_history", json!({"id": reference})).await;
+    for reference in [first_id.clone(), second_id.clone(), format!("fact#{second_short}")] {
+        let (err, chain) = call(&app, alice, "memory_get", json!({"ids": [reference], "trace": true})).await;
         assert!(!err && chain.contains("2 versions"), "{chain}");
         let (vim, helix) = (chain.find("prefers.editor: vim"), chain.find("prefers.editor: helix"));
         assert!(vim.is_some() && helix.is_some() && vim < helix, "{chain}");
         assert!(chain.contains("replaced by an explicit write"), "{chain}");
     }
-    let (err, text) = call(&app, alice, "memory_history", json!({"id": "ffffffff-ffff-ffff-ffff-ffffffffffff"})).await;
+    let missing = json!({"ids": ["ffffffff-ffff-ffff-ffff-ffffffffffff"], "trace": true});
+    let (err, text) = call(&app, alice, "memory_get", missing).await;
     assert!(err && text.contains("not_found"), "{text}");
     // Another user cannot see the chain.
     let bob = seed_identity(&w.pool, TokenKind::Device).await;
-    let (err, text) = call(&app, &bob, "memory_history", json!({"id": first_id})).await;
+    let (err, text) = call(&app, &bob, "memory_get", json!({"ids": [first_id], "trace": true})).await;
     assert!(err && text.contains("not_found"), "{text}");
 }
 
@@ -320,7 +353,8 @@ async fn project_scope_is_inferred(pool: PgPool) {
         let pool = w.pool.clone();
         async move {
             sqlx::query_scalar::<_, String>(
-                "SELECT scope_kind::text || ':' || scope_key FROM observations WHERE id = $1::uuid",
+                "SELECT scope_kind::text || ':' || scope_key FROM observations
+                  WHERE replace(id::text, '-', '') LIKE '%' || $1",
             )
             .bind(id)
             .fetch_one(&pool)
@@ -387,7 +421,7 @@ async fn bad_calls_are_tool_errors(pool: PgPool) {
     let (err, text) = call(&app, alice, "memory_remember", json!({"kind": "fact", "content": "no predicate"})).await;
     assert!(err && text.contains("predicate"), "{text}");
     let (err, text) = call(&app, alice, "memory_forget", json!({"id": "zzzz"})).await;
-    assert!(err && text.contains("no single memory"), "{text}");
+    assert!(err && text.contains("no memory matches zzzz"), "{text}");
     let (err, text) = call(&app, alice, "no_such_tool", json!({})).await;
     assert!(err && text.contains("unknown tool"), "{text}");
 
@@ -469,7 +503,7 @@ async fn feedback_tool_records_a_verdict_once_and_explains_the_outcome(pool: PgP
     // The result of memory_get carries the tag a model should read.
     let (_, got) = call(&app, alice, "memory_get", json!({"ids": [id]})).await;
     assert!(got.contains("· disputed]"), "{got}");
-    let (_, explained) = call(&app, alice, "memory_explain", json!({"id": id})).await;
+    let (_, explained) = call(&app, alice, "memory_get", json!({"ids": [id], "trace": true})).await;
     assert!(explained.contains("fact.feedback") && explained.contains("wrong: it is helix"), "{explained}");
 
     let (err, bad) = call(&app, alice, "memory_feedback", json!({"id": id, "verdict": "meh"})).await;
@@ -499,4 +533,78 @@ async fn documents_are_found_by_type_and_read_with_their_source(pool: PgPool) {
     let (is_error, body) = call(&app, &w.alice, "memory_get", json!({"ids": [id]})).await;
     assert!(!is_error, "{body}");
     assert!(body.contains("source: docs/runbook.md#Runbook") && body.contains("down script"), "{body}");
+}
+
+/// A global note with the given id, inserted the way the observer would leave it.
+async fn insert_note(w: &World, id: uuid::Uuid, title: &str, age_minutes: f64) {
+    sqlx::query(
+        "INSERT INTO observations (id, space_id, scope_kind, scope_key, type, title, narrative, extracted_by,
+                                   content_hash, token_estimate, created_at)
+         VALUES ($1, $2, 'global', '', 'discovery', $3, 'narrative', '{}', $1::text, 10,
+                 now() - make_interval(secs => $4 * 60.0))",
+    )
+    .bind(id)
+    .bind(w.alice.space_id)
+    .bind(title)
+    .bind(age_minutes)
+    .execute(&w.pool)
+    .await
+    .expect("insert note");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn short_ids_lengthen_when_rows_collide_and_ambiguous_ones_are_errors(pool: PgPool) {
+    let w = world(pool).await;
+    let app = mcp_app(&w);
+    let alice = &w.alice;
+    // Two rows whose ids end alike: the 6-hex short id names both.
+    let (a, b) = (uuid::Uuid::from_u128(0x1a1b2c3), uuid::Uuid::from_u128(0x2a1b2c3));
+    insert_note(&w, a, "First of a pair", 20.0).await;
+    insert_note(&w, b, "Second of a pair", 10.0).await;
+
+    let (err, table) = call(&app, alice, "memory_timeline", json!({"anchor_id": a.to_string()})).await;
+    assert!(!err, "{table}");
+    assert!(table.contains("**▶ 1a1b2c3**") && table.contains("| 2a1b2c3 |"), "lengthened to tell them apart: {table}");
+
+    for (name, args) in [
+        ("memory_get", json!({"ids": ["a1b2c3"]})),
+        ("memory_timeline", json!({"anchor_id": "obs#a1b2c3"})),
+        ("memory_forget", json!({"id": "a1b2c3"})),
+        ("memory_feedback", json!({"id": "a1b2c3", "verdict": "helpful"})),
+    ] {
+        let (err, text) = call(&app, alice, name, args).await;
+        assert!(
+            err && text.contains("ambiguous") && text.contains("1a1b2c3") && text.contains("2a1b2c3"),
+            "{name}: {text}"
+        );
+    }
+
+    // The longer ending resolves; next to an ambiguous one the rest of a get still comes back.
+    let (err, got) = call(&app, alice, "memory_get", json!({"ids": ["2a1b2c3", "a1b2c3"]})).await;
+    assert!(!err && got.contains("Second of a pair") && !got.contains("First of a pair"), "{got}");
+    assert!(got.contains("a1b2c3 is ambiguous"), "{got}");
+    let (err, got) = call(&app, alice, "memory_get", json!({"ids": ["1a1b2c3", "2a1b2c3"]})).await;
+    assert!(!err && got.contains("[obs#1a1b2c3 ") && got.contains("[obs#2a1b2c3 "), "{got}");
+}
+
+#[sqlx::test(migrations = "../../migrations")]
+async fn search_folds_near_duplicates_into_the_newest(pool: PgPool) {
+    let w = world(pool).await;
+    let app = mcp_app(&w);
+    let alice = &w.alice;
+    for (id, title, age) in [
+        (0x11_u128, "Cache warm-up fails on boot", 30.0),
+        (0x22, "cache warm-up FAILS on boot!", 20.0),
+        (0x33, "Cache warm-up fails on boot.", 10.0),
+        (0x44, "Cache warm-up skipped in tests", 5.0),
+    ] {
+        insert_note(&w, uuid::Uuid::from_u128(0xabc000 + id), title, age).await;
+    }
+    let (err, table) = call(&app, alice, "memory_search", json!({"query": "cache warm-up"})).await;
+    assert!(!err, "{table}");
+    // The newest of the three, standing for the other two; the different title keeps its own row.
+    assert!(table.contains("| Cache warm-up fails on boot. (+2 similar) |"), "{table}");
+    assert_eq!(table.matches("fails on boot").count() + table.matches("FAILS on boot").count(), 1, "{table}");
+    assert!(table.contains("Cache warm-up skipped in tests |") && !table.contains("skipped in tests (+"), "{table}");
+    assert!(table.contains(&format!("| {} |", "abc033")), "{table}");
 }

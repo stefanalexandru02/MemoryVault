@@ -360,6 +360,14 @@ pub fn estimate_tokens(text: &str) -> i32 {
     i32::try_from(text.chars().count().div_ceil(4)).unwrap_or(i32::MAX)
 }
 
+/// Lowercase; punctuation, symbols and emoji become spaces; whitespace collapsed (claude-mem's rule). Two titles that
+/// normalize alike are the same memory said twice.
+pub fn normalize_title(title: &str) -> String {
+    let kept: String =
+        title.to_lowercase().chars().map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' }).collect();
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
 /// Serde helpers for list query parameters given comma-separated (`types=decision,bugfix`) or as a
 /// JSON array. Use with `#[serde(default, deserialize_with = "comma_list::deserialize")]` on an
 /// `Option<Vec<T>>` where `T: FromStr`.
@@ -407,6 +415,8 @@ mod tests {
         assert_eq!(estimate_tokens("abcde"), 2);
         assert_eq!(estimate_tokens(""), 0);
         assert_eq!(estimate_tokens("ééé"), 1);
+        assert_eq!(normalize_title("  Fixed: the BUG!! in  `auth.rs` 🚀 "), "fixed the bug in auth rs");
+        assert_eq!(normalize_title("🚀 !!"), "");
     }
 
     #[test]

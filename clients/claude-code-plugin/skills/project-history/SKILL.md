@@ -19,11 +19,11 @@ Build the story from recorded observations, not from guesses, and say which peri
 5. For "what did we believe then" and for reversals, ask the facts directly. **`memory_search`** with `as_of`
    (an RFC 3339 time such as `2026-09-01T00:00:00Z`) returns facts, procedures and past work as they stood at that
    instant, with replaced facts back in force. Run it for the start and the end of the period to see what
-   changed. For a fact or procedure that changed, **`memory_history`** with its id lists every version, oldest
-   first, with when each held and who replaced it and why.
+   changed. For a fact or procedure that changed, **`memory_get`** with its id and `trace: true` lists every version,
+   oldest first, with when each held and who replaced it and why.
 6. Write the report in order of time. For each stretch: what the goal was, what was tried, what was decided and
    why, what was left open. Quote ids or dates for the claims that matter so the user can check them with
-   `memory_explain`.
+   `memory_get` and `trace: true`.
 7. Finish with open threads: next steps recorded but not yet done, and decisions that were never confirmed.
 
 If memory holds little for the period, say so instead of padding the report.

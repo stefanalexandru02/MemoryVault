@@ -1,15 +1,19 @@
 //! Deterministic markdown rendering (spec 11.5): citation tags, slot sections, the
 //! progressive-disclosure index (claude-mem's code-mode glyphs), since-you-were-here, memory bodies
-//! explain chains and supersession history.
+//! and the provenance and supersession trace.
 //!
 //! Everything here is a pure function of its inputs (UTC dates, stable ordering), so the same slots
-//! always render to the same bytes. The MCP tools reuse [`index_rows_markdown`],
-//! [`memory_items_markdown`], [`explain_markdown`] and [`history_markdown`] so pull-mode output matches the SessionStart
-//! block.
+//! always render to the same bytes. The text goes into a model's context, so it is spare: ids are the
+//! shortest ending that tells the rows shown apart, an index names each day once, and the glyph legend
+//! belongs to the SessionStart block alone. The MCP tools reuse [`search_rows_markdown`],
+//! [`timeline_rows_markdown`], [`memory_item_markdowns`] and [`trace_markdown`] so pull-mode output matches
+//! that block.
 
-use chrono::{DateTime, Utc};
-use memvault_core::ids::short_id;
-use memvault_core::schemas::common::{MemoryTable, Scope, ScopeKind};
+use std::collections::HashMap;
+
+use chrono::{DateTime, NaiveDate, Utc};
+use memvault_core::ids::{short_id, short_ids};
+use memvault_core::schemas::common::{MemoryTable, Scope, ScopeKind, normalize_title};
 use memvault_core::schemas::memories::{
     DocumentFull, ExplainResponse, HistoryResponse, IndexRow, MemoryItem, Provenance, procedure_caution,
 };
@@ -32,7 +36,7 @@ pub const GLYPHS: &[(&str, &str)] = &[
     ("sensitive", "⊘"),
 ];
 pub const DEFAULT_GLYPH: &str = "•";
-pub const INDEX_HEADER: &str = "| id | when | t | title | ~tok |\n|---|---|---|---|---|";
+pub const INDEX_HEADER: &str = "| id | time | t | title | ~tok |\n|---|---|---|---|---|";
 const EXCERPT_CHARS: usize = 160;
 const NARRATIVE_CHARS: usize = 600;
 const DOCUMENT_EXCERPT_CHARS: usize = 480;
@@ -67,6 +71,10 @@ pub fn fmt_when(dt: Option<DateTime<Utc>>) -> String {
     dt.map_or_else(|| "?".into(), |d| d.format("%m-%d %H:%M").to_string())
 }
 
+fn fmt_time(dt: DateTime<Utc>) -> String {
+    dt.format("%H:%M").to_string()
+}
+
 /// Collapse whitespace runs to single spaces and trim.
 pub fn one_line(text: &str) -> String {
     text.split_whitespace().collect::<Vec<_>>().join(" ")
@@ -88,50 +96,37 @@ fn cell(text: &str) -> String {
 
 // ---------- citation tags ----------
 
-fn tag(kind: &str, id: &Uuid, parts: &[Option<String>]) -> String {
-    let mut bits = vec![format!("{kind}#{}", short_id(id))];
+fn tag(kind: &str, id: &str, parts: &[Option<String>]) -> String {
+    let mut bits = vec![format!("{kind}#{id}")];
     bits.extend(parts.iter().flatten().filter(|p| !p.is_empty()).cloned());
     format!("[{}]", bits.join(" · "))
 }
 
-/// `[fact#a91c2e · 0.83 · laptop+desktop · 2026-10-02]`, with the caution (`disputed`, `unconfirmed 4 months`)
-/// as a last part when the fact is to be treated with care.
-pub fn fact_tag(
-    id: &Uuid,
-    confidence: f64,
-    devices: &[String],
-    first_seen: Option<DateTime<Utc>>,
-    caution: Option<&str>,
-) -> String {
-    tag(
-        "fact",
-        id,
-        &[
-            Some(format!("{confidence:.2}")),
-            Some(devices.join("+")),
-            Some(fmt_date(first_seen)),
-            caution.map(String::from),
-        ],
-    )
+/// `[fact#a91c2e]`, with the caution (`disputed`, `unconfirmed 4 months`) after the id when the fact is to be
+/// treated with care. What else is known of it (confidence, devices, evidence) is in `memory_get` with `trace`.
+pub fn fact_tag(id: &Uuid, caution: Option<&str>) -> String {
+    tag("fact", &short_id(id), &[caution.map(String::from)])
 }
 
 /// `[obs#a1b2c3 · laptop-x1 · 2026-10-22]`.
 pub fn obs_tag(id: &Uuid, device: Option<&str>, created_at: Option<DateTime<Utc>>) -> String {
-    tag("obs", id, &[device.map(String::from), Some(fmt_date(created_at))])
+    tag("obs", &short_id(id), &[device.map(String::from), Some(fmt_date(created_at))])
 }
 
-pub fn summary_tag(id: &Uuid, device: Option<&str>, created_at: Option<DateTime<Utc>>) -> String {
-    tag("sum", id, &[device.map(String::from), Some(fmt_date(created_at))])
+/// `[sum#a1b2c3]`: the summary line already says when and where.
+pub fn summary_tag(id: &Uuid) -> String {
+    tag("sum", &short_id(id), &[])
 }
 
-pub fn procedure_tag(id: &Uuid, version: i32, created_at: Option<DateTime<Utc>>, caution: Option<&str>) -> String {
-    tag("proc", id, &[Some(format!("v{version}")), Some(fmt_date(created_at)), caution.map(String::from)])
+/// `[proc#a1b2c3]`, with `disputed` after the id for a procedure that failed more often than it worked.
+pub fn procedure_tag(id: &Uuid, caution: Option<&str>) -> String {
+    tag("proc", &short_id(id), &[caution.map(String::from)])
 }
 
 /// `[doc#a1b2c3 · source: docs/adr/0003.md#Decision · 2026-10-02]`: `source` is `uri#Heading > Subheading` and the
 /// date is when the chunk was ingested.
 pub fn document_tag(id: &Uuid, source: &str, ingested_at: Option<DateTime<Utc>>) -> String {
-    tag("doc", id, &[Some(format!("source: {source}")), Some(fmt_date(ingested_at))])
+    tag("doc", &short_id(id), &[Some(format!("source: {source}")), Some(fmt_date(ingested_at))])
 }
 
 fn with_citation(line: String, citation: &Option<String>) -> String {
@@ -240,6 +235,8 @@ pub struct IndexEntry {
     pub anchor: bool,
     /// `disputed` / `unconfirmed 4 months`, shown after the title.
     pub caution: Option<String>,
+    /// Rows of the same memory said again, folded into this one (see [`collapse_similar`]).
+    pub similar: usize,
 }
 
 impl IndexEntry {
@@ -252,6 +249,7 @@ impl IndexEntry {
             tokens: r.token_estimate,
             anchor: r.is_anchor,
             caution: r.caution.clone(),
+            similar: 0,
         }
     }
 
@@ -264,39 +262,104 @@ impl IndexEntry {
             tokens: o.item.token_estimate,
             anchor: false,
             caution: None,
+            similar: 0,
         }
     }
 }
 
-pub fn index_line(e: &IndexEntry, full_ids: bool) -> String {
-    let mut reference = if full_ids { e.id.to_string() } else { short_id(&e.id) };
-    if e.anchor {
-        reference = format!("**▶ {reference}**");
-    }
-    let title = match &e.caution {
-        Some(c) => format!("{} [{c}]", cell(&e.title)),
-        None => cell(&e.title),
-    };
-    format!("| {reference} | {} | {} | {title} | {} |", fmt_when(Some(e.when)), e.glyph, e.tokens)
+/// What makes two rows the same memory said twice: table, type, scope and normalized title. A title that
+/// normalizes to nothing matches nothing.
+fn similar_key(table: MemoryTable, row_type: Option<&str>, scope: &Scope, title: &str) -> Option<String> {
+    let norm = normalize_title(title);
+    (!norm.is_empty()).then(|| format!("{}\0{}\0{}\0{norm}", table.as_str(), row_type.unwrap_or(""), scope.as_text()))
 }
 
-/// Header, one line per entry and the legend; empty for no entries.
-pub fn index_table(entries: &[IndexEntry], full_ids: bool) -> String {
+/// Fold rows with the same key into one: the newest, in the place of the first, counting the rest in `similar`.
+fn collapse_similar(keyed: impl IntoIterator<Item = (Option<String>, IndexEntry)>) -> Vec<IndexEntry> {
+    let mut out: Vec<IndexEntry> = Vec::new();
+    let mut at: HashMap<String, usize> = HashMap::new();
+    for (key, entry) in keyed {
+        let Some(&i) = key.as_ref().and_then(|k| at.get(k)) else {
+            if let Some(k) = key {
+                at.insert(k, out.len());
+            }
+            out.push(entry);
+            continue;
+        };
+        let similar = out[i].similar + 1;
+        if entry.when > out[i].when {
+            out[i] = entry;
+        }
+        out[i].similar = similar;
+    }
+    out
+}
+
+/// A row: `| 9f6f34 | 10:16 | ⚖ | title | 168 |`. `reference` is the id as it is to be shown.
+pub fn index_line(e: &IndexEntry, reference: &str) -> String {
+    let reference = if e.anchor { format!("**▶ {reference}**") } else { reference.to_string() };
+    let mut title = cell(&e.title);
+    if let Some(c) = &e.caution {
+        title.push_str(&format!(" [{c}]"));
+    }
+    if e.similar > 0 {
+        title.push_str(&format!(" (+{} similar)", e.similar));
+    }
+    format!("| {reference} | {} | {} | {title} | {} |", fmt_time(e.when), e.glyph, e.tokens)
+}
+
+/// Header, then the rows under one `**2026-10-22**` line per day (days in the order they first appear, rows in
+/// the order given), with the shortest ids that tell the rows apart; empty for no entries.
+pub fn index_table(entries: &[IndexEntry]) -> String {
     if entries.is_empty() {
         return String::new();
     }
+    let refs = short_ids(&entries.iter().map(|e| e.id).collect::<Vec<_>>());
+    let mut days: Vec<(NaiveDate, Vec<usize>)> = Vec::new();
+    for (i, e) in entries.iter().enumerate() {
+        let day = e.when.date_naive();
+        match days.iter_mut().find(|(d, _)| *d == day) {
+            Some((_, rows)) => rows.push(i),
+            None => days.push((day, vec![i])),
+        }
+    }
     let mut lines = vec![INDEX_HEADER.to_string()];
-    lines.extend(entries.iter().map(|e| index_line(e, full_ids)));
-    lines.push(legend());
+    for (day, rows) in days {
+        lines.push(format!("**{day}**"));
+        lines.extend(rows.into_iter().map(|i| index_line(&entries[i], &refs[i])));
+    }
     lines.join("\n")
 }
 
-/// Search/timeline/by-file output for the MCP tools (full ids so `memory_get` can take them).
-pub fn index_rows_markdown(rows: &[IndexRow]) -> String {
+/// [`index_table`] and the glyph legend, for the blocks that start a session.
+fn index_with_legend(entries: &[IndexEntry]) -> String {
+    let table = index_table(entries);
+    if table.is_empty() { table } else { format!("{table}\n{}", legend()) }
+}
+
+fn row_entries(rows: &[IndexRow], collapse: bool) -> Vec<IndexEntry> {
+    if !collapse {
+        return rows.iter().map(IndexEntry::from_row).collect();
+    }
+    collapse_similar(
+        rows.iter().map(|r| (similar_key(r.table, r.row_type.as_deref(), &r.scope, &r.title), IndexEntry::from_row(r))),
+    )
+}
+
+/// `memory_search` output: the rows, near-duplicates folded into one.
+pub fn search_rows_markdown(rows: &[IndexRow]) -> String {
     if rows.is_empty() {
         return "_No matching memories._".into();
     }
-    index_table(&rows.iter().map(IndexEntry::from_row).collect::<Vec<_>>(), true)
+    index_table(&row_entries(rows, true))
+}
+
+/// `memory_timeline` output: every row in time order, the anchor marked.
+pub fn timeline_rows_markdown(rows: &[IndexRow]) -> String {
+    if rows.is_empty() {
+        return "_No matching memories._".into();
+    }
+    index_table(&row_entries(rows, false))
 }
 
 // ---------- sections ----------
@@ -326,11 +389,10 @@ fn profile_body(slots: &RecallSlots) -> String {
 pub fn recall_markdown(slots: &RecallSlots) -> String {
     let others: Vec<&FactItem> = slots.facts.iter().filter(|f| !f.pinned).collect();
     let expanded: Vec<&ObservationItem> = slots.observations.iter().filter(|o| o.expanded).collect();
-    let rest: Vec<IndexEntry> =
-        slots.observations.iter().filter(|o| !o.expanded).map(IndexEntry::from_observation).collect();
+    let rest = observation_entries(slots.observations.iter().filter(|o| !o.expanded));
     let mut obs_parts: Vec<String> = expanded.iter().map(|o| observation_block(o)).collect();
     if !rest.is_empty() {
-        obs_parts.push(index_table(&rest, false));
+        obs_parts.push(index_with_legend(&rest));
     }
     let body = join_sections(&[
         section("Profile", &profile_body(slots)),
@@ -344,27 +406,58 @@ pub fn recall_markdown(slots: &RecallSlots) -> String {
     if body.is_empty() { "## Memory\n_No relevant memories._".into() } else { format!("## Memory\n{body}") }
 }
 
+/// The index rows of observations, near-duplicates folded into one.
+fn observation_entries<'a>(observations: impl Iterator<Item = &'a ObservationItem>) -> Vec<IndexEntry> {
+    collapse_similar(observations.map(|o| {
+        (
+            similar_key(MemoryTable::Observations, Some(&o.obs_type), &o.item.scope, &o.title),
+            IndexEntry::from_observation(o),
+        )
+    }))
+}
+
 pub const RECENT_OBSERVATIONS_TITLE: &str = "Recent observations (fetch with memory_get)";
+const RECENT_SESSIONS_TITLE: &str = "Recent sessions";
 
 /// Cached portion of the SessionStart block: everything except the live sections.
 pub fn context_body(slots: &RecallSlots) -> String {
-    let entries: Vec<IndexEntry> = slots.observations.iter().map(IndexEntry::from_observation).collect();
+    let entries = observation_entries(slots.observations.iter());
     join_sections(&[
         section("Profile", &profile_body(slots)),
         section("Open work", &lines(&slots.work_state, work_state_line)),
         section("Relevant procedures", &lines(&slots.procedures, procedure_line)),
-        section(RECENT_OBSERVATIONS_TITLE, &index_table(&entries, false)),
-        section("Recent sessions", &lines(&slots.summaries, summary_line)),
+        section(RECENT_OBSERVATIONS_TITLE, &index_with_legend(&entries)),
+        section(RECENT_SESSIONS_TITLE, &lines(&slots.summaries, summary_line)),
     ])
 }
 
-/// What the lean block tells the model about the pull tools (names and arguments as in `memories::mcp`).
+/// The cached block without the Recent sessions lines of summaries that since-you-were-here already lists.
+pub fn without_listed_sessions(body: &str, listed: &[Uuid]) -> String {
+    let marks: Vec<String> = listed.iter().map(summary_tag).collect();
+    let recent = format!("### {RECENT_SESSIONS_TITLE}");
+    let mut sections: Vec<Vec<&str>> = Vec::new();
+    for line in body.lines() {
+        if line.starts_with("### ") || sections.is_empty() {
+            sections.push(Vec::new());
+        }
+        if let Some(last) = sections.last_mut() {
+            last.push(line);
+        }
+    }
+    for section in sections.iter_mut().filter(|s| s[0] == recent) {
+        section.retain(|line| *line == recent || !marks.iter().any(|m| line.contains(m)));
+    }
+    sections.retain(|s| s.as_slice() != [recent.as_str()]);
+    sections.concat().join("\n")
+}
+
+/// What the lean block tells the model about the pull tools (their arguments are in the tool definitions).
 pub const LEAN_RUBRIC: &str = "### Memory tools
 Only the profile and open work are loaded here; the rest of the shared memory is on demand.
-- `memory_search` (query; optional types, scope, since, files): when the task may depend on earlier sessions, decisions or fixes, or the user refers to them. Returns an index of ids and titles.
-- `memory_timeline` (anchor_id): the rows around a search hit.
-- `memory_get` (ids): full bodies, only for the ids you need.
-- `memory_remember` (kind, content): only when the user asks you to keep something.
+- `memory_search`: when the task may depend on earlier sessions, decisions or fixes, or the user refers to them. Returns an index of ids and titles.
+- `memory_timeline`: the rows around a search hit.
+- `memory_get`: full bodies, only for the ids you need.
+- `memory_remember`: only when the user asks you to keep something.
 Do not search for what the task already tells you.";
 
 /// Cached portion of the lean SessionStart block: profile, open work and [`LEAN_RUBRIC`].
@@ -379,6 +472,8 @@ pub fn lean_body(slots: &RecallSlots) -> String {
 /// One session in since-you-were-here (11.7).
 #[derive(Debug, Clone, PartialEq)]
 pub struct SinceRow {
+    /// The summary the line is made from, when the session has one.
+    pub summary_id: Option<Uuid>,
     pub started_at: DateTime<Utc>,
     pub device: String,
     pub request: Option<String>,
@@ -432,20 +527,25 @@ pub fn assemble_context(banners: &[String], cached_body: &str, since: &str) -> S
     out
 }
 
-// ---------- memory bodies (memory_get) and explain ----------
+// ---------- memory bodies (memory_get) and trace ----------
 
-pub fn memory_item_markdown(item: &MemoryItem) -> String {
+/// `#### ⚖ Title [obs#d94f56 · decision · billing-api · 10-24 10:16]`: one line, the tag carrying what is known of the
+/// row (a project scope by the last segment of its key, an active fact or procedure without its status).
+fn item_header(glyph: &str, title: &str, kind: &str, id: &str, parts: Vec<Option<String>>) -> String {
+    format!("#### {glyph} {title} {}", tag(kind, id, &parts))
+}
+
+fn item_markdown(item: &MemoryItem, id: &str) -> String {
     match item {
         MemoryItem::Observations(o) => {
-            let mut lines = vec![
-                format!(
-                    "#### {} {} {}",
-                    glyph(MemoryTable::Observations, Some(&o.obs_type)),
-                    one_line(&o.title),
-                    obs_tag(&o.id, None, Some(o.created_at))
-                ),
-                format!("`{}` · {} · {} · {}", o.id, o.obs_type, o.scope.as_text(), fmt_when(Some(o.created_at))),
-            ];
+            let header = item_header(
+                glyph(MemoryTable::Observations, Some(&o.obs_type)),
+                &one_line(&o.title),
+                "obs",
+                id,
+                vec![Some(o.obs_type.clone()), Some(scope_label(&o.scope)), Some(fmt_when(Some(o.created_at)))],
+            );
+            let mut lines = vec![header];
             if let Some(s) = o.subtitle.as_deref().filter(|s| !s.trim().is_empty()) {
                 lines.push(format!("_{}_", one_line(s)));
             }
@@ -459,10 +559,14 @@ pub fn memory_item_markdown(item: &MemoryItem) -> String {
             lines.join("\n")
         }
         MemoryItem::Summaries(s) => {
-            let mut lines = vec![
-                format!("#### § {} summary {}", s.grain, summary_tag(&s.id, None, Some(s.created_at))),
-                format!("`{}` · {} · {}", s.id, s.scope.as_text(), fmt_when(Some(s.created_at))),
-            ];
+            let header = item_header(
+                "§",
+                &format!("{} summary", s.grain),
+                "sum",
+                id,
+                vec![Some(scope_label(&s.scope)), Some(fmt_when(Some(s.created_at)))],
+            );
+            let mut lines = vec![header];
             for (label, value) in [
                 ("request", &s.request),
                 ("investigated", &s.investigated),
@@ -478,76 +582,86 @@ pub fn memory_item_markdown(item: &MemoryItem) -> String {
             lines.join("\n")
         }
         MemoryItem::Facts(f) => [
-            format!(
-                "#### ≡ {} {} {}",
-                f.subject.canonical_name,
-                f.predicate,
-                fact_tag(&f.id, f.confidence, &[], Some(f.first_seen_at), f.caution.as_deref())
+            item_header(
+                "≡",
+                &format!("{} {}", f.subject.canonical_name, f.predicate),
+                "fact",
+                id,
+                vec![
+                    Some(f.status.to_string()).filter(|status| status != "active"),
+                    Some(scope_label(&f.scope)),
+                    Some(format!("confidence {:.2}", f.confidence)),
+                    Some(format!("confirmations {}", f.confirmations)),
+                    f.caution.clone(),
+                ],
             ),
-            format!("`{}` · {} · {} · confirmations {}", f.id, f.status, f.scope.as_text(), f.confirmations),
             one_line(&f.value_text),
         ]
         .join("\n"),
         MemoryItem::Procedures(p) => [
-            format!(
-                "#### ¶ {} {}",
-                one_line(&p.name),
-                procedure_tag(
-                    &p.id,
-                    p.version,
-                    Some(p.created_at),
-                    procedure_caution(p.success_count, p.failure_count).as_deref()
-                )
-            ),
-            format!(
-                "`{}` · {} · {} · {}",
-                p.id,
-                p.task_class,
-                serde_json::to_value(p.status).ok().and_then(|v| v.as_str().map(String::from)).unwrap_or_default(),
-                p.scope.as_text()
+            item_header(
+                "¶",
+                &one_line(&p.name),
+                "proc",
+                id,
+                vec![
+                    Some(p.task_class.clone()),
+                    Some(format!("v{}", p.version)),
+                    serde_json::to_value(p.status)
+                        .ok()
+                        .and_then(|v| v.as_str().map(String::from))
+                        .filter(|status| status != "active"),
+                    Some(scope_label(&p.scope)),
+                    procedure_caution(p.success_count, p.failure_count),
+                ],
             ),
             format!("When: {}", one_line(&p.trigger_text)),
             p.body_md.trim().to_string(),
         ]
         .join("\n"),
-        MemoryItem::Documents(d) => document_markdown(d),
+        MemoryItem::Documents(d) => document_markdown(d, id),
     }
 }
 
-fn document_markdown(d: &DocumentFull) -> String {
-    let retired = d.retired_at.map(|at| format!(" · retired {}", fmt_when(Some(at)))).unwrap_or_default();
+fn document_markdown(d: &DocumentFull, id: &str) -> String {
+    let retired = d.retired_at.map(|at| format!("retired {}", fmt_when(Some(at))));
     [
-        format!(
-            "#### {} {} {}",
+        item_header(
             glyph(MemoryTable::Documents, None),
-            one_line(&d.title),
-            document_tag(&d.id, &d.source(), Some(d.created_at))
-        ),
-        format!(
-            "`{}` · {} · chunk {} · ingested {}{retired}",
-            d.id,
-            d.scope.as_text(),
-            d.chunk_index,
-            fmt_when(Some(d.created_at))
+            &one_line(&d.title),
+            "doc",
+            id,
+            vec![
+                Some(format!("source: {}", d.source())),
+                Some(scope_label(&d.scope)),
+                Some(format!("chunk {}", d.chunk_index)),
+                Some(format!("ingested {}", fmt_when(Some(d.created_at)))),
+                retired,
+            ],
         ),
         d.content.trim().to_string(),
     ]
     .join("\n")
 }
 
+/// One body per item, each headed by one line with the shortest id that tells the items apart.
+pub fn memory_item_markdowns(items: &[MemoryItem]) -> Vec<String> {
+    let refs = short_ids(&items.iter().map(MemoryItem::id).collect::<Vec<_>>());
+    items.iter().zip(&refs).map(|(item, id)| item_markdown(item, id)).collect()
+}
+
 pub fn memory_items_markdown(items: &[MemoryItem]) -> String {
     if items.is_empty() {
         return "_Nothing found._".into();
     }
-    items.iter().map(memory_item_markdown).collect::<Vec<_>>().join("\n\n")
+    memory_item_markdowns(items).join("\n\n")
 }
 
 fn provenance_lines(p: &Provenance, indent: &str) -> Vec<String> {
     let mut out = Vec::new();
     if let Some(s) = &p.session {
         out.push(format!(
-            "{indent}- session `{}` · {} · {} · {} · {}",
-            s.id,
+            "{indent}- session {} · {} · {} · {}",
             s.harness,
             s.project_key.as_deref().unwrap_or("-"),
             s.device_id.as_deref().unwrap_or("-"),
@@ -573,8 +687,11 @@ fn provenance_lines(p: &Provenance, indent: &str) -> Vec<String> {
     out
 }
 
-pub fn explain_markdown(e: &ExplainResponse) -> String {
-    let mut lines = vec![memory_item_markdown(&e.item), String::new(), "**Provenance**".into()];
+/// Where a memory came from and how it changed, to follow its body in `memory_get` with `trace`: the provenance
+/// (session, events, extractor, the evidence observations), the audit trail and, for a fact or procedure that
+/// was replaced or replaced another, the supersession chain, oldest first.
+pub fn trace_markdown(e: &ExplainResponse, h: &HistoryResponse) -> String {
+    let mut lines = vec!["**Provenance**".to_string()];
     let prov = e.provenance.as_ref().map(|p| provenance_lines(p, "")).unwrap_or_default();
     if prov.is_empty() && e.evidence.is_empty() {
         lines.push("- (none recorded)".into());
@@ -590,40 +707,32 @@ pub fn explain_markdown(e: &ExplainResponse) -> String {
         lines.extend(provenance_lines(&ev.provenance, "  "));
     }
     if !e.audit.is_empty() {
-        lines.push(String::new());
         lines.push("**Audit**".into());
         for a in &e.audit {
             let reason = a.reason.as_deref().map(|r| format!(": {}", one_line(r))).unwrap_or_default();
             lines.push(format!("- {} {} by {}{reason}", fmt_when(Some(a.created_at)), a.action, a.actor));
         }
     }
-    lines.join("\n")
-}
-
-/// The supersession chain, oldest first: when each link held, who ended it and why.
-pub fn history_markdown(h: &HistoryResponse) -> String {
-    let mut lines = vec![format!(
-        "**History** of `{}` ({} {})",
-        h.id,
-        h.entries.len(),
-        if h.entries.len() == 1 { "version" } else { "versions" }
-    )];
-    for e in &h.entries {
-        let until = e.valid_to.map_or_else(|| "now".into(), |t| fmt_date(Some(t)));
-        let mark = if e.current { " ← asked" } else { "" };
-        lines.push(format!(
-            "- {} `{}` {} · {} → {} · {}{mark}",
-            glyph(e.table, None),
-            short_id(&e.id),
-            e.status,
-            fmt_date(e.valid_from),
-            until,
-            excerpt(&e.text, EXCERPT_CHARS)
-        ));
-        if let Some(actor) = &e.ended_by {
-            let reason = e.reason.as_deref().map(|r| format!(": {}", excerpt(r, EXCERPT_CHARS))).unwrap_or_default();
-            let model = e.model.as_deref().map(|m| format!(" ({m})")).unwrap_or_default();
-            lines.push(format!("  ended {} by {actor}{model}{reason}", fmt_when(e.ended_at)));
+    if h.entries.len() > 1 {
+        lines.push(format!("**History** ({} versions)", h.entries.len()));
+        let refs = short_ids(&h.entries.iter().map(|e| e.id).collect::<Vec<_>>());
+        for (e, id) in h.entries.iter().zip(&refs) {
+            let until = e.valid_to.map_or_else(|| "now".into(), |t| fmt_date(Some(t)));
+            let mark = if e.current { " ← asked" } else { "" };
+            lines.push(format!(
+                "- {} `{id}` {} · {} → {} · {}{mark}",
+                glyph(e.table, None),
+                e.status,
+                fmt_date(e.valid_from),
+                until,
+                excerpt(&e.text, EXCERPT_CHARS)
+            ));
+            if let Some(actor) = &e.ended_by {
+                let reason =
+                    e.reason.as_deref().map(|r| format!(": {}", excerpt(r, EXCERPT_CHARS))).unwrap_or_default();
+                let model = e.model.as_deref().map(|m| format!(" ({m})")).unwrap_or_default();
+                lines.push(format!("  ended {} by {actor}{model}{reason}", fmt_when(e.ended_at)));
+            }
         }
     }
     lines.join("\n")
@@ -632,6 +741,7 @@ pub fn history_markdown(h: &HistoryResponse) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use memvault_core::schemas::common::ContentType;
     use memvault_core::schemas::memories::HistoryEntry;
     use memvault_core::schemas::recall::SlotItem;
 
@@ -646,18 +756,46 @@ mod tests {
         }
     }
 
+    fn observation(n: u128, title: &str, obs_type: &str, when: &str) -> ObservationItem {
+        ObservationItem {
+            item: item(n),
+            obs_type: obs_type.into(),
+            title: title.into(),
+            subtitle: None,
+            narrative: None,
+            facts: vec![],
+            files: vec![],
+            importance: 0.5,
+            created_at: when.parse().unwrap(),
+            session_id: None,
+            device_id: None,
+            expanded: false,
+        }
+    }
+
+    fn row(n: u128, table: MemoryTable, row_type: &str, title: &str, when: &str) -> IndexRow {
+        IndexRow {
+            id: Uuid::from_u128(n),
+            table,
+            row_type: Some(row_type.into()),
+            title: title.into(),
+            created_at: when.parse().unwrap(),
+            scope: Scope::global(),
+            token_estimate: 12,
+            score: None,
+            is_anchor: false,
+            caution: None,
+        }
+    }
+
     #[test]
     fn tags_and_excerpts() {
         let id = Uuid::from_u128(0xa91c2e);
         let day = "2026-10-02T08:00:00Z".parse().ok();
-        assert_eq!(
-            fact_tag(&id, 0.83, &["laptop".into(), "desktop".into()], day, None),
-            "[fact#a91c2e · 0.83 · laptop+desktop · 2026-10-02]"
-        );
-        assert_eq!(
-            fact_tag(&id, 0.83, &[], day, Some("unconfirmed 4 months")),
-            "[fact#a91c2e · 0.83 · 2026-10-02 · unconfirmed 4 months]"
-        );
+        assert_eq!(fact_tag(&id, None), "[fact#a91c2e]");
+        assert_eq!(fact_tag(&id, Some("unconfirmed 4 months")), "[fact#a91c2e · unconfirmed 4 months]");
+        assert_eq!(procedure_tag(&id, Some("disputed")), "[proc#a91c2e · disputed]");
+        assert_eq!(summary_tag(&id), "[sum#a91c2e]");
         assert_eq!(obs_tag(&id, None, day), "[obs#a91c2e · 2026-10-02]");
         assert_eq!(excerpt("  a  b\nc ", 10), "a b c");
         assert_eq!(excerpt("abcdefghij", 5), "abcd…");
@@ -665,28 +803,111 @@ mod tests {
     }
 
     #[test]
-    fn index_and_legend() {
-        let o = ObservationItem {
-            item: item(0xa1b2c3),
-            obs_type: "decision".into(),
-            title: "Chose pgvector | not Chroma".into(),
-            subtitle: None,
-            narrative: None,
-            facts: vec![],
-            files: vec![],
-            importance: 0.5,
-            created_at: "2026-10-22T14:03:00Z".parse().unwrap(),
-            session_id: None,
-            device_id: None,
-            expanded: false,
-        };
-        let table = index_table(&[IndexEntry::from_observation(&o)], false);
+    fn index_names_each_day_once_and_shows_only_the_time() {
+        let o = observation(0xa1b2c3, "Chose pgvector | not Chroma", "decision", "2026-10-22T14:03:00Z");
+        let table = index_table(&[IndexEntry::from_observation(&o)]);
         assert_eq!(
             table,
-            format!("{INDEX_HEADER}\n| a1b2c3 | 10-22 14:03 | ⚖ | Chose pgvector \\| not Chroma | 12 |\n{}", legend())
+            format!("{INDEX_HEADER}\n**2026-10-22**\n| a1b2c3 | 14:03 | ⚖ | Chose pgvector \\| not Chroma | 12 |")
         );
+        assert_eq!(index_table(&[]), "");
+
+        let entries: Vec<IndexEntry> = [
+            observation(1, "one", "bugfix", "2026-10-22T14:03:00Z"),
+            observation(2, "two", "bugfix", "2026-10-21T09:00:00Z"),
+            observation(3, "three", "bugfix", "2026-10-22T08:30:00Z"),
+        ]
+        .iter()
+        .map(IndexEntry::from_observation)
+        .collect();
+        let lines: Vec<String> = index_table(&entries).lines().skip(2).map(String::from).collect();
+        let days: Vec<&str> = lines.iter().filter(|l| l.starts_with("**")).map(String::as_str).collect();
+        assert_eq!(days, ["**2026-10-22**", "**2026-10-21**"], "days in the order they first appear");
+        assert_eq!(lines.len(), 5);
+        assert!(lines[1].contains("one") && lines[2].contains("three") && lines[4].contains("two"), "{lines:?}");
+    }
+
+    #[test]
+    fn legend_closes_the_session_start_index_only() {
+        let o = observation(0xa1b2c3, "Chose pgvector", "decision", "2026-10-22T14:03:00Z");
+        let entries = [IndexEntry::from_observation(&o)];
+        assert_eq!(index_with_legend(&entries), format!("{}\n{}", index_table(&entries), legend()));
         assert!(legend().starts_with("_Legend: ⚖ decision · ● bugfix · ◆ feature"));
-        assert_eq!(index_table(&[], false), "");
+        assert_eq!(index_with_legend(&[]), "");
+        let rows = [row(0xa1b2c3, MemoryTable::Observations, "decision", "Chose pgvector", "2026-10-22T14:03:00Z")];
+        assert!(!search_rows_markdown(&rows).contains("Legend") && !timeline_rows_markdown(&rows).contains("Legend"));
+        assert_eq!(search_rows_markdown(&[]), "_No matching memories._");
+    }
+
+    #[test]
+    fn ids_lengthen_only_to_tell_the_rows_shown_apart() {
+        let rows = [
+            row(0x1a1b2c3, MemoryTable::Observations, "bugfix", "first", "2026-10-22T14:03:00Z"),
+            row(0x2a1b2c3, MemoryTable::Observations, "bugfix", "second", "2026-10-22T14:04:00Z"),
+            row(0xffffff, MemoryTable::Observations, "bugfix", "third", "2026-10-22T14:05:00Z"),
+        ];
+        let table = timeline_rows_markdown(&rows);
+        assert!(
+            table.contains("| 1a1b2c3 |") && table.contains("| 2a1b2c3 |") && table.contains("| ffffff |"),
+            "{table}"
+        );
+    }
+
+    #[test]
+    fn near_duplicates_fold_into_the_newest_unless_they_differ_in_kind() {
+        let rows = [
+            row(1, MemoryTable::Observations, "bugfix", "Fixed the bug", "2026-10-20T10:00:00Z"),
+            row(2, MemoryTable::Observations, "bugfix", "fixed: THE bug.", "2026-10-22T10:00:00Z"),
+            row(3, MemoryTable::Observations, "decision", "Fixed the bug", "2026-10-21T10:00:00Z"),
+            row(4, MemoryTable::Facts, "bugfix", "Fixed the bug", "2026-10-21T11:00:00Z"),
+            row(5, MemoryTable::Observations, "bugfix", "Fixed the bug", "2026-10-19T10:00:00Z"),
+            row(6, MemoryTable::Observations, "bugfix", "!!", "2026-10-18T10:00:00Z"),
+            row(7, MemoryTable::Observations, "bugfix", "??", "2026-10-17T10:00:00Z"),
+        ];
+        let table = search_rows_markdown(&rows);
+        assert_eq!(table.matches("(+2 similar)").count(), 1, "{table}");
+        assert!(
+            table.contains("| 000002 | 10:00 | ● | fixed: THE bug. (+2 similar) |"),
+            "the newest stands for the rest: {table}"
+        );
+        for kept in ["000003", "000004", "000006", "000007"] {
+            assert!(table.contains(&format!("| {kept} |")), "{kept}: {table}");
+        }
+        assert!(!table.contains("| 000001 |") && !table.contains("| 000005 |"), "{table}");
+        let all = timeline_rows_markdown(&rows);
+        assert!(!all.contains("similar") && all.contains("| 000001 |"), "the timeline keeps every row: {all}");
+
+        let mut scoped = row(8, MemoryTable::Observations, "bugfix", "Fixed the bug", "2026-10-22T09:00:00Z");
+        scoped.scope = Scope::new(ScopeKind::Project, "github.com/a/b");
+        assert!(
+            !search_rows_markdown(&[rows[1].clone(), scoped]).contains("similar"),
+            "another scope is another memory"
+        );
+    }
+
+    #[test]
+    fn session_start_index_folds_near_duplicates_too() {
+        let observations = [
+            observation(1, "Staging URL logged", "bugfix", "2026-10-22T10:00:00Z"),
+            observation(2, "staging url logged!", "bugfix", "2026-10-21T10:00:00Z"),
+        ];
+        let slots = RecallSlots { observations: observations.to_vec(), ..RecallSlots::default() };
+        let body = context_body(&slots);
+        assert!(body.contains("| 000001 | 10:00 | ● | Staging URL logged (+1 similar) |"), "{body}");
+        assert!(!body.contains("000002"), "{body}");
+    }
+
+    #[test]
+    fn listed_sessions_are_not_repeated_in_recent_sessions() {
+        let (a, b) = (Uuid::from_u128(0xaaaaaa), Uuid::from_u128(0xbbbbbb));
+        let body = "### Profile\n- p\n### Recent sessions\n- 10-23 vm · \"one\" [sum#aaaaaa]\n- 10-22 vm · \"two\" [sum#bbbbbb]\n### Open work\n- w";
+        assert_eq!(without_listed_sessions(body, &[]), body);
+        assert_eq!(
+            without_listed_sessions(body, &[a]),
+            "### Profile\n- p\n### Recent sessions\n- 10-22 vm · \"two\" [sum#bbbbbb]\n### Open work\n- w"
+        );
+        assert_eq!(without_listed_sessions(body, &[a, b]), "### Profile\n- p\n### Open work\n- w");
+        assert_eq!(without_listed_sessions("", &[a]), "");
     }
 
     #[test]
@@ -707,7 +928,7 @@ mod tests {
     }
 
     #[test]
-    fn history_lists_versions_oldest_first() {
+    fn trace_lists_versions_oldest_first_and_only_for_a_chain() {
         let entry = |n: u128, status: &str, text: &str, to: Option<&str>| HistoryEntry {
             id: Uuid::from_u128(n),
             table: MemoryTable::Facts,
@@ -724,21 +945,44 @@ mod tests {
             model: None,
             run_id: None,
         };
-        let h = HistoryResponse {
+        let history = |entries| HistoryResponse { id: Uuid::from_u128(2), table: MemoryTable::Facts, entries };
+        let explained = ExplainResponse {
             id: Uuid::from_u128(2),
             table: MemoryTable::Facts,
-            entries: vec![
-                entry(1, "superseded", "prefers.editor: vim", Some("2026-03-01T00:00:00Z")),
-                entry(2, "active", "prefers.editor: helix", None),
-            ],
+            item: MemoryItem::Documents(DocumentFull {
+                id: Uuid::from_u128(2),
+                space_id: Uuid::nil(),
+                scope: Scope::global(),
+                source_uri: "docs/a.md".into(),
+                title: "A".into(),
+                content_type: ContentType::Markdown,
+                chunk_index: 0,
+                heading_path: vec![],
+                content: "text".into(),
+                content_hash: "h".into(),
+                token_estimate: 1,
+                ingested_by: None,
+                created_at: "2026-01-01T00:00:00Z".parse().unwrap(),
+                retired_at: None,
+            }),
+            provenance: None,
+            evidence: vec![],
+            audit: vec![],
         };
+        let chain = history(vec![
+            entry(1, "superseded", "prefers.editor: vim", Some("2026-03-01T00:00:00Z")),
+            entry(2, "active", "prefers.editor: helix", None),
+        ]);
         assert_eq!(
-            history_markdown(&h),
-            "**History** of `00000000-0000-0000-0000-000000000002` (2 versions)\n\
+            trace_markdown(&explained, &chain),
+            "**Provenance**\n- (none recorded)\n\
+             **History** (2 versions)\n\
              - ≡ `000001` superseded · 2026-01-01 → 2026-03-01 · prefers.editor: vim\n  \
              ended 03-01 00:00 by planner: switched editors\n\
              - ≡ `000002` active · 2026-01-01 → now · prefers.editor: helix ← asked"
         );
+        let alone = history(vec![entry(2, "active", "prefers.editor: helix", None)]);
+        assert_eq!(trace_markdown(&explained, &alone), "**Provenance**\n- (none recorded)");
     }
 
     #[test]

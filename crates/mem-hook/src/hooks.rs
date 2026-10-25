@@ -15,6 +15,8 @@ const CONTEXT_TIMEOUT: Duration = Duration::from_secs(3);
 const END_BUDGET: Duration = Duration::from_secs(1);
 const FILE_CONTEXT_TIMEOUT: Duration = Duration::from_millis(1500);
 const FILE_CONTEXT_ROWS: usize = 5;
+/// Characters of an id shown at least, as in the memory tables.
+const SHORT_ID_MIN: usize = 6;
 
 /// Claude Code's hook input plus everything derived from it.
 struct Hook {
@@ -329,16 +331,19 @@ fn file_context(hook: &Hook) {
     else {
         return;
     };
-    let lines: Vec<String> = rows
+    let rows: Vec<(&str, &str, &str, &str)> = rows
         .iter()
         .filter_map(|row| {
             let id = row.get("id")?.as_str()?;
             let title = row.get("title")?.as_str()?;
             let day = row.get("created_at").and_then(Value::as_str).map(|t| &t[..t.len().min(10)]).unwrap_or("");
             let kind = row.get("type").and_then(Value::as_str).unwrap_or("note");
-            Some(format!("- {day} [{kind}] {title} (id {id})"))
+            Some((id, day, kind, title))
         })
         .collect();
+    let ids = short_ids(&rows.iter().map(|r| r.0).collect::<Vec<_>>());
+    let lines: Vec<String> =
+        rows.iter().zip(ids).map(|((_, day, kind, title), id)| format!("- {day} [{kind}] {title} (id {id})")).collect();
     if lines.is_empty() {
         return;
     }
@@ -358,6 +363,22 @@ fn session_end(hook: &Hook) {
     }
 }
 
+/// The last characters of each id (hyphens ignored) that tell it from the others, at least [`SHORT_ID_MIN`]; the
+/// memory tools take such an ending in place of the whole id.
+fn short_ids(ids: &[&str]) -> Vec<String> {
+    let plain: Vec<String> = ids.iter().map(|id| id.replace('-', "")).collect();
+    let tail = |id: &str, len: usize| id.get(id.len().saturating_sub(len)..).unwrap_or(id).to_string();
+    plain
+        .iter()
+        .map(|own| {
+            let len = (SHORT_ID_MIN..own.len())
+                .find(|&len| plain.iter().all(|other| other == own || tail(other, len) != tail(own, len)))
+                .unwrap_or(own.len());
+            tail(own, len)
+        })
+        .collect()
+}
+
 /// Percent-encodes everything but unreserved characters.
 fn encode(s: &str) -> String {
     let mut out = String::new();
@@ -375,7 +396,18 @@ fn encode(s: &str) -> String {
 mod tests {
     use serde_json::json;
 
-    use super::{Mapped, map_event, valid_client};
+    use super::{Mapped, map_event, short_ids, valid_client};
+
+    #[test]
+    fn short_ids_keep_six_characters_unless_rows_end_alike() {
+        let ids = [
+            "01930000-0000-7000-8000-0000001a1b2c3",
+            "01930000-0000-7000-8000-0000002a1b2c3",
+            "01930000-0000-7000-8000-000000ffffff",
+        ];
+        assert_eq!(short_ids(&ids), ["1a1b2c3", "2a1b2c3", "ffffff"]);
+        assert_eq!(short_ids(&["x"]), ["x"]);
+    }
 
     #[test]
     fn encodes_query_values() {

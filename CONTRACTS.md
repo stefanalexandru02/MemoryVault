@@ -163,7 +163,7 @@ Full DDL of spec 4.1-4.7 plus:
   `search_tsv @@ websearch_to_tsquery('simple', $q)` with `ts_rank_cd`. Vector leg: call
   `db::tune_vector_search(&mut tx, &caps, 80)` first (sets `hnsw.iterative_scan` only when supported).
 - **Ids**: `memvault_core::ids::new_id()` (UUIDv7); `short_id(&id)` = last 6 hex chars for citation tags;
-  `id_time(&id)`.
+  `short_ids(&[id])` = those, lengthened where two ids of the set end alike (what tables show); `id_time(&id)`.
 - **Time**: `timestamptz` / `chrono::DateTime<Utc>` everywhere.
 - **token_estimate** = `ceil(chars / 4)`: `memvault_core::estimate_tokens(&str) -> i32` (replaces tiktoken).
 - **Scopes**: `schemas::common::Scope { kind: ScopeKind, key }`; global key `""`; text form `kind:key`

@@ -335,14 +335,14 @@ async fn facts_profile_and_procedures(pool: PgPool) {
     // With a rendered profile, the profile slot uses it and pinned facts still show.
     sqlx::query(
         "INSERT INTO profiles (space_id, scope_kind, scope_key, body_md, token_estimate, facts_version)
-         VALUES ($1, 'global', '', '- Prefers helix [fact#abcdef · 0.80 · 2026-10-01]', 10, 1)",
+         VALUES ($1, 'global', '', '- Prefers helix [fact#abcdef]', 10, 1)",
     )
     .bind(space)
     .execute(&w.pool)
     .await
     .unwrap();
     let resp = engine::recall(&w.state, &w.alice.identity, req("editor")).await.unwrap();
-    assert_eq!(resp.slots.profile.unwrap().body_md, "- Prefers helix [fact#abcdef · 0.80 · 2026-10-01]");
+    assert_eq!(resp.slots.profile.unwrap().body_md, "- Prefers helix [fact#abcdef]");
     assert!(resp.slots.facts.iter().any(|f| f.item.id == pinned && f.pinned));
     let md = resp.rendered_markdown.unwrap();
     assert!(md.starts_with("## Memory\n### Profile\n- Prefers helix"), "{md}");
@@ -472,8 +472,10 @@ async fn get_writes_access_log_and_explain_has_provenance(pool: PgPool) {
     assert_eq!(p.extracted_by["prompt"], "observer.code@v1");
     assert_eq!(e.audit.len(), 1);
     assert_eq!(e.audit[0].action, "fact.create");
-    let md = memvault_recall::render::explain_markdown(&e);
+    let h = engine::history(&w.state, &w.alice.identity, fact).await.unwrap();
+    let md = memvault_recall::render::trace_markdown(&e, &h);
     assert!(md.contains("- events seq 3, 4") && md.contains("fact.create by planner: auto-activated"), "{md}");
+    assert!(!md.contains("History"), "a fact that never changed has no chain to show: {md}");
     let e = engine::explain(&w.state, &w.alice.identity, obs).await.unwrap();
     assert!(e.evidence.is_empty());
     assert_eq!(e.provenance.unwrap().session.unwrap().project_key.as_deref(), Some(PROJECT));
@@ -743,7 +745,7 @@ async fn as_of_recall_uses_the_past(pool: PgPool) {
     let h = insert_editor_history(&w).await;
     sqlx::query(
         "INSERT INTO profiles (space_id, scope_kind, scope_key, body_md, token_estimate, facts_version)
-         VALUES ($1, 'global', '', '- Prefers helix [fact#abcdef · 0.80 · 2026-10-01]', 10, 1)",
+         VALUES ($1, 'global', '', '- Prefers helix [fact#abcdef]', 10, 1)",
     )
     .bind(w.alice.space_id)
     .execute(&w.pool)
@@ -907,13 +909,13 @@ async fn stale_and_disputed_memories_carry_a_caution_everywhere_they_are_shown(p
     assert_eq!(caution(stale).as_deref(), Some("unconfirmed 4 months"));
     assert_eq!(caution(disputed).as_deref(), Some("disputed"));
     assert_eq!(caution(fresh), None);
-    let table = memvault_recall::render::index_rows_markdown(&rows);
+    let table = memvault_recall::render::search_rows_markdown(&rows);
     assert!(table.contains("prefers.shell: fish for editor shells [unconfirmed 4 months]"), "{table}");
 
     let got = engine::get_memories(&w.state, &w.alice.identity, &[stale, fresh]).await.unwrap();
     let MemoryItem::Facts(full) = &got.items[0] else { panic!("fact expected") };
     assert_eq!(full.caution.as_deref(), Some("unconfirmed 4 months"));
-    let body = memvault_recall::render::memory_item_markdown(&got.items[0]);
+    let body = memvault_recall::render::memory_items_markdown(&got.items[..1]);
     assert!(body.lines().next().unwrap().ends_with("· unconfirmed 4 months]"), "{body}");
     assert!(got.feedback.is_empty());
 }

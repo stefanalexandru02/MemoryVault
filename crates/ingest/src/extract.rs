@@ -7,7 +7,7 @@ use chrono::{DateTime, NaiveDate, NaiveDateTime, Utc};
 use memvault_core::ids::new_id;
 use memvault_core::invalidate::notify_invalidate;
 use memvault_core::jobs::enqueue_embed;
-use memvault_core::schemas::common::{ScopeHint, ScopeKind};
+use memvault_core::schemas::common::{ScopeHint, ScopeKind, normalize_title};
 use memvault_core::schemas::outputs::{FactCandidate, LlmOutput, ObservedObservation, ObserverV1};
 use memvault_core::schemas::work::PacketRecord;
 use memvault_core::{ApiError, AppliedCounts, PacketApplier, estimate_tokens};
@@ -96,13 +96,6 @@ pub fn content_hash(obs: &ObservedObservation) -> String {
     let mut parts = vec![obs.obs_type.as_str(), obs.title.as_str()];
     parts.extend(obs.facts.iter().map(String::as_str));
     hex::encode(Sha256::digest(parts.join("|").as_bytes()))
-}
-
-/// Lowercase; punctuation, symbols and emoji become spaces; whitespace collapsed (claude-mem's rule).
-pub fn normalize_title(title: &str) -> String {
-    let kept: String =
-        title.to_lowercase().chars().map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' }).collect();
-    kept.split_whitespace().collect::<Vec<_>>().join(" ")
 }
 
 /// Key for the near-duplicate check, unique per (scope, platform, agent-ness, normalized title).
@@ -623,9 +616,7 @@ mod tests {
     }
 
     #[test]
-    fn normalizes_titles() {
-        assert_eq!(normalize_title("  Fixed: the BUG!! in  `auth.rs` 🚀 "), "fixed the bug in auth rs");
-        assert_eq!(normalize_title("🚀 !!"), "");
+    fn title_keys_ignore_case_and_punctuation() {
         let scope = (ScopeKind::Project, "github.com/a/b".to_string());
         let a = title_norm_key("Fixed the bug", &scope, "claude-code", false).unwrap();
         assert_eq!(Some(a.clone()), title_norm_key("fixed: THE bug.", &scope, "claude-code", false));

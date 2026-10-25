@@ -61,16 +61,9 @@ pub struct MemoryTimelineArgs {
 pub struct MemoryGetArgs {
     /// <= 20.
     pub ids: Vec<String>,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MemoryExplainArgs {
-    pub id: String,
-}
-
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
-pub struct MemoryHistoryArgs {
-    pub id: String,
+    /// Append provenance and supersession chain to each body.
+    #[serde(default)]
+    pub trace: bool,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]

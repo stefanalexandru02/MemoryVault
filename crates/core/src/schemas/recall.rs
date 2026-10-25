@@ -131,7 +131,7 @@ pub struct SlotItem {
     pub score: f64,
     #[serde(default)]
     pub token_estimate: i32,
-    /// e.g. `[fact#a91c2e · 0.83 · laptop+desktop · 2026-10-02]`.
+    /// e.g. `[fact#a91c2e]`, or `[fact#a91c2e · unconfirmed 4 months]` for a fact to treat with care.
     #[serde(default)]
     pub citation: Option<String>,
 }

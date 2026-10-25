@@ -35,7 +35,7 @@ pub const CONTEXT_BUDGETS: Budgets = Budgets {
     work_state: 150,
     documents: 0,
 };
-/// The lean block: a short profile, pinned facts and open work around the ~140-token rubric, ~400 tokens in all.
+/// The lean block: a short profile, pinned facts and open work around the ~120-token rubric, ~360 tokens at most.
 pub const LEAN_BUDGETS: Budgets =
     Budgets { profile: 120, facts: 60, procedures: 0, observations: 0, summaries: 0, work_state: 80, documents: 0 };
 const SINCE_LIMIT: i64 = 8;
@@ -135,12 +135,12 @@ pub async fn render_context(
             (body, Served::Render(Box::new(pack)))
         }
     };
-    let since = match (mode, project_key) {
+    let (since, listed) = match (mode, project_key) {
         (InjectionMode::Full, Some(p)) => since_you_were_here(&mut tx, identity, &spaces, p, device).await?,
-        _ => String::new(),
+        _ => (String::new(), Vec::new()),
     };
     let banners = health_banners(&mut tx, &spaces).await?;
-    let out = render::assemble_context(&banners, &body, &since);
+    let out = render::assemble_context(&banners, &render::without_listed_sessions(&body, &listed), &since);
     let latency_ms = i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX);
     let rec = |hits| RetrievalRecord {
         mode: "context",
@@ -173,14 +173,15 @@ fn hits_of(pack: &Pack) -> i32 {
 
 /// Spec 11.7: sessions on this project run by other clients since this client's previous session
 /// here (default: the last 14 days), newest first, with their session summary (or, while a session
-/// is still running, its latest prompt summary).
+/// is still running, its latest prompt summary). Returns the section and the summaries it lists, which the
+/// cached Recent sessions do not repeat.
 pub async fn since_you_were_here(
     conn: &mut PgConnection,
     identity: &Identity,
     spaces: &[Uuid],
     project_key: &str,
     device: &str,
-) -> Result<String, sqlx::Error> {
+) -> Result<(String, Vec<Uuid>), sqlx::Error> {
     let last: Option<DateTime<Utc>> = sqlx::query_scalar(
         "WITH mine AS (
            SELECT id, started_at FROM sessions
@@ -194,12 +195,12 @@ pub async fn since_you_were_here(
     .bind(CURRENT_SESSION_SECONDS)
     .fetch_one(&mut *conn)
     .await?;
-    type Row = (DateTime<Utc>, String, String, Option<String>, Option<String>);
+    type Row = (DateTime<Utc>, String, String, Option<Uuid>, Option<String>, Option<String>);
     let rows: Vec<Row> = sqlx::query_as(
-        "SELECT s.started_at, c.device_id, c.kind, sm.request, sm.next_steps
+        "SELECT s.started_at, c.device_id, c.kind, sm.id, sm.request, sm.next_steps
            FROM sessions s JOIN clients c ON c.id = s.client_id
            LEFT JOIN LATERAL (
-             SELECT request, next_steps FROM summaries
+             SELECT id, request, next_steps FROM summaries
               WHERE session_id = s.id AND grain IN ('session', 'prompt')
               ORDER BY (grain = 'session') DESC, created_at DESC, id DESC LIMIT 1) sm ON true
           WHERE s.space_id = ANY($1) AND s.project_key = $2 AND s.client_id <> $3
@@ -215,14 +216,16 @@ pub async fn since_you_were_here(
     .await?;
     let rows: Vec<SinceRow> = rows
         .into_iter()
-        .map(|(started_at, device_id, kind, request, next_steps)| SinceRow {
+        .map(|(started_at, device_id, kind, summary_id, request, next_steps)| SinceRow {
+            summary_id,
             started_at,
             device: if kind == "agentic-os" { "assistant".into() } else { device_id },
             request,
             next_steps,
         })
         .collect();
-    Ok(render::since_section(device, last, &rows))
+    let listed = rows.iter().filter_map(|r| r.summary_id).collect();
+    Ok((render::since_section(device, last, &rows), listed))
 }
 
 /// Live banner lines: observer packets nobody has run for a day.

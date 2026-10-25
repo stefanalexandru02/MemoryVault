@@ -169,9 +169,12 @@ and repeated items are merged. The last section lists the gaps that are still op
 - **Prompt files.** Each file carries an extra `description` field, which `PromptSpec` allows. Event objects are
   rendered with `tojson`, one JSON line per event, so the templates do not depend on which optional event fields are
   present. Prompt versions are strings like `v1`, not `1`, because `PromptRegistry` requires `v<digits>`.
-- **Profile slot.** Profiles are `- <subject>: <predicate> = <value_text> [fact#<short> · <conf> · <devices> ·
-  <first_seen>]`, pinned first, then by importance times confidence, up to 400 tokens. `facts_version` is a hash of
-  the active facts' rendering inputs.
+- **Profile slot.** Profiles are `- <subject>: <predicate> = <value_text> [fact#<short>]`, with the caution
+  (`disputed`, `unconfirmed N months`) after the id when there is one; pinned first, then by importance times
+  confidence, up to 400 tokens. Spec 11.5 also puts confidence, devices and first-seen date in the tag; they cost
+  about 20 tokens a line at every session start and are in `memory_get` with `trace` instead. `facts_version` is a
+  hash of the active facts' rendering inputs, which no longer include the devices, so profiles written in the old
+  format are rendered again by the next planner run.
 - **Profile re-render.** Appliers re-render the profile and notify the context-cache invalidation channel for touched
   scopes in the same transaction.
 - **Summary planning.** Day packets use `grain = 'session'` summaries only, over a 14-day lookback, never for today.
@@ -266,7 +269,7 @@ and repeated items are merged. The last section lists the gaps that are still op
 - **Injection modes.** `GET /v1/context` takes `mode=full|lean`; without it the user's default from `user_settings`
   (`GET`/`PUT /v1/me/settings`), else `full`. `mem-hook` sends `MEM_INJECTION` from `~/.memory/config` as `mode`. The
   lean block is the Profile and Open work sections (budgets 120/60/80 for profile, pinned facts and work state) plus a
-  fixed rubric of about 140 tokens; it has no since-you-were-here section. A re-render job carries the mode of the
+  fixed rubric of about 120 tokens; it has no since-you-were-here section. A re-render job carries the mode of the
   block it replaces.
 - **Context calls are logged on cache hits too.** `retrieval_log` gained `tokens`, `hits` and `injection`. A hit logs
   a row with no candidates, so `GET /v1/stats/recall` (own calls; `all=true` for admin tokens) counts every call. Rows
@@ -297,8 +300,17 @@ and repeated items are merged. The last section lists the gaps that are still op
   observations are.
 - **Search window.** `offset + limit` for `GET /v1/search` is capped at 1000.
 - **Output caps.** `memory_get` output is capped at about 24k characters, by shortening the longest bodies first.
-  Search, timeline and explain are capped at about 8k characters. Search output ends with a hint about
-  `memory_timeline` and `memory_get`.
+  Search and timeline are capped at about 8k characters.
+- **Lean rendering of pull output (7, 11.5).** What goes into the model's context is kept small. `memory_search`,
+  `memory_timeline` and `memory_get` print the 6-hex short id, lengthened to the shortest ending that tells apart the
+  rows shown (the full UUID stays in REST JSON and the viewer). Rows are grouped under one `**2026-10-22**` line per
+  day and show only the time; days appear in the order of their first row, so a relevance-ordered search is regrouped
+  by day. The glyph legend ends only the SessionStart index (full mode); search, timeline and get repeat neither it nor
+  a "next step" footer, and the lean block has no legend. Near-duplicate rows (same table, type, scope and normalized
+  title, as in `title_norm_key`) fold into the newest one with `(+N similar)` in the SessionStart index and in search;
+  the timeline lists every row. Since-you-were-here and Recent sessions do not list a session twice: the summary the
+  first section uses is left out of the second. Spec 11.5 shows dates on every row, the legend after every table and a
+  confidence, devices and date tag on facts, procedures and sessions; those are the costs this removes.
 
 ## 9. MCP and memory writes
 
@@ -324,7 +336,7 @@ and repeated items are merged. The last section lists the gaps that are still op
   single `wrong` queues a fact, a single `outdated` does not. Nothing is retracted by the request itself.
 - **Cautions.** A fact is shown as `disputed` when it is queued or its confidence is under 0.4, else as `unconfirmed N
   months` when `last_confirmed_at` is 90 or more days old; a procedure that failed more than it worked is `disputed`.
-  The tag is the last part of the citation (`[fact#a91c2e · 0.83 · laptop · 2026-10-02 · unconfirmed 4 months]`),
+  The tag is the last part of the citation (`[fact#a91c2e · unconfirmed 4 months]`),
   appears after the title in index rows (`IndexRow.caution`, `FactFull.caution`) and in rendered profiles. Pinned facts
   carry none. Scoring is unchanged: it already uses confidence, and facts still have no recency term.
 - **Tool errors.** Tool failures (bad arguments, 403, 404, scope errors) come back as `CallToolResult` with
@@ -341,8 +353,13 @@ and repeated items are merged. The last section lists the gaps that are still op
 - **`memory_search since`** accepts RFC 3339, `YYYY-MM-DD`, or a span (`24h`, `7d`, `2w`).
 - **Work state.** `POST` returns the folded list (200). `GET` without a scope uses the caller's default scopes (global,
   current project, device). It folds with `memvault_recall::engine::fold_work_state`.
-- **`memory_get` references.** It accepts full ids, `obs#a1b2c3` and 6-hex short ids through
-  `memvault_recall::engine::resolve_refs`. If no id resolves to a visible row, it is a tool error.
+- **`memory_get` references.** It accepts full ids, `obs#a1b2c3` and short ids through
+  `memvault_recall::engine::resolve_refs`; the other tools that take an id (`memory_timeline`, `memory_forget`,
+  `memory_feedback`) do the same. A short id is the last 4 or more hex characters of an id (the random end of a UUIDv7,
+  not its time-ordered start), and tables show it lengthened when two rows shown end alike. One that matches more than
+  one visible row is a tool error naming the candidates with enough characters to tell them apart (`memory_get` still
+  returns the ids that did resolve, and lists the ambiguous ones after them); if no id resolves to a visible row, it is
+  a tool error.
 - **Forget.** Summaries cannot be forgotten through the tool (422). Admin hard delete works on them. Forgetting twice is
   a no-op with no extra audit row. Reader roles get 403 `space_forbidden`. Rows the caller cannot see get 404.
 - **Hard delete (admin, REST only).** It removes the row and its embeddings. It nulls references to the row
@@ -356,7 +373,12 @@ and repeated items are merged. The last section lists the gaps that are still op
   confirmations, but it keeps its confidence.
 - **Promotion.** `promote_scope` supports only `to: global`. Promotion to project, device or agent is rejected,
   because a decision carries no scope key to derive it from.
-- **Explain.** `explain` is implemented in the API and the tool. Its output is capped as in section 8.
+- **Explain and history (7).** `GET /v1/memories/{id}/explain` and `/history` are implemented as in the spec, but the
+  MCP tools `memory_explain` and `memory_history` are not: `memory_get` takes `trace: true`, which appends the
+  provenance (session, events, extractor, evidence), the audit trail and, for a fact or procedure with more than one
+  version, the supersession chain to each body. Nine tool definitions cost about 1,400 tokens in every session, seven
+  about 900. The result is capped with the bodies (section 8). The session id is left out of the trace; no tool takes
+  it.
 - **Document sources.** `POST /v1/sources` (memories:write), `GET /v1/sources` and `DELETE /v1/sources` ingest files
   as memory of a new kind `document`; the spec has nothing like it. A source is `(space, scope, uri)` with a
   project or the global scope. `content` is chunked in `memvault_memories::chunk` (markdown by heading, text by
@@ -593,7 +615,7 @@ and repeated items are merged. The last section lists the gaps that are still op
   created). Observations and summaries count from `created_at`, observations until `archived_at`. Recall ranks relative to
   `as_of`, rebuilds the profile from the facts valid then instead of the rendered `profiles` row, and leaves work state
   out. `/v1/context`, the timeline and by-file do not take `as_of`; the context cache is not time-aware.
-- **History endpoint.** `GET /v1/memories/{id}/history` and the MCP `memory_history` follow `supersedes_id` in both
+- **History endpoint.** `GET /v1/memories/{id}/history` and `memory_get` with `trace` follow `supersedes_id` in both
   directions (at most 50 links each way) under the caller's RLS, so links in spaces the caller cannot read drop out and
   an invisible id is a 404. Only facts and procedures chain; an observation or summary is a chain of one. Other
   `secret` rows in a chain are left out. Procedures have no `superseded_by` or end time columns, so both are derived

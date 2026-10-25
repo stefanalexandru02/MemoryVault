@@ -12,7 +12,7 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use memvault_core::auth::resolve_read_spaces;
 use memvault_core::db::caps;
-use memvault_core::ids::new_id;
+use memvault_core::ids::{new_id, short_id};
 use memvault_core::schemas::common::{InjectionMode, MemoryTable, Scope, ScopeKind, Sensitivity, SummaryGrain};
 use memvault_core::schemas::memories::{
     AuditEntry, ByFileQuery, DocumentFull, EntityRef, EvidenceObservation, ExplainResponse, FactFull, FeedbackCounts,
@@ -415,8 +415,8 @@ fn fill_observations(
             }
         }
         if let Some(item) = observation_item(c, false) {
-            let cost =
-                i64::from(estimate_tokens(&render::index_line(&render::IndexEntry::from_observation(&item), false)));
+            let line = render::index_line(&render::IndexEntry::from_observation(&item), &short_id(&item.item.id));
+            let cost = i64::from(estimate_tokens(&line));
             if used + cost <= budget {
                 used += cost;
                 out.push(item);
@@ -602,8 +602,7 @@ fn slot_item(c: &Candidate, row: &TierRow, token_estimate: i32, citation: String
 fn fact_item(c: &Candidate) -> Option<FactItem> {
     let row @ TierRow::Fact(r) = c.row.as_ref()? else { return None };
     let confidence = f64::from(r.confidence);
-    let citation =
-        render::fact_tag(&r.id, confidence, &r.devices, Some(r.first_seen_at), r.caution(Utc::now()).as_deref());
+    let citation = render::fact_tag(&r.id, r.caution(Utc::now()).as_deref());
     Some(FactItem {
         item: slot_item(c, row, estimate_tokens(&r.value_text), citation),
         subject: r.subject_name.clone(),
@@ -628,12 +627,7 @@ fn procedure_item(c: &Candidate) -> Option<ProcedureItem> {
             c,
             row,
             tokens,
-            render::procedure_tag(
-                &r.id,
-                r.version,
-                Some(r.created_at),
-                procedure_caution(r.success_count, r.failure_count).as_deref(),
-            ),
+            render::procedure_tag(&r.id, procedure_caution(r.success_count, r.failure_count).as_deref()),
         ),
         name: r.name.clone(),
         task_class: r.task_class.clone(),
@@ -674,12 +668,7 @@ fn observation_item(c: &Candidate, expand: bool) -> Option<ObservationItem> {
 fn summary_item(c: &Candidate) -> Option<SummaryItem> {
     let row @ TierRow::Sum(r) = c.row.as_ref()? else { return None };
     Some(SummaryItem {
-        item: slot_item(
-            c,
-            row,
-            r.token_estimate,
-            render::summary_tag(&r.id, r.device_id.as_deref(), Some(r.created_at)),
-        ),
+        item: slot_item(c, row, r.token_estimate, render::summary_tag(&r.id)),
         grain: r.grain,
         request: r.request.clone(),
         learned: r.learned.clone(),
@@ -1372,39 +1361,53 @@ async fn feedback_counts(conn: &mut PgConnection, ids: &[Uuid]) -> Result<BTreeM
         .collect())
 }
 
-/// Map display refs (`obs#a1b2c3`, the 6-hex short id, or a full id) to visible row ids, for the
-/// MCP `memory_get` tool whose input may come from the SessionStart index. A ref matching no row,
-/// or more than one, maps to `None`.
+/// What a display ref points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefMatch {
+    One(Uuid),
+    /// No visible row ends with it.
+    Missing,
+    /// More than one visible row ends with it (some of them).
+    Ambiguous(Vec<Uuid>),
+}
+
+/// Map display refs (`obs#a1b2c3`, a short id of 4 or more hex characters, or a full id) to visible row ids, for the
+/// MCP tools whose input may come from an index.
 pub async fn resolve_refs(
     state: &AppState,
     identity: &Identity,
     refs: &[String],
-) -> Result<Vec<(String, Option<Uuid>)>, ApiError> {
+) -> Result<Vec<(String, RefMatch)>, ApiError> {
     let mut tx = user_tx(&state.db.app, identity).await?;
     let mut out = Vec::with_capacity(refs.len());
     for r in refs {
         let text = r.trim().to_lowercase();
         let text = text.rsplit('#').next().unwrap_or("").to_string();
         if let Ok(id) = text.parse::<Uuid>() {
-            out.push((r.clone(), Some(id)));
+            out.push((r.clone(), RefMatch::One(id)));
             continue;
         }
         if text.len() < 4 || !text.chars().all(|c| c.is_ascii_hexdigit()) {
-            out.push((r.clone(), None));
+            out.push((r.clone(), RefMatch::Missing));
             continue;
         }
-        let ids: Vec<Uuid> = sqlx::query_scalar(
+        let mut ids: Vec<Uuid> = sqlx::query_scalar(
             "SELECT id FROM observations WHERE replace(id::text, '-', '') LIKE '%' || $1
              UNION ALL SELECT id FROM summaries WHERE replace(id::text, '-', '') LIKE '%' || $1
              UNION ALL SELECT id FROM facts WHERE replace(id::text, '-', '') LIKE '%' || $1
              UNION ALL SELECT id FROM procedures WHERE replace(id::text, '-', '') LIKE '%' || $1
              UNION ALL SELECT id FROM documents WHERE replace(id::text, '-', '') LIKE '%' || $1
-             LIMIT 2",
+             LIMIT 5",
         )
         .bind(&text)
         .fetch_all(&mut *tx)
         .await?;
-        out.push((r.clone(), if ids.len() == 1 { Some(ids[0]) } else { None }));
+        let found = match ids.len() {
+            0 => RefMatch::Missing,
+            1 => RefMatch::One(ids.remove(0)),
+            _ => RefMatch::Ambiguous(ids),
+        };
+        out.push((r.clone(), found));
     }
     tx.commit().await?;
     Ok(out)

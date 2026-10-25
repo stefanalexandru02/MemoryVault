@@ -103,8 +103,11 @@ async fn context_block_has_every_section(pool: PgPool) {
     assert!(md.contains("| ● | Fixed off-by-one in window close |"), "{md}");
     assert!(!md.contains(&short_id(&s.subagent)) && !md.contains(&short_id(&s.secret)));
     assert!(!md.contains("hunter2"));
-    // Recent sessions (session summaries' next steps) from the cached part.
-    assert!(md.contains("### Recent sessions\n"), "{md}");
+    // Recent sessions (session summaries' next steps) from the cached part, without the session that
+    // since-you-were-here already lists.
+    let recent = pos("### Recent sessions\n");
+    assert!(md[recent..].contains("Old work") && !md[recent..].contains("Add rerank stage to recall"), "{md}");
+    assert_eq!(md.matches("Add rerank stage to recall").count(), 1, "{md}");
 
     // Cached: one row carrying what a re-render needs; a second call is identical.
     let (n, client, project_key): (i64, Option<Uuid>, Option<String>) =
