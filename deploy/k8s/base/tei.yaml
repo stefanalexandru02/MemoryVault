@@ -2,7 +2,8 @@
 # Model caches sit on PVCs so restarts do not re-download. The first start needs internet egress to
 # huggingface.co (see the tei-model-download NetworkPolicy in networkpolicy.yaml).
 #
-# The image tag is pinned to a CPU build (cpu-1.8 exists in ghcr.io/huggingface/text-embeddings-inference).
+# The image tag is pinned to the x86_64 CPU build. TEI publishes arm64 under its own tag (cpu-arm64-1.9.4);
+# use that one on arm64 nodes.
 #
 # Pod Security `restricted` applies to the namespace, so the pods run non-root with RuntimeDefault seccomp.
 # A non-root process cannot bind port 80 with all capabilities dropped, so TEI listens on 8080 and the
@@ -55,7 +56,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: tei
-          image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+          image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4
           args:
             - --model-id
             - BAAI/bge-m3
@@ -132,7 +133,7 @@ spec:
           type: RuntimeDefault
       containers:
         - name: tei
-          image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.8
+          image: ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4
           args:
             - --model-id
             - BAAI/bge-reranker-v2-m3
