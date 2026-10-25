@@ -59,21 +59,12 @@ chmod 600 "$memory_home/config"
 
 cat <<NEXT
 
-Next steps (or run "make connect-local" / "make connect-remote URL=... TOKEN=..." from the repo root, which does all of this)
+Next steps
 
-1. Edit $memory_home/config, then add to your shell profile:
-     set -a; . $memory_home/config; set +a
+The quick way, from the repository root:  make connect-local   (or: make connect-remote URL=... TOKEN=...)
+That fills in the config, installs the plugin (hooks, skills, MCP server) and allows its tools.
 
-2. Register the MCP server (user scope; the token stays a reference):
-     claude mcp add -s user -t http memory '\${MEMORY_URL}/mcp' -H 'Authorization: Bearer \${MEMORY_TOKEN}'
-
-3. Pre-approve its tools in ~/.claude/settings.json:
-     { "permissions": { "allow": ["mcp__memory__*"] } }
-
-4. Load the plugin (hooks):
-     claude --plugin-dir $here
-   or add this directory to a plugin marketplace and install "memory".
-
-5. Optional nightly runner (consolidation), with a runner token in the config:
+By hand: see the plugin README, "Install". An optional nightly runner (consolidation), with a runner token in
+the config:
      0 3 * * *  $here/bin/mem-hook observe --all --max 50
 NEXT

@@ -473,13 +473,19 @@ and repeated items are merged. The last section lists the gaps that are still op
   Python foundation suite. That is a history note and can be reworded.
 - **Unverified deployment pieces.** The CNPG role setup, the TEI image tag and user, the kustomize symlinks, and the
   Postgres image build have not been run against a live cluster.
-- **Phase 4 items not built.** The file-context hook, the admin viewer UI, OAuth for more users, KEDA scaling and
+- **Phase 4 items not built.** The admin viewer UI, OAuth for more users, KEDA scaling and
   export and import per space. The base manifests include no ScaledObject.
 - **Embedding cosine check.** The same-value check does not use embeddings (section 6). Near-duplicates become conflict
   candidates until consolidation resolves them.
 - **Eval replay and checks not run here.** The acceptance checks in spec section 17 need a live environment. The
   Windows hook has not been run.
-- **`make connect-*` writes the token into the MCP entry.** The manual route registers
-  `Authorization: Bearer ${MEMORY_TOKEN}` as a reference, which only works when the shell profile exports the
-  variable. `connect.sh` writes the literal token into `~/.claude.json` instead, so apps that do not read the
-  profile (IDEs, the desktop app) connect too. `~/.memory/config` (mode 0600) holds the same token.
+- **MCP server bundled in the plugin.** The spec registers the MCP server separately with `claude mcp add`, with
+  the token as an environment reference. The plugin now ships `.mcp.json` and takes the URL and token from its own
+  `userConfig` (token in the keychain, or `~/.claude/.credentials.json` where there is none), so no shell profile
+  is involved and IDE and desktop apps connect too. Tool names become `mcp__plugin_memory_memory__*`. The plugin
+  also ships six skills (`recall`, `remember`, `brief`, `project-history`, `handoff`, `how-it-works`), which the
+  spec does not list. `make connect-local`, `make connect-remote` and `make disconnect` wrap the setup.
+- **File-context hook is informational.** Phase 4's file-context hook is built as a `PreToolUse` hook on `Read`
+  (`mem-hook file-context`). It adds earlier observations for the file as context, once per file per session, and
+  never blocks or replaces the read. claude-mem's file-read gate can replace a read of a large unchanged file with
+  its timeline; this one does not, because a wrong block costs the agent the file.

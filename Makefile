@@ -35,7 +35,7 @@ CONNECT := ./clients/claude-code-plugin/connect.sh
 
 .DEFAULT_GOAL := help
 .PHONY: help env build up up-lite down restart ps logs migrate bootstrap user token tokens admin \
-        consolidate reindex psql connect-local connect-remote connect-status disconnect install-plugin mcp-add test clean
+        consolidate reindex psql connect-local connect-remote connect-status disconnect install-plugin test clean
 
 help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
@@ -145,9 +145,6 @@ disconnect: ## Remove the hooks, MCP server and token from this machine (PURGE=1
 
 install-plugin: ## Build mem-hook and set up ~/.memory on this machine
 	./clients/claude-code-plugin/install.sh
-
-mcp-add: ## Register the memory MCP server with Claude Code (user scope)
-	claude mcp add -s user -t http memory '$${MEMORY_URL}/mcp' -H 'Authorization: Bearer $${MEMORY_TOKEN}'
 
 test: .env ## Run the Rust test suite against the compose Postgres
 	DATABASE_URL=postgres://postgres:$(POSTGRES_PASSWORD)@127.0.0.1:$(PG_PORT)/postgres \

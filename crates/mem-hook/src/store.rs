@@ -15,6 +15,9 @@ pub struct Cache {
     pub next_seq: i64,
     pub window: i64,
     pub prompt_no: i64,
+    /// Files whose past observations were already shown this session (`file-context`).
+    #[serde(default)]
+    pub surfaced_files: Vec<String>,
 }
 
 fn sessions_dir(home: &Path) -> PathBuf {
@@ -52,6 +55,21 @@ pub fn alloc_seq(home: &Path, claude_sid: &str, new_prompt: bool) -> i64 {
             c.prompt_no += 1;
         }
         seq
+    })
+}
+
+/// True the first time `path` is asked about in this session, false afterwards.
+pub fn first_surface(home: &Path, claude_sid: &str, path: &str) -> bool {
+    update_cache(home, claude_sid, |c| {
+        if c.surfaced_files.iter().any(|p| p == path) {
+            return false;
+        }
+        // Bounded: a session that reads thousands of files keeps its newest 500.
+        if c.surfaced_files.len() >= 500 {
+            c.surfaced_files.remove(0);
+        }
+        c.surfaced_files.push(path.to_string());
+        true
     })
 }
 
@@ -125,6 +143,17 @@ mod tests {
         assert_eq!(alloc_seq(dir.path(), "s1", true), 1);
         assert_eq!(update_cache(dir.path(), "s1", |c| (c.next_seq, c.prompt_no)), (2, 1));
         assert_eq!(alloc_seq(dir.path(), "s2", false), 0);
+    }
+
+    #[test]
+    fn a_file_is_surfaced_once_per_session() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(first_surface(dir.path(), "s1", "/a/b.rs"));
+        assert!(!first_surface(dir.path(), "s1", "/a/b.rs"));
+        assert!(first_surface(dir.path(), "s1", "/a/c.rs"));
+        assert!(first_surface(dir.path(), "s2", "/a/b.rs"));
+        // The sequence counters share the cache file and are untouched.
+        assert_eq!(alloc_seq(dir.path(), "s1", false), 0);
     }
 
     #[test]
