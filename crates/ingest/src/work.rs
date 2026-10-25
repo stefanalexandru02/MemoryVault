@@ -8,12 +8,15 @@
 use axum::extract::State;
 use memvault_core::auth::{self, writable_space_ids};
 use memvault_core::http::{Json, Path};
-use memvault_core::schemas::common::PacketStatus;
+use memvault_core::jobs::enqueue_plan_if_busy;
+use memvault_core::schemas::common::{PacketKind, PacketStatus, Scope, ScopeKind};
 use memvault_core::schemas::validate::OutputError;
 use memvault_core::schemas::work::{
-    FailRequest, FailResponse, HeartbeatResponse, LeaseRequest, LeaseResponse, ResultRequest, ResultResponse,
+    FailRequest, FailResponse, HeartbeatResponse, LeaseRequest, LeaseResponse, PacketRecord, ResultRequest,
+    ResultResponse,
 };
 use memvault_core::{ApiError, AppState, AppliedCounts, Identity, require_scope};
+use sqlx::PgConnection;
 use uuid::Uuid;
 
 use crate::builders::to_json;
@@ -34,6 +37,29 @@ pub async fn lease(
             .await?;
     tx.commit().await?;
     Ok(Json(LeaseResponse { packets }))
+}
+
+/// After an extract packet: queue a planner run for each scope it wrote to that has gathered `threshold` new
+/// observations since it was last planned.
+async fn enqueue_busy_scopes(
+    conn: &mut PgConnection,
+    packet: &PacketRecord,
+    threshold: i64,
+) -> Result<(), sqlx::Error> {
+    let window_no = packet.inputs.get("window_no").and_then(|w| w.as_i64()).and_then(|w| i32::try_from(w).ok());
+    let scopes: Vec<(ScopeKind, String)> = sqlx::query_as(
+        "SELECT DISTINCT scope_kind, scope_key FROM observations
+          WHERE space_id = $1 AND session_id = $2 AND window_no = $3",
+    )
+    .bind(packet.space_id)
+    .bind(packet.session_id)
+    .bind(window_no)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (kind, key) in scopes {
+        enqueue_plan_if_busy(conn, packet.space_id, &Scope::new(kind, key), threshold).await?;
+    }
+    Ok(())
 }
 
 /// Validate (fence stripping only, 9.4) and apply in one transaction. Idempotent on the packet: a
@@ -87,6 +113,9 @@ pub async fn post_result(
     .bind(to_json(&counts))
     .execute(&mut *tx)
     .await?;
+    if packet.kind == PacketKind::Extract {
+        enqueue_busy_scopes(&mut tx, &packet, state.settings.consolidate_observation_threshold).await?;
+    }
     windows::after_packet_settled(&mut tx, Some(&*state.prompts), packet.kind, packet.session_id, &packet.inputs)
         .await?;
     tx.commit().await?;

@@ -15,11 +15,14 @@
 //!   packets they summarise have settled (done/failed/cancelled): the prompt summary then carries
 //!   the window observations' titles and the session summary the prompt summaries.
 //!   [`after_packet_settled`] and the sweep trigger that.
+//! - Once a session has ended and its extract packets have settled, a scoped planner run is queued for
+//!   every scope the session wrote observations in (`jobs(type='plan')`, trigger `session_end`).
 
 use chrono::{DateTime, Utc};
 use memvault_core::Settings;
+use memvault_core::jobs::enqueue_plan;
 use memvault_core::prompts::PromptRegistry;
-use memvault_core::schemas::common::{EventKind, PacketKind};
+use memvault_core::schemas::common::{EventKind, PacketKind, PlanTrigger, Scope, ScopeKind};
 use memvault_core::system_tx;
 use serde_json::Value;
 use sqlx::{PgConnection, PgPool};
@@ -250,6 +253,33 @@ pub async fn maybe_create_prompt_summary(
     Ok(if created { vec![PacketKind::SummarizePrompt] } else { Vec::new() })
 }
 
+/// Once `session` has ended and none of its extract packets is in flight, queue a planner run for each
+/// scope it wrote observations in.
+async fn plan_ended_session(conn: &mut PgConnection, session: &SessionRow) -> Result<(), sqlx::Error> {
+    let extracted: bool = sqlx::query_scalar(
+        "SELECT s.ended_at IS NOT NULL
+            AND NOT EXISTS (SELECT 1 FROM work_packets WHERE session_id = s.id AND kind = 'extract'
+                                                         AND status IN ('pending', 'leased'))
+           FROM sessions s WHERE s.id = $1",
+    )
+    .bind(session.id)
+    .fetch_one(&mut *conn)
+    .await?;
+    if !extracted {
+        return Ok(());
+    }
+    let scopes: Vec<(ScopeKind, String)> = sqlx::query_as(
+        "SELECT DISTINCT scope_kind, scope_key FROM observations WHERE session_id = $1 AND archived_at IS NULL",
+    )
+    .bind(session.id)
+    .fetch_all(&mut *conn)
+    .await?;
+    for (kind, key) in scopes {
+        enqueue_plan(conn, session.space_id, &Scope::new(kind, key), PlanTrigger::SessionEnd).await?;
+    }
+    Ok(())
+}
+
 /// Create the owed `summarize_session` packet once nothing it folds is still in flight.
 pub async fn maybe_create_session_summary(
     conn: &mut PgConnection,
@@ -366,6 +396,7 @@ pub async fn end_session(
         }
     }
     packets.extend(maybe_create_session_summary(conn, prompts, session).await?);
+    plan_ended_session(conn, session).await?;
     Ok(Ended { ended_at, window_closed, packets })
 }
 
@@ -396,6 +427,7 @@ pub async fn after_packet_settled(
         if let Some(prompt_no) = prompt_no {
             created.extend(maybe_create_prompt_summary(conn, prompts, &session, prompt_no).await?);
         }
+        plan_ended_session(conn, &session).await?;
     }
     created.extend(maybe_create_session_summary(conn, prompts, &session).await?);
     Ok(created)

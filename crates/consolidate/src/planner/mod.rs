@@ -11,20 +11,30 @@
 //!
 //! Everything written by one `run_planner` call shares a run id: code-only changes are audited with
 //! it, packets carry it in their inputs, and appliers audit with it (so a revert undoes the run).
+//!
+//! A pass covers a whole space (the nightly pass, an operator) or one scope of it (a run queued by a
+//! session end or by enough new observations, see [`run_plan_job`]). Each pass records why it ran
+//! ([`PlanTrigger`]) and which scopes it planned, in `planner_runs` and `scope_planning`. The nightly
+//! pass leaves out scopes planned within `CONSOLIDATE_MIN_INTERVAL_S`.
 
 pub mod clusters;
 pub mod decay;
 pub mod feedback;
 mod housekeeping;
 mod procedures;
+mod runs;
+pub mod scope;
 mod summaries;
+
+pub use runs::{JobOutcome, run_plan_job};
+pub use scope::ScopeFilter;
 
 use std::collections::BTreeMap;
 
 use chrono::{DateTime, Utc};
 use memvault_core::ids::new_id;
 use memvault_core::schemas::admin::ConsolidateResponse;
-use memvault_core::schemas::common::{OutputSchemaName, PacketKind};
+use memvault_core::schemas::common::{OutputSchemaName, PacketKind, PlanTrigger, Scope};
 use memvault_core::{ApiError, AppState};
 use serde_json::Value;
 use sqlx::PgConnection;
@@ -124,45 +134,87 @@ pub(crate) async fn profile_md(
     Ok(body.unwrap_or_default())
 }
 
-/// One planning pass as of `now` over one space, in the caller's transaction.
+/// One planning pass as of `now` over the scopes of `filter` in one space, in the caller's transaction.
 pub async fn plan_space(
     conn: &mut PgConnection,
     state: &AppState,
     space_id: Uuid,
     run_id: Uuid,
     now: DateTime<Utc>,
+    filter: &ScopeFilter,
 ) -> Result<Tally, ApiError> {
     let ctx = AuditCtx::planner(space_id, run_id);
     let mut tally = Tally::default();
-    tally.action("learned_on_refreshed", housekeeping::refresh_learned_on(conn, space_id).await?);
-    tally.action("feedback_retract", feedback::retract_disputed(conn, &ctx, now).await?);
-    clusters::plan(conn, state, &ctx, now, &mut tally).await?;
-    let (observations, facts) = decay::decay(conn, space_id, now).await?;
+    tally.action("learned_on_refreshed", housekeeping::refresh_learned_on(conn, space_id, filter).await?);
+    tally.action("feedback_retract", feedback::retract_disputed(conn, &ctx, now, filter).await?);
+    clusters::plan(conn, state, &ctx, now, filter, &mut tally).await?;
+    let (observations, facts) = decay::decay(conn, space_id, now, filter).await?;
     tally.action("decay_observations", observations);
     tally.action("decay_facts", facts);
-    tally.action("obs_archive", decay::archive(conn, &ctx, now).await?);
-    summaries::plan(conn, state, &ctx, now, &mut tally).await?;
-    procedures::plan(conn, state, &ctx, &mut tally).await?;
-    tally.action("profiles_rendered", u64::try_from(profiles::refresh_space(conn, space_id).await?).unwrap_or(0));
+    tally.action("obs_archive", decay::archive(conn, &ctx, now, filter).await?);
+    summaries::plan(conn, state, &ctx, now, filter, &mut tally).await?;
+    procedures::plan(conn, state, &ctx, filter, &mut tally).await?;
+    let rendered = profiles::refresh_space(conn, space_id, filter).await?;
+    tally.action("profiles_rendered", u64::try_from(rendered).unwrap_or(0));
     Ok(tally)
 }
 
-/// One planning pass (spec 12.1) for one space, or every space when `None`.
-/// `memvault planner` and `POST /v1/admin/consolidate` call it.
-pub async fn run_planner(state: &AppState, space_id: Option<Uuid>) -> Result<ConsolidateResponse, ApiError> {
-    run_planner_at(state, space_id, Utc::now()).await
+/// What a planner call covers and why it runs.
+#[derive(Debug, Clone)]
+pub struct PlanOptions {
+    /// `None`: every space.
+    pub space_id: Option<Uuid>,
+    /// Restrict the run to one scope of `space_id`; `None`: every scope.
+    pub scope: Option<Scope>,
+    pub trigger: PlanTrigger,
 }
 
-/// [`run_planner`] with an explicit clock (tests, backfills). Each space is planned in its own
-/// transaction; a space that fails is logged and counted under `space_errors` when the pass covers
-/// every space, and fails the call when one space was asked for.
+impl PlanOptions {
+    /// The scheduled pass: every scope of the spaces, except those planned within the minimum interval.
+    pub fn nightly(space_id: Option<Uuid>) -> Self {
+        Self { space_id, scope: None, trigger: PlanTrigger::Nightly }
+    }
+
+    /// An operator's run: it covers what it is asked to, whatever was planned a moment ago.
+    pub fn manual(space_id: Option<Uuid>, scope: Option<Scope>) -> Self {
+        Self { space_id, scope, trigger: PlanTrigger::Manual }
+    }
+}
+
+/// One manual planning pass (spec 12.1) for one space, or every space when `None`.
+pub async fn run_planner(state: &AppState, space_id: Option<Uuid>) -> Result<ConsolidateResponse, ApiError> {
+    run_planner_for(state, &PlanOptions::manual(space_id, None)).await
+}
+
+/// [`run_planner`] with an explicit clock (tests, backfills).
 pub async fn run_planner_at(
     state: &AppState,
     space_id: Option<Uuid>,
     now: DateTime<Utc>,
 ) -> Result<ConsolidateResponse, ApiError> {
+    run_planner_with(state, &PlanOptions::manual(space_id, None), now).await
+}
+
+/// [`run_planner_with`] as of now.
+pub async fn run_planner_for(state: &AppState, options: &PlanOptions) -> Result<ConsolidateResponse, ApiError> {
+    run_planner_with(state, options, Utc::now()).await
+}
+
+/// One planning pass as `options` describe it, as of `now`. Each space is planned in its own
+/// transaction; a space that fails is logged and counted under `space_errors` when the pass covers
+/// every space, and fails the call when one space was asked for. `memvault planner` (nightly),
+/// `POST /v1/admin/consolidate` (manual) and the worker's `plan` jobs call it.
+pub async fn run_planner_with(
+    state: &AppState,
+    options: &PlanOptions,
+    now: DateTime<Utc>,
+) -> Result<ConsolidateResponse, ApiError> {
+    if options.scope.is_some() && options.space_id.is_none() {
+        return Err(ApiError::invalid("a scope needs a space"));
+    }
     let run_id = new_id();
-    let spaces: Vec<Uuid> = match space_id {
+    let trigger = options.trigger;
+    let spaces: Vec<Uuid> = match options.space_id {
         Some(id) => vec![id],
         None => sqlx::query_scalar("SELECT id FROM spaces ORDER BY created_at, id").fetch_all(&state.db.system).await?,
     };
@@ -170,14 +222,27 @@ pub async fn run_planner_at(
     for space in spaces {
         let result = async {
             let mut tx = system_tx(&state.db.system).await?;
-            let tally = plan_space(&mut tx, state, space, run_id, now).await?;
+            let filter = match &options.scope {
+                Some(scope) => ScopeFilter::only(scope.clone()),
+                None if trigger == PlanTrigger::Nightly => {
+                    let min_interval = chrono::Duration::from_std(state.settings.consolidate_min_interval)
+                        .unwrap_or(chrono::Duration::zero());
+                    ScopeFilter::skipping(&runs::planned_since(&mut tx, space, now - min_interval).await?)
+                }
+                None => ScopeFilter::default(),
+            };
+            let tally = plan_space(&mut tx, state, space, run_id, now, &filter).await?;
+            runs::record(&mut tx, space, run_id, trigger, &filter, now, &tally).await?;
             tx.commit().await?;
             Ok::<_, ApiError>(tally)
         }
         .await;
         match result {
-            Ok(tally) => total.absorb(tally),
-            Err(e) if space_id.is_none() => {
+            Ok(tally) => {
+                metrics::counter!("memsvc_planner_runs_total", "trigger" => trigger.as_str()).increment(1);
+                total.absorb(tally);
+            }
+            Err(e) if options.space_id.is_none() => {
                 tracing::error!(%space, error = %e, "planning failed for space");
                 total.action("space_errors", 1);
             }
@@ -185,9 +250,9 @@ pub async fn run_planner_at(
         }
     }
     for (name, n) in &total.actions {
-        metrics::counter!("memsvc_consolidation_actions_total", "action" => name.clone())
+        metrics::counter!("memsvc_consolidation_actions_total", "action" => name.clone(), "trigger" => trigger.as_str())
             .increment(u64::try_from(*n).unwrap_or(0));
     }
-    tracing::info!(%run_id, packets = ?total.packets, actions = ?total.actions, "consolidation planned");
-    Ok(ConsolidateResponse { run_id, packets_created: total.packets, actions: total.actions })
+    tracing::info!(%run_id, trigger = trigger.as_str(), packets = ?total.packets, actions = ?total.actions, "consolidation planned");
+    Ok(ConsolidateResponse { run_id, trigger: Some(trigger), packets_created: total.packets, actions: total.actions })
 }

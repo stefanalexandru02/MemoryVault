@@ -757,10 +757,13 @@
   // ---------- admin ----------
   async function renderAdmin() {
     const own = (state.token.split('_')[1] || '');
-    const health = h('div', {}), tokens = h('div', {}), packets = h('div', {}), jobs = h('div', {});
+    const health = h('div', {}), tokens = h('div', {}), runs = h('div', {}), packets = h('div', {}), jobs = h('div', {});
     $main.replaceChildren(h('div', { class: 'page' }, h('div', { class: 'page-inner' },
       h('div', { class: 'head-row' }, h('h2', { text: 'Health' }), h('button', { class: 'btn small', onclick: () => loadDoctor() }, 'Check again')), health,
-      h('h2', { text: 'Tokens' }), tokens, h('h2', { text: 'Failed work packets' }), packets, h('h2', { text: 'Failed background jobs' }), jobs)));
+      h('h2', { text: 'Tokens' }), tokens,
+      h('h2', { text: 'Consolidation runs' }),
+      h('p', { class: 'muted', text: 'Planner runs, newest first, with what started them: the nightly pass, the end of a session, enough new observations in a scope, or an operator. Runs waiting in the queue come first.' }), runs,
+      h('h2', { text: 'Failed work packets' }), packets, h('h2', { text: 'Failed background jobs' }), jobs)));
 
     // Server diagnosis (GET /v1/admin/doctor). detail and fix are server text: textContent only, the fix in <code>.
     async function loadDoctor() {
@@ -792,6 +795,21 @@
       if (!confirm(isOwn ? 'This is the token you are signed in with. Revoke it and sign out?' : `Revoke token mem_${t.prefix}_…? The device using it loses access.`)) return;
       try { await api(`/v1/admin/tokens/${t.id}`, { method: 'DELETE' }); toast('Token revoked'); if (isOwn) signOut('You revoked your own token.'); else loadTokens(); } catch (e) { if (e.status !== 401) toast(e.message, true); }
     }
+    // GET /v1/admin/consolidation (finished runs) and the queued `plan` jobs, each with its trigger.
+    async function loadRuns() {
+      try {
+        const [done, queued] = await Promise.all([api('/v1/admin/consolidation?limit=20'), api('/v1/admin/jobs?type=plan&status=queued&limit=20')]);
+        const counts = (o) => Object.entries(o || {}).map(([k, v]) => `${k} ${v}`).join(', ') || '–';
+        const trigger = (t) => h('span', { class: 'pill', text: t.replace('_', ' ') });
+        const rows = [
+          ...queued.map((j) => h('tr', {}, h('td', { title: fullTime(j.run_after), text: `queued for ${fullTime(j.run_after)}` }), h('td', {}, trigger(j.trigger || 'manual')), h('td', { text: j.scope || '' }), h('td', { text: '–' }), h('td', { text: '–' }))),
+          ...done.map((r) => h('tr', {}, h('td', { title: fullTime(r.created_at), text: ago(r.created_at) }), h('td', {}, trigger(r.trigger)), h('td', { text: r.scope || 'all scopes' }), h('td', { text: counts(r.packets) }), h('td', { text: counts(r.actions) }))),
+        ];
+        runs.replaceChildren(rows.length ? h('div', { class: 'scroll-x' }, h('table', { class: 't' },
+          h('thead', {}, h('tr', {}, ['When', 'Trigger', 'Scope', 'Packets', 'Actions'].map((c) => h('th', { text: c })))),
+          h('tbody', {}, rows))) : h('div', { class: 'muted', text: 'None yet.' }));
+      } catch (e) { if (e.status !== 401) runs.replaceChildren(h('div', { class: 'error', text: e.message })); }
+    }
     async function loadPackets() {
       try {
         const list = await api('/v1/admin/packets?status=failed&limit=20');
@@ -807,10 +825,10 @@
         const list = await api('/v1/admin/jobs?status=failed&limit=20');
         jobs.replaceChildren(list.length ? h('div', { class: 'scroll-x' }, h('table', { class: 't' },
           h('thead', {}, h('tr', {}, ['Type', 'Attempts', 'Created', 'Error'].map((c) => h('th', { text: c })))),
-          h('tbody', {}, list.map((j) => h('tr', {}, h('td', { text: j.type }), h('td', { text: j.attempts }), h('td', { text: ago(j.created_at) }), h('td', { text: j.last_error || '' })))))) : h('div', { class: 'muted', text: 'None.' }));
+          h('tbody', {}, list.map((j) => h('tr', {}, h('td', { text: j.trigger ? `${j.type} (${j.trigger})` : j.type }), h('td', { text: j.attempts }), h('td', { text: ago(j.created_at) }), h('td', { text: j.last_error || '' })))))) : h('div', { class: 'muted', text: 'None.' }));
       } catch (e) { if (e.status !== 401) jobs.replaceChildren(h('div', { class: 'error', text: e.message })); }
     }
-    loadDoctor(); loadTokens(); loadPackets(); loadJobs();
+    loadDoctor(); loadTokens(); loadRuns(); loadPackets(); loadJobs();
   }
 
   // ---------- keyboard ----------

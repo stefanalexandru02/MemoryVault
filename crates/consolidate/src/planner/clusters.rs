@@ -24,6 +24,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use super::scope::ScopeFilter;
 use super::{NewPacket, Tally, create_packet, profile_md};
 use crate::audit::{AuditCtx, record, snapshot};
 
@@ -285,16 +286,21 @@ pub async fn plan(
     state: &AppState,
     ctx: &AuditCtx,
     now: DateTime<Utc>,
+    filter: &ScopeFilter,
     tally: &mut Tally,
 ) -> Result<(), ApiError> {
     let space_id = ctx.space_id;
-    let candidates: Vec<Candidate> = sqlx::query_as(
+    let scope = ScopeFilter::condition("scope_kind", "scope_key", 3);
+    let candidates: Vec<Candidate> = sqlx::query_as(&format!(
         "SELECT id, scope_kind, scope_key, subject_id, predicate, value_text, confidence::float8 AS confidence, conflict,
                 first_seen_at
-           FROM facts WHERE space_id = $1 AND status = 'candidate' ORDER BY first_seen_at, id LIMIT $2",
-    )
+           FROM facts WHERE space_id = $1 AND status = 'candidate' AND {scope} ORDER BY first_seen_at, id LIMIT $2",
+    ))
     .bind(space_id)
     .bind(MAX_CANDIDATES)
+    .bind(filter.only_kind())
+    .bind(filter.only_key())
+    .bind(filter.skipped())
     .fetch_all(&mut *conn)
     .await?;
     if candidates.is_empty() {

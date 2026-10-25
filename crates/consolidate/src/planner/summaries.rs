@@ -13,6 +13,7 @@ use serde_json::{Value, json};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use super::scope::ScopeFilter;
 use super::{NewPacket, Tally, create_packet};
 use crate::audit::AuditCtx;
 
@@ -82,6 +83,7 @@ async fn day_packets(
     state: &AppState,
     ctx: &AuditCtx,
     today: NaiveDate,
+    filter: &ScopeFilter,
     tally: &mut Tally,
 ) -> Result<(), ApiError> {
     let days: Vec<(ScopeKind, String, NaiveDate)> = sqlx::query_as(
@@ -101,7 +103,7 @@ async fn day_packets(
     .bind(i64::try_from(MIN_SUMMARIES).unwrap_or(2))
     .fetch_all(&mut *conn)
     .await?;
-    for (kind, key, day) in days {
+    for (kind, key, day) in days.into_iter().filter(|(kind, key, _)| filter.allows(*kind, key)) {
         let items =
             session_summaries(conn, ctx.space_id, kind, &key, midnight(day), midnight(day + Duration::days(1))).await?;
         let created = create_packet(
@@ -129,6 +131,7 @@ async fn week_packets(
     state: &AppState,
     ctx: &AuditCtx,
     (start, end): (NaiveDate, NaiveDate),
+    filter: &ScopeFilter,
     tally: &mut Tally,
 ) -> Result<(), ApiError> {
     let (from, to) = (midnight(start), midnight(end + Duration::days(1)));
@@ -146,7 +149,7 @@ async fn week_packets(
     .bind(to)
     .fetch_all(&mut *conn)
     .await?;
-    for (kind, key) in scopes {
+    for (kind, key) in scopes.into_iter().filter(|(kind, key)| filter.allows(*kind, key)) {
         let mut items: Vec<Value> = sqlx::query_scalar(&format!(
             "SELECT {SUMMARY_JSON} FROM summaries
               WHERE space_id = $1 AND scope_kind = $2 AND scope_key = $3 AND grain = 'day'
@@ -190,12 +193,13 @@ pub async fn plan(
     state: &AppState,
     ctx: &AuditCtx,
     now: DateTime<Utc>,
+    filter: &ScopeFilter,
     tally: &mut Tally,
 ) -> Result<(), ApiError> {
     let today = now.date_naive();
-    day_packets(conn, state, ctx, today, tally).await?;
+    day_packets(conn, state, ctx, today, filter, tally).await?;
     if let Some(week) = week_period(today) {
-        week_packets(conn, state, ctx, week, tally).await?;
+        week_packets(conn, state, ctx, week, filter, tally).await?;
     }
     Ok(())
 }

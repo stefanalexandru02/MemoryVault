@@ -1940,6 +1940,7 @@ dependencies = [
  "async-trait",
  "axum",
  "chrono",
+ "memvault-consolidate",
  "memvault-core",
  "memvault-ingest",
  "memvault-recall",

@@ -7,7 +7,7 @@ use uuid::Uuid;
 
 use crate::auth::scopes::TokenKind;
 use crate::error::ApiError;
-use crate::schemas::common::{ClientKind, EmbeddingOwnerTable, MembershipRole, SpaceKind};
+use crate::schemas::common::{ClientKind, EmbeddingOwnerTable, MembershipRole, PlanTrigger, Scope, SpaceKind};
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct UserCreate {
@@ -144,17 +144,47 @@ pub struct ConsolidateRequest {
     /// `None` = every space.
     #[serde(default)]
     pub space_id: Option<Uuid>,
+    /// Restrict the run to one scope of `space_id`; `None` = every scope.
+    #[serde(default)]
+    pub scope: Option<Scope>,
+}
+
+impl ConsolidateRequest {
+    pub fn validate(&self) -> Result<(), ApiError> {
+        if self.scope.is_some() && self.space_id.is_none() {
+            return Err(ApiError::invalid("scope needs space_id"));
+        }
+        Ok(())
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct ConsolidateResponse {
     pub run_id: Uuid,
+    /// What started the run; `None` in responses of servers that predate triggers.
+    #[serde(default)]
+    pub trigger: Option<PlanTrigger>,
     /// By packet kind.
     #[serde(default)]
     pub packets_created: BTreeMap<String, i64>,
     /// Code-only actions: auto-activate, archive, ...
     #[serde(default)]
     pub actions: BTreeMap<String, i64>,
+}
+
+/// One planner run in one space (`GET /v1/admin/consolidation`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
+pub struct PlannerRunOut {
+    pub run_id: Uuid,
+    pub space_id: Uuid,
+    /// `kind:key` of the scope the run was restricted to; `None` = every scope of the space.
+    pub scope: Option<String>,
+    pub trigger: PlanTrigger,
+    /// By packet kind.
+    pub packets: serde_json::Value,
+    /// Code-only actions: auto-activate, archive, ...
+    pub actions: serde_json::Value,
+    pub created_at: DateTime<Utc>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -178,6 +208,11 @@ pub struct JobOut {
     pub locked_until: Option<DateTime<Utc>>,
     pub last_error: Option<String>,
     pub created_at: DateTime<Utc>,
+    /// `plan` jobs: what queued the run, and the `kind:key` scope it plans.
+    #[serde(default)]
+    pub trigger: Option<String>,
+    #[serde(default)]
+    pub scope: Option<String>,
 }
 
 fn yes() -> bool {

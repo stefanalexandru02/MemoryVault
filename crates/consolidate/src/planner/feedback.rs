@@ -12,6 +12,7 @@ use memvault_core::schemas::common::ScopeKind;
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use super::scope::ScopeFilter;
 use crate::audit::{AuditCtx, record, snapshot};
 
 /// Disputed facts retracted per space and pass.
@@ -27,17 +28,26 @@ struct Disputed {
 }
 
 /// Retract the queued facts of the space; returns how many.
-pub async fn retract_disputed(conn: &mut PgConnection, ctx: &AuditCtx, now: DateTime<Utc>) -> Result<u64, sqlx::Error> {
-    let queued: Vec<Disputed> = sqlx::query_as(
+pub async fn retract_disputed(
+    conn: &mut PgConnection,
+    ctx: &AuditCtx,
+    now: DateTime<Utc>,
+    filter: &ScopeFilter,
+) -> Result<u64, sqlx::Error> {
+    let scope = ScopeFilter::condition("f.scope_kind", "f.scope_key", 3);
+    let queued: Vec<Disputed> = sqlx::query_as(&format!(
         "SELECT f.id, f.scope_kind, f.scope_key FROM facts f
-          WHERE f.space_id = $1 AND f.status = 'active' AND f.disputed_at IS NOT NULL AND NOT f.pinned
+          WHERE f.space_id = $1 AND f.status = 'active' AND f.disputed_at IS NOT NULL AND NOT f.pinned AND {scope}
             AND NOT EXISTS (SELECT 1 FROM facts c
                              WHERE c.space_id = f.space_id AND c.scope_kind = f.scope_kind AND c.scope_key = f.scope_key
                                AND c.subject_id = f.subject_id AND c.predicate = f.predicate AND c.status = 'candidate')
           ORDER BY f.disputed_at, f.id LIMIT $2 FOR UPDATE OF f",
-    )
+    ))
     .bind(ctx.space_id)
     .bind(MAX_PER_PASS)
+    .bind(filter.only_kind())
+    .bind(filter.only_key())
+    .bind(filter.skipped())
     .fetch_all(&mut *conn)
     .await?;
     for fact in &queued {

@@ -1,8 +1,9 @@
 //! memvault-consolidate: planner, consolidation appliers, revert, admin routes and CLI (spec 6.7,
 //! 12).
 //!
-//! - [`planner`]: the nightly pass (`memvault planner`, `POST /v1/admin/consolidate`): fact
-//!   clusters, auto-activation, decay and archival, day/week summaries, procedure mining, profiles.
+//! - [`planner`]: the nightly pass (`memvault planner`), operator runs (`POST /v1/admin/consolidate`) and the
+//!   scoped runs the worker makes after a session ends or a scope fills up: fact clusters, auto-activation,
+//!   decay and archival, day/week summaries, procedure mining, profiles.
 //! - [`appliers`]: results of `consolidate_facts`, `consolidate_summary`, `consolidate_procedures`
 //!   packets, applied by code with audit rows.
 //! - [`revert`]: undo a run from its audit rows.

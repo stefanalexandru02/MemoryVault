@@ -6,6 +6,7 @@ rust-version.workspace = true
 publish.workspace = true
 
 [dependencies]
+memvault-consolidate.workspace = true
 memvault-core.workspace = true
 memvault-ingest.workspace = true
 memvault-recall.workspace = true

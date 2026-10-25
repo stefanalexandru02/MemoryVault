@@ -376,8 +376,9 @@ and repeated items are merged. The last section lists the gaps that are still op
   auto-activated.
 - **Consolidation tests.** Consolidate tests load the repository's `prompts/` directory, which is what the deploy ships.
   The crate's own prompt copies were deleted.
-- **Not built.** The on-demand consolidation trigger (candidates above 50, or a conflict older than 24 h, from
-  architecture 5.4). Marking a procedure's `failure_count` from later summaries. Spec 12 requires neither.
+- **Not built.** The on-demand consolidation trigger on a candidate backlog above 50 or a conflict older than 24 h
+  (architecture 5.4; session-end and observation-threshold triggers are built, below). Marking a procedure's
+  `failure_count` from later summaries. Spec 12 requires neither.
 - **Admin CLI.** `memvault admin project remap` takes `--from` and `--to`, as the spec says. The positional form is gone.
 - **Project remap.** It is audited as `project.remap` with before and after rows. It refuses with 409 when active
   facts would collide on the target key. It is undone through the revert endpoint.
@@ -391,6 +392,26 @@ and repeated items are merged. The last section lists the gaps that are still op
 - **Replay observers.** `evals replay --observer` is optional. Without it, packet outputs are the recorded ones, or a
   fake observer's when the recording has none. `--prompt` implies the `claude` observer, which runs only `extract`
   packets through `claude -p`. Summaries keep their recorded or fake outputs.
+- **Triggers instead of the backlog trigger.** Architecture 5.4 wants an on-demand run when candidates pile up. What is
+  built reacts to activity: a session end (once its extract packets settled) and `CONSOLIDATE_OBSERVATION_THRESHOLD`
+  new observations in a scope (counted from `scope_planning.last_planned_at`, extract results only) each queue a
+  scoped `plan` job. `CONSOLIDATE_OBSERVATION_THRESHOLD=0` turns the second off.
+- **One live job per scope.** The unique index `jobs_plan_live` allows one `plan` job per `(space, scope)` while it is
+  queued or running, so a trigger that arrives during a run is dropped; the nightly pass or a later trigger picks the
+  activity up.
+- **Debounce at run time.** The minimum interval is checked when the worker claims the job, not when it is queued
+  (ingest has no settings at the point where it queues). A job inside the interval goes back to `queued` with
+  `run_after` at the end of it and is not counted as an attempt (`queue::defer`).
+- **Nightly skip.** `memvault planner` leaves out scopes whose `scope_planning.last_planned_at` is inside the
+  interval. `POST /v1/admin/consolidate`, `memvault admin consolidate now` and `planner::run_planner` are `manual` and
+  never skip. Every pass, scoped or not, stamps the scopes it planned.
+- **Scope in a pass.** A scoped pass filters its own stages (learned-on refresh, disputed facts, fact candidates,
+  decay, archival, summaries, procedures, profiles). A candidate still clusters with a similar fact of another scope
+  of the same space, as before.
+- **Audit and metrics.** `planner_runs` (one row per run and space, 180-day retention like the other logs) records the
+  trigger and scope; `memory_audit` rows keep joining on `run_id`. `memsvc_consolidation_actions_total` gained a
+  `trigger` label; new are `memsvc_planner_runs_total{trigger}`, `memsvc_plan_enqueued_total{trigger,outcome}` and
+  `memsvc_plan_jobs_total{trigger,outcome}` (planned or deferred).
 
 ## 11. Worker and jobs
 
@@ -416,6 +437,10 @@ and repeated items are merged. The last section lists the gaps that are still op
   and `settings.port`). A failed bind logs an error, and the worker keeps running. This is not an HTTP API in the
   spec's sense.
 - **Worker port.** The worker's Service and container port were meant to be removed. See section 14.
+- **Plan lane.** Scoped `plan` jobs (triggered consolidation, section 10) have a worker lane of their own, so a long
+  reindex cannot hold them up. A job that is not due yet is requeued with `queue::defer`, and the worker now depends on
+  `memvault-consolidate`.
+
 ## 12. Evals
 
 - **Questions name content.** Questions list expected content, not ids, because ids differ on every replay. They use

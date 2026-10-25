@@ -36,7 +36,7 @@ lock" is normal, wait; never kill cargo or delete `target/`. Build and test only
 | `crates/evals` | `memvault-evals` | evals | record, redact, replay, compare |
 | `crates/mem-hook` | `mem-hook` (bin) | plugin | hook subcommands + `observe`; **no dependency on core** (ureq + serde_json, no async runtime) |
 
-Dependency graph: every crate depends on core; memories -> recall; worker -> ingest, recall. Do not add an edge
+Dependency graph: every crate depends on core; memories -> recall; worker -> ingest, recall, consolidate. Do not add an edge
 that creates a cycle (ingest and recall must not depend on worker or memories).
 
 Foundation-owned shared files: root `Cargo.toml`, `Cargo.lock` (cargo updates it; fine), `.cargo/config.toml`,
@@ -128,6 +128,10 @@ Full DDL of spec 4.1-4.7 plus:
 - **0203 recall**: `user_settings`; `retrieval_log.tokens`, `.hits`, `.injection` (`full`|`lean`, context calls only)
   and an index on `(client_id, created_at)`; `context_cache.mode`, `.hit_count`; `memsvc_recall_invalidate` is
   recreated returning `mode` as well (same grants). The cache key is `v2` and includes the mode.
+- **0401 consolidation**: `scope_planning(space_id, scope_kind, scope_key, last_planned_at)` (when the planner last
+  processed a scope), `planner_runs(run_id, space_id, scope_kind?, scope_key?, trigger, packets, actions, created_at)`
+  (one row per run and space; trigger `nightly|session_end|threshold|manual`), both with forced space RLS, and the
+  unique index `jobs_plan_live` (one queued or running `plan` job per space and scope).
 - **0500 worker**: `jobs.priority` (claim order; live jobs 0, `reindex` backfill 10).
 - **0900 hardening**: `memsvc_app` loses INSERT/UPDATE/DELETE on `users`, `spaces`, `api_tokens`, `clients`
   (except `api_tokens.last_used_at` and `clients.last_seen_at/current_project_key/current_project_at`) and DELETE on
@@ -198,7 +202,12 @@ Full DDL of spec 4.1-4.7 plus:
   for jobs queued before it existed), queued by the API's cache
   listener with `run_after = now() + CONTEXT_RERENDER_DEBOUNCE_S`, coalesced per `cache_key`, run by
   `memvault_recall::cache::rerender(&state, &payload) -> Result<bool, ApiError>` (false: user or client gone; the
-  job is done either way); `reindex`; `retention` (`idempotency_key = retention:<UTC date>`, queued by the sweep).
+  job is done either way); `plan` = `memvault_core::jobs::PlanJob {space_id, scope, trigger}`, queued by
+  `jobs::enqueue_plan` (a session end, via ingest `windows`) or `jobs::enqueue_plan_if_busy` (the observation
+  threshold, after an extract result), coalesced per scope, run on its own lane by
+  `memvault_consolidate::planner::run_plan_job(&state, &payload, now) -> Result<JobOutcome, ApiError>`
+  (`Deferred(until)`: the scope was planned inside `CONSOLIDATE_MIN_INTERVAL_S`, the worker requeues the job with
+  `queue::defer`); `reindex`; `retention` (`idempotency_key = retention:<UTC date>`, queued by the sweep).
   Only the API listener deletes cache rows; the worker never does.
 - **Invalidation**: `memvault_core::invalidate::notify_invalidate(&mut tx, space_id, scope_kind, scope_key)` inside
   every write transaction that changes what context/recall shows; delivered on commit on channel
@@ -220,7 +229,7 @@ that login is superuser or BYPASSRLS), `DB_POOL_MAX` (10), `TEI_EMBED_URL`, `TEI
 `WINDOW_IDLE_SECONDS` (90), `LEASE_SECONDS_DEFAULT` (600), `PREFERRED_RUNNER_SECONDS` (600),
 `WORKER_SWEEP_INTERVAL_S` (30), `EMBED_BATCH_SIZE` (64), `EMBED_CONCURRENCY` (2), `EMBED_MAX_PART_TOKENS` (512),
 `CONTEXT_RERENDER_DEBOUNCE_S` (2), `RETENTION_EVENTS_PAYLOAD_DAYS` (30), `RETENTION_PACKETS_DAYS` (90),
-`RETENTION_LOGS_DAYS` (180), `HOST`, `PORT`, `LOG_LEVEL` (EnvFilter directive), `LOG_FORMAT` (`json`|`text`),
+`RETENTION_LOGS_DAYS` (180), `CONSOLIDATE_OBSERVATION_THRESHOLD` (25; 0 = off), `CONSOLIDATE_MIN_INTERVAL_S` (900), `HOST`, `PORT`, `LOG_LEVEL` (EnvFilter directive), `LOG_FORMAT` (`json`|`text`),
 `TEI_EMBED_BATCH_TIMEOUT_S` (60, worker embed batches), `WORKER_METRICS_ADDR` (default `HOST:PORT`).
 `serve` and `admin` refuse to start with an empty `TOKEN_PEPPER` (`Settings::require_token_pepper`).
 Durations are `std::time::Duration` fields (`tei_rerank_timeout`, ...). Handlers read `state.settings`.
@@ -340,7 +349,7 @@ JSON 404/405 fallbacks, `DefaultBodyLimit` 8 MB, request ids (`x-request-id`), t
 `serve(state, TcpListener, shutdown) -> anyhow::Result<()>`: first `db::migrate`, then the router plus the context-cache listener
 (`memvault_recall::cache::spawn_listener`) and recorder upkeep; `memvault serve` and the end-to-end test use it.
 CLI `memvault`: `serve [--host] [--port]` (graceful shutdown on SIGINT/SIGTERM), `worker`
-(`memvault_worker::run_worker_with(state, batch_embedder(&state), shutdown)`), `planner [--space-id]`,
+(`memvault_worker::run_worker_with(state, batch_embedder(&state), shutdown)`), `planner [--space-id]` (the nightly pass: trigger `nightly`),
 `migrate [--dsn]`,
 `admin <args...>` -> `memvault_consolidate::admin_cli::run` (including `admin doctor [--json]`, the checks of `GET /v1/admin/doctor`), `evals <args...>` -> `memvault_evals::cli::run`.
 
@@ -361,7 +370,7 @@ CLI `memvault`: `serve [--host] [--port]` (graceful shutdown on SIGINT/SIGTERM),
 | `cache::spawn_listener(AppState, CancellationToken) -> JoinHandle<()>` | recall | 11.6 |
 | `cache::rerender(&AppState, &RenderContextJob) -> Result<bool, ApiError>` | recall | 11.6 |
 | `mcp::service(AppState) -> axum::Router` (applies its own bearer auth; mount with `nest_service("/mcp", ..)`) | memories | 7 |
-| `planner::run_planner(&AppState, Option<Uuid>) -> Result<ConsolidateResponse, ApiError>` | consolidate | 12.1 |
+| `planner::run_planner(&AppState, Option<Uuid>) -> Result<ConsolidateResponse, ApiError>` (trigger `manual`; `run_planner_with(&AppState, &PlanOptions, now)` takes space, scope and trigger) | consolidate | 12.1 |
 | `admin_cli::run(AppState, Vec<String>) -> anyhow::Result<()>` | consolidate | 5.2, 6.7 |
 | `run_worker(AppState, CancellationToken) -> anyhow::Result<()>` (embeds via `state.tei`; tests) | worker | 14 |
 | `run_worker_with(AppState, Arc<dyn Embedder>, CancellationToken)`, `batch_embedder(&AppState) -> Arc<dyn Embedder>` | worker | 13, 14 |

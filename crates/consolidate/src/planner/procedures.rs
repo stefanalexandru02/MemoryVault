@@ -10,6 +10,7 @@ use sha2::{Digest, Sha256};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use super::scope::ScopeFilter;
 use super::{NewPacket, Tally, create_packet};
 use crate::audit::AuditCtx;
 
@@ -23,6 +24,7 @@ pub async fn plan(
     conn: &mut PgConnection,
     state: &AppState,
     ctx: &AuditCtx,
+    filter: &ScopeFilter,
     tally: &mut Tally,
 ) -> Result<(), ApiError> {
     let space_id = ctx.space_id;
@@ -37,7 +39,7 @@ pub async fn plan(
     .bind(MIN_SESSIONS)
     .fetch_all(&mut *conn)
     .await?;
-    for (kind, key, task_class) in groups {
+    for (kind, key, task_class) in groups.into_iter().filter(|(kind, key, _)| filter.allows(*kind, key)) {
         let group = format!("{kind}:{key}|{task_class}");
         let open: bool = sqlx::query_scalar(
             "SELECT EXISTS (SELECT 1 FROM work_packets WHERE space_id = $1 AND kind = 'consolidate_procedures'

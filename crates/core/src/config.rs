@@ -64,6 +64,12 @@ pub struct Settings {
     pub retention_packets_days: i64,
     pub retention_logs_days: i64,
 
+    // --- consolidation triggers ---
+    /// New observations in a scope since it was last planned that queue a planner run; 0 turns the trigger off.
+    pub consolidate_observation_threshold: i64,
+    /// A scope is planned at most once per interval; the nightly pass skips scopes planned inside it.
+    pub consolidate_min_interval: Duration,
+
     // --- HTTP server, logging ---
     pub host: String,
     pub port: u16,
@@ -106,6 +112,8 @@ impl Default for Settings {
             retention_events_payload_days: 30,
             retention_packets_days: 90,
             retention_logs_days: 180,
+            consolidate_observation_threshold: 25,
+            consolidate_min_interval: Duration::from_secs(900),
             host: "0.0.0.0".into(),
             port: 8000,
             log_level: "info".into(),
@@ -179,6 +187,11 @@ impl Settings {
             retention_events_payload_days: parse("RETENTION_EVENTS_PAYLOAD_DAYS", d.retention_events_payload_days)?,
             retention_packets_days: parse("RETENTION_PACKETS_DAYS", d.retention_packets_days)?,
             retention_logs_days: parse("RETENTION_LOGS_DAYS", d.retention_logs_days)?,
+            consolidate_observation_threshold: parse(
+                "CONSOLIDATE_OBSERVATION_THRESHOLD",
+                d.consolidate_observation_threshold,
+            )?,
+            consolidate_min_interval: secs("CONSOLIDATE_MIN_INTERVAL_S", d.consolidate_min_interval)?,
             host: var("HOST").unwrap_or(d.host),
             port: parse("PORT", d.port)?,
             log_level: var("LOG_LEVEL").unwrap_or(d.log_level),

@@ -32,7 +32,8 @@ enum Command {
     },
     /// Run the worker loop (embed jobs, sweeps, re-render, retention); waits for the API to migrate.
     Worker,
-    /// Run one consolidation planning pass (waits for the schema, like the worker).
+    /// Run one nightly consolidation pass (waits for the schema, like the worker); scopes planned by a
+    /// triggered run within CONSOLIDATE_MIN_INTERVAL_S are left out.
     Planner {
         #[arg(long)]
         space_id: Option<uuid::Uuid>,
@@ -100,7 +101,8 @@ async fn main() -> anyhow::Result<()> {
         Command::Planner { space_id } => {
             let state = AppState::connect(settings, all_appliers()).await?;
             db::wait_for_schema(&state.db.system, SCHEMA_WAIT).await?;
-            let result = memvault_consolidate::planner::run_planner(&state, space_id).await?;
+            let options = memvault_consolidate::planner::PlanOptions::nightly(space_id);
+            let result = memvault_consolidate::planner::run_planner_for(&state, &options).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
         }

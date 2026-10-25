@@ -15,8 +15,9 @@ successfully, so it cannot slow or break a session. When the server cannot be re
 **Extraction.** Raw events are not what gets recalled. After a burst of activity, `mem-hook observe` leases a work
 packet from the server and runs it through `claude -p` on this machine, using the user's own Claude login. The
 model turns the events into short observations (what was learned or built), session summaries and candidate
-facts. The server never calls a model and holds no Claude credentials. A nightly consolidation merges
-duplicates, resolves contradictions and lets old entries fade.
+facts. The server never calls a model and holds no Claude credentials. Consolidation, which runs nightly and
+also soon after a session ends or a project has gathered enough new observations, merges duplicates, resolves
+contradictions and lets old entries fade.
 
 **Storage.** Everything lives in the user's own Postgres behind the MemoryVault server. Each user has private
 spaces plus any spaces shared with them; access is enforced in the database. Tokens are per device and can be

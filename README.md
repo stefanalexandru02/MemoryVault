@@ -35,7 +35,7 @@ and the rationale is in [docs/architecture.md](docs/architecture.md).
 
 `docker-compose.yml` runs the whole server on one machine: Postgres (ParadeDB, which bundles pgvector and
 `pg_search`), the two TEI servers, migrations, the API, the worker and a scheduler that runs a consolidation
-planning pass once a day. The `Makefile` wraps it; `make` lists every target.
+planning pass once a day (the worker also plans a project after its sessions end, see below). The `Makefile` wraps it; `make` lists every target.
 
 ```bash
 make up              # creates .env with fresh secrets, builds the image, starts everything (viewer at /viewer)
@@ -260,6 +260,25 @@ entry. Cron has a minimal `PATH`, so set `CLAUDE_BIN` in the config:
 0 3 * * *  /path/to/clients/claude-code-plugin/bin/mem-hook observe --all --max 50
 ```
 
+### When consolidation runs
+
+The planner runs from four triggers, and every run records which one started it:
+
+- `nightly`: `memvault planner`, which the compose `scheduler` and the Kubernetes CronJob run. It plans every scope
+  except those planned within the last `CONSOLIDATE_MIN_INTERVAL_S`.
+- `session_end`: once a session has ended and its extract packets have settled, the server queues a `plan` job for
+  each scope the session wrote observations in. The worker runs the planner restricted to that scope.
+- `threshold`: the same job, queued when a scope has `CONSOLIDATE_OBSERVATION_THRESHOLD` (default 25, 0 turns it
+  off) new observations since it was last planned.
+- `manual`: `POST /v1/admin/consolidate` and `memvault admin consolidate now`, which accept a `scope` to restrict
+  the run and ignore the interval.
+
+A scope has at most one waiting `plan` job, and it is planned at most once per `CONSOLIDATE_MIN_INTERVAL_S`
+(default 900): a job that comes up inside the interval goes back in the queue until it is over. Runs are listed by
+`GET /v1/admin/consolidation` and `memvault admin consolidate runs`, in the viewer's Admin tab (with the queued
+`plan` jobs), and `memsvc_planner_runs_total{trigger}` and `memsvc_consolidation_actions_total{action,trigger}` count
+them. `GET /v1/admin/jobs` and `memvault admin jobs list` show the trigger and scope of each `plan` job.
+
 ## Deploying to Kubernetes
 
 The base is in `deploy/k8s/base` and runs in namespace `memory`. The `home` overlay sets the image names,
@@ -340,7 +359,8 @@ live run.
 `consolidate_procedures` packets, apply rules with audit rows, revert, the nightly runner
 (`mem-hook observe --all`), the `explain` endpoint and tool, incremental decay, day and week summaries, and
 eval replay in CI against `evals/baseline.json`. Open: the planted-contradiction check (resolved in one nightly
-run, then reverted) needs a live run. The on-demand consolidation trigger from architecture 5.4 is not built.
+run, then reverted) needs a live run. Triggered consolidation is built (see "When consolidation runs"); the
+trigger on a candidate backlog or an old conflict from architecture 5.4 is not.
 
 **Phase 4: polish.** Built: procedure mining (through `consolidate_procedures`) and the Rust hook binary for
 Linux. The hook code type-checks for Windows but has not been run there. The RLS test suite exists in the crate

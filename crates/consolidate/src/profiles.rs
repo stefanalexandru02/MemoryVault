@@ -11,6 +11,8 @@ use memvault_core::schemas::memories::{UNCONFIRMED_AFTER_DAYS, fact_caution};
 use sqlx::PgConnection;
 use uuid::Uuid;
 
+use crate::planner::scope::ScopeFilter;
+
 /// Token budget of one rendered profile.
 pub const PROFILE_MAX_TOKENS: i32 = 400;
 
@@ -153,9 +155,9 @@ pub async fn refresh_scope(
     Ok(true)
 }
 
-/// [`refresh_scope`] for every scope that has facts or a profile (planner step 5). Returns the
-/// number of profiles written or removed.
-pub async fn refresh_space(conn: &mut PgConnection, space_id: Uuid) -> Result<i64, sqlx::Error> {
+/// [`refresh_scope`] for every scope of `filter` that has facts or a profile (planner step 5). Returns
+/// the number of profiles written or removed.
+pub async fn refresh_space(conn: &mut PgConnection, space_id: Uuid, filter: &ScopeFilter) -> Result<i64, sqlx::Error> {
     let scopes: Vec<(ScopeKind, String)> = sqlx::query_as(
         "SELECT scope_kind, scope_key FROM facts WHERE space_id = $1 AND status = 'active'
          UNION SELECT scope_kind, scope_key FROM profiles WHERE space_id = $1
@@ -165,7 +167,7 @@ pub async fn refresh_space(conn: &mut PgConnection, space_id: Uuid) -> Result<i6
     .fetch_all(&mut *conn)
     .await?;
     let mut changed = 0;
-    for (kind, key) in scopes {
+    for (kind, key) in scopes.into_iter().filter(|(kind, key)| filter.allows(*kind, key)) {
         changed += i64::from(refresh_scope(conn, space_id, kind, &key).await?);
     }
     Ok(changed)

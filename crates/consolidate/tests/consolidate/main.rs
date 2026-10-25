@@ -11,3 +11,4 @@ mod e2e;
 mod feedback;
 mod planner;
 mod revert;
+mod triggers;

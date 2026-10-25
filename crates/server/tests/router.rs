@@ -68,6 +68,8 @@ async fn viewer_is_served_with_a_strict_content_security_policy(pool: PgPool) {
     assert!(!js.contains(".innerHTML") && !js.contains("insertAdjacentHTML(") && !js.contains("document.write("));
     // The Admin tab's Health panel reads the doctor endpoint.
     assert!(js.contains("/v1/admin/doctor"));
+    // ... and the Consolidation runs panel lists planner runs and queued plan jobs with their trigger.
+    assert!(js.contains("/v1/admin/consolidation?limit=") && js.contains("/v1/admin/jobs?type=plan"));
     // The detail pane lists a fact's or procedure's versions, and the search bar can ask for a past day.
     assert!(js.contains("/history`") && js.contains("p.set('as_of'"));
     // Helpful / wrong / outdated buttons post feedback on the open memory.

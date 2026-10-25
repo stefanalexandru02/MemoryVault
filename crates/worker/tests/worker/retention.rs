@@ -60,10 +60,22 @@ async fn trims_old_events_and_deletes_old_rows(pool: PgPool) {
     .await
     .unwrap();
 
+    for age in ["200 days", "1 day"] {
+        sqlx::query(&format!(
+            "INSERT INTO planner_runs (run_id, space_id, trigger, created_at)
+             VALUES ($1, $2, 'nightly', now() - interval '{age}')"
+        ))
+        .bind(new_id())
+        .bind(s)
+        .execute(&e.pool)
+        .await
+        .unwrap();
+    }
+
     let report = run_retention(&e.pool, &e.state.settings).await.unwrap();
     assert_eq!(report.events_trimmed, 1);
     assert_eq!(report.packets_deleted, 1);
-    assert_eq!(report.logs_deleted, 1);
+    assert_eq!(report.logs_deleted, 2, "an access log row and a planner run");
 
     let (trimmed, kind, excerpt): (bool, String, String) =
         sqlx::query_as("SELECT payload_trimmed, payload->>'kind', payload->>'excerpt' FROM events WHERE seq = 1")

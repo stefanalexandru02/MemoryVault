@@ -97,7 +97,7 @@ claude-mem is ~1,700 TypeScript files across a Claude Code plugin, a local Bun w
 
 **Data flow, read side:** `POST /v1/recall` → scope resolution → hybrid candidate retrieval (BM25 + cosine, RRF) per tier → rerank by recency × importance × confidence → MMR diversity → fill per-slot token budgets → return JSON + rendered markdown → log to `retrieval_log`.
 
-**Consolidation:** nightly CronJob (and when `fact_candidates` backlog > threshold) → work packets → a nightly runner with Claude returns merge/supersede/retract decisions written to `facts` with full `memory_audit` trail → decay/archival → weekly summaries → procedure mining → regenerate cached `profile` block per scope.
+**Consolidation:** nightly CronJob (and scoped runs after a session ends or a scope gathers enough new observations) → work packets → a nightly runner with Claude returns merge/supersede/retract decisions written to `facts` with full `memory_audit` trail → decay/archival → weekly summaries → procedure mining → regenerate cached `profile` block per scope.
 
 ---
 
@@ -296,7 +296,7 @@ In-session option: the main Claude Code agent can also call `memory_remember` fo
 
 ### 5.4 Consolidation (offline, planned by the server, run on Claude by a runner)
 
-A CronJob at 03:00 plus an on-demand trigger when `facts WHERE status='candidate'` exceeds 50 or a conflict is older than 24 h. The server plans the work (clusters, decay set, summary periods) as packets; the nightly runner leases them, runs Opus, and posts decisions back. The server validates and applies. Runs per scope, in stages, each writing `memory_audit` rows with `run_id` so a run can be reversed:
+A CronJob at 03:00 plus scoped runs that react to activity, as Letta's sleep-time agent does: the end of a session (once its extract packets have settled) or `CONSOLIDATE_OBSERVATION_THRESHOLD` new observations in a scope queue a `plan` job for that scope, debounced to one waiting job per scope and one run per scope per `CONSOLIDATE_MIN_INTERVAL_S`; the nightly pass skips scopes planned inside that interval. Every run records its trigger (`nightly`, `session_end`, `threshold`, `manual`) in `planner_runs`. A trigger on the candidate backlog (more than 50) or a conflict older than 24 h is not built. The server plans the work (clusters, decay set, summary periods) as packets; the nightly runner leases them, runs Opus, and posts decisions back. The server validates and applies. Runs per scope, in stages, each writing `memory_audit` rows with `run_id` so a run can be reversed:
 
 1. **Fact resolution.** Cluster candidates with existing facts by `(subject, predicate)` and by cosine similarity > 0.85 on `value` parts. For each cluster the Opus-class model returns one of `merge_into(id)`, `supersede(id, new_value, valid_from)`, `keep_both`, `retract(id, reason)`, `promote_scope(global)`, with a justification. Code applies the decision; the model never writes SQL. Confidence is recomputed: `conf = 1 - Π(1 - c_i)` over independent confirmations, capped at 0.98 unless pinned.
 2. **Decay and archival.** `importance *= 2^(-age_days / half_life[tier,type])` with half-lives of 14 days for `change/discovery` observations, 90 days for `decision/bugfix`, 365 days for facts; each access resets part of the decay (`+0.1`, capped). Observations below 0.05 importance and older than 60 days are `archived_at`. Facts never decay below 0.1 and are never archived; they are only superseded.
@@ -369,7 +369,7 @@ A small Python client (`httpx`) with `ingest(events)`, `recall(scopes, query, bu
 | `postgres` | CloudNativePG `Cluster`, 1 instance, Postgres 17 image with pgvector and `pg_search` | 20–50 GB PVC; continuous WAL archiving and nightly base backup to S3/MinIO; `pg_dump` weekly as belt-and-braces. The only stateful piece. |
 | `memory-api` | Deployment ×2, HPA on CPU | FastAPI + asyncpg; readiness probe runs `SELECT 1`; serves REST and `/mcp`. |
 | `memory-worker` | Deployment ×1 | Python only. Hands out work packets with leases, validates and applies posted results, writes embeddings, re-queues expired leases. No model credential. |
-| `memory-consolidate` | CronJob `0 3 * * *` + `kubectl create job --from` for on-demand | Plans the Section 5.4 stages as packets; applies the decisions the runner posts back. |
+| `memory-consolidate` | CronJob `0 3 * * *` + `kubectl create job --from` for on-demand; the worker runs the scoped `plan` jobs | Plans the Section 5.4 stages as packets; applies the decisions the runner posts back. |
 | `embeddings` | Deployment, HuggingFace text-embeddings-inference, CPU | Model `bge-m3` (1024d, multilingual) or `multilingual-e5-base`. claude-mem measured a large recall gap for non-English text on MiniLM; pick multilingual from the start since re-embedding later costs hours. A second TEI container serves `bge-reranker-v2-m3` for reranking. |
 | Runners (outside the cluster) | Claude Code hooks; the agentic OS; a nightly task in the OS or `claude -p` on a cron | Lease packets from `/v1/work/lease`, run Claude on their own login, post results. Nothing in the cluster stores a Claude credential. |
 | Ingress | Tailscale operator or Traefik + cert-manager | Private by default; Bearer token per client; optional mTLS. |

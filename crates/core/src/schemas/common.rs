@@ -185,6 +185,17 @@ str_enum!(
     }
 );
 
+str_enum!(
+    /// What started a planner run: the nightly pass, the end of a session, enough new observations in a scope, or
+    /// an operator (`POST /v1/admin/consolidate`, `memvault admin consolidate now`).
+    PlanTrigger {
+        Nightly = "nightly",
+        SessionEnd = "session_end",
+        Threshold = "threshold",
+        Manual = "manual",
+    }
+);
+
 str_enum!(EventKind {
     UserPrompt = "user_prompt",
     AssistantMessage = "assistant_message",
