@@ -56,6 +56,10 @@ The API and Postgres bind to `127.0.0.1` by default. To serve other machines, se
 to the host's LAN or Tailscale address and use `MEMORY_URL=http://<that address>:8000` on the clients.
 `.env` holds `TOKEN_PEPPER`; tokens stop working if it changes, so back it up.
 
+On a Mac, the stack runs in Docker Desktop's Linux VM on the CPU (no Metal). The Makefile selects TEI's arm64 image
+on Apple Silicon. The two models need about 5 GB of RAM together, so give Docker Desktop at least 8 GB
+(Settings → Resources).
+
 ## Local development
 
 ### Toolchain
@@ -185,8 +189,8 @@ kubectl apply -k deploy/k8s/overlays/home
 
 Before the first apply, change the placeholder values in the overlay: `ghcr.io/REPLACE-OWNER/...` for the images, and
 the MinIO endpoint and bucket for backups. Build and push the images from `deploy/docker/server.Dockerfile`
-and, if you use the fallback, `deploy/docker/postgres.Dockerfile`. Confirm the TEI image tag `cpu-1.8` exists
-on `ghcr.io` before the first apply.
+and, if you use the fallback, `deploy/docker/postgres.Dockerfile`. The TEI manifests use the x86_64 image `cpu-1.9.4`; on arm64 nodes,
+switch to `cpu-arm64-1.9.4`.
 
 ### Secrets
 

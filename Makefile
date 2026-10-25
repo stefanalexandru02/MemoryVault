@@ -18,6 +18,14 @@ endif
 MEMVAULT_PORT ?= 8000
 PG_PORT       ?= 55432
 BIND_ADDR     ?= 127.0.0.1
+# TEI's CPU images are single-architecture: arm64 has its own tag. cpu-1.8 was the default in .env files
+# written before arm64 support and has no arm64 build, so it is treated as unset.
+TEI_TAG       := $(if $(filter arm64 aarch64,$(shell uname -m)),cpu-arm64-1.9.4,cpu-1.9.4)
+ifneq (,$(filter %:cpu-1.8,$(TEI_IMAGE)))
+TEI_IMAGE     :=
+endif
+TEI_IMAGE     := $(or $(TEI_IMAGE),ghcr.io/huggingface/text-embeddings-inference:$(TEI_TAG))
+export TEI_IMAGE
 API_HOST      := $(if $(filter 0.0.0.0,$(BIND_ADDR)),127.0.0.1,$(BIND_ADDR))
 MEMORY_URL    ?= http://$(API_HOST):$(MEMVAULT_PORT)
 
@@ -31,6 +39,7 @@ help: ## List the targets
 	@awk 'BEGIN {FS = ":.*## "} /^[a-zA-Z_-]+:.*## / {printf "  \033[36m%-15s\033[0m %s\n", $$1, $$2}' $(MAKEFILE_LIST)
 	@echo
 	@echo "  Variables: HANDLE=$(HANDLE) NAME=$(NAME) CLIENT=$(CLIENT) KIND=$(KIND) MEMORY_URL=$(MEMORY_URL)"
+	@echo "  TEI image: $(TEI_IMAGE)"
 
 env: .env ## Create .env with fresh secrets (kept if it exists)
 

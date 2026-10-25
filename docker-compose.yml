@@ -59,7 +59,7 @@ services:
       retries: 30
 
   tei-embed:
-    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.8}
+    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}
     profiles: ["tei"]
     restart: unless-stopped
     command: ["--model-id", "BAAI/bge-m3", "--max-batch-tokens", "16384", "--port", "8080"]
@@ -67,7 +67,7 @@ services:
       - tei-models:/data
 
   tei-rerank:
-    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.8}
+    image: ${TEI_IMAGE:-ghcr.io/huggingface/text-embeddings-inference:cpu-1.9.4}
     profiles: ["tei"]
     restart: unless-stopped
     command: ["--model-id", "BAAI/bge-reranker-v2-m3", "--port", "8080"]

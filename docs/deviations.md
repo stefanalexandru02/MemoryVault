@@ -438,7 +438,8 @@ and repeated items are merged. The last section lists the gaps that are still op
 - **TEI security context.** The pod runs with `runAsNonRoot`, UID, GID and `fsGroup` 1000, and the `RuntimeDefault`
   seccomp profile. The image `USER` could not be verified, because the config blob host was blocked from the build
   environment. The explicit UID does not depend on the image `USER`, but verify before the first apply.
-- **TEI image tag.** The tag `cpu-1.8` is a guess. Confirm that it exists on `ghcr.io` before the first apply.
+- **TEI image tag.** `cpu-1.9.4` (x86_64 only). arm64 nodes and Apple Silicon need `cpu-arm64-1.9.4`; the compose
+  Makefile picks the tag from `uname -m`. Both tags were checked against the ghcr.io registry.
 - **Postgres image.** `postgres.Dockerfile` is the fallback. The first choice is the ParadeDB CNPG image. The package
   names assume the PGDG apt repository is in the CNPG base image, and `pg_search` comes from a `.deb` URL build arg.
   Neither was built, because no Docker daemon was available.
