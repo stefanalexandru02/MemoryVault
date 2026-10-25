@@ -31,6 +31,15 @@ async fn replays_the_example_set(pool: PgPool) {
     assert_eq!(report.contradictions, 0);
     assert!(baseline_regression(&report, set.baseline.as_ref().unwrap()).is_none());
     assert!(baseline_regression(&report, &Baseline { recall_at_5: 1.0 }).is_none());
+
+    // The three injection modes over the same questions. The set is small enough for the full block to hold all of
+    // it, lean holds none of it, and smart finds what the question shares words with.
+    let by_mode = |m: &str| report.injection.iter().find(|i| i.mode == m).unwrap();
+    let (full, lean, smart) = (by_mode("full"), by_mode("lean"), by_mode("smart"));
+    assert!(full.found >= smart.found && smart.found > lean.found, "{:?}", report.injection);
+    assert!(lean.tokens < full.tokens && lean.tokens < smart.tokens + 1.0, "{:?}", report.injection);
+    assert!(smart.tokens - lean.tokens <= 250.0, "the prompt adds at most 250 tokens: {:?}", report.injection);
+    assert!(smart.prompt_injections.unwrap() >= 1 && full.prompt_injections.is_none());
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -60,6 +69,7 @@ fn a_recall_drop_over_five_percent_fails_the_baseline() {
         contradictions: 0,
         packets_failed: 0,
         per_question: vec![],
+        injection: vec![],
     };
     let baseline = Baseline { recall_at_5: 1.0 };
     assert!(baseline_regression(&report, &baseline).is_none());

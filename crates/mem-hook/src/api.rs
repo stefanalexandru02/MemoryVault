@@ -18,6 +18,8 @@ pub struct Resp {
     pub body: String,
     /// Seconds from a `Retry-After` header.
     pub retry_after: Option<u64>,
+    /// The `X-Memory-Injection` header: the mode the server rendered a context block in.
+    pub injection: Option<String>,
 }
 
 impl Resp {
@@ -72,6 +74,7 @@ fn finish(result: Result<ureq::http::Response<ureq::Body>, ureq::Error>) -> Resu
     let status = resp.status().as_u16();
     let retry_after =
         resp.headers().get("retry-after").and_then(|v| v.to_str().ok()).and_then(|v| v.trim().parse().ok());
+    let injection = resp.headers().get("x-memory-injection").and_then(|v| v.to_str().ok()).map(str::to_string);
     let body = resp.body_mut().read_to_string().map_err(|e| e.to_string())?;
-    Ok(Resp { status, body, retry_after })
+    Ok(Resp { status, body, retry_after, injection })
 }

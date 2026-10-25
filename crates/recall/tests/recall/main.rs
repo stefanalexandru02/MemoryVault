@@ -6,3 +6,4 @@ mod context;
 mod documents;
 mod engine;
 mod routes;
+mod smart;

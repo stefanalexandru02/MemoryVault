@@ -353,6 +353,25 @@ impl ContextQuery {
     }
 }
 
+/// `POST /v1/context/prompt`: the first prompt of a session, for the memories it matches (smart injection).
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PromptContextRequest {
+    pub prompt: String,
+    #[serde(default)]
+    pub project_key: Option<String>,
+    #[serde(default)]
+    pub device_id: Option<String>,
+}
+
+impl PromptContextRequest {
+    pub fn validate(&self) -> Result<(), ApiError> {
+        if self.prompt.trim().is_empty() {
+            return Err(ApiError::invalid("prompt must not be empty"));
+        }
+        Ok(())
+    }
+}
+
 /// `GET`/`PUT /v1/me/settings`: the caller's server-side defaults.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserSettings {

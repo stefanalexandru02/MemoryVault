@@ -74,6 +74,7 @@ pub fn run(event: &str) {
     match event {
         "session-start" => session_start(&mut hook),
         "prompt" => {
+            inject::prompt_context(&hook);
             let prompt = hook.field("prompt");
             record(&hook, "user_prompt", json!({ "prompt": prompt }), true);
         }
@@ -294,6 +295,9 @@ fn session_start(hook: &mut Hook) {
         query.push_str(&format!("&types={}", cfg.context_types.join(",")));
     }
     let fetched = hook.app.api.get(&query, CONTEXT_TIMEOUT).ok().filter(|r| r.ok());
+    // In smart mode the first prompt of the session asks the server for the memories it matches.
+    let smart = fetched.as_ref().is_some_and(|r| r.injection.as_deref() == Some("smart"));
+    store::set_smart_pending(&home, &hook.target.claude_session_id, smart);
     let block = match fetched {
         Some(resp) => {
             store::save_context(&home, key, &resp.body);

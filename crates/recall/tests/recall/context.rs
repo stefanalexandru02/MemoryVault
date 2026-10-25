@@ -456,7 +456,7 @@ async fn index_rows_and_types_shape_the_block_and_the_cache(pool: PgPool) {
     let state = &w.state;
     let render = |rows: Option<u32>, types: Vec<ObservationType>| async move {
         let options = context::ContextOptions { mode: Some(InjectionMode::Full), rows, types };
-        context::render_context_with(state, id, Some(PROJECT), None, "startup", &options).await
+        context::render_context_with(state, id, Some(PROJECT), None, "startup", &options).await.map(|b| b.body)
     };
 
     // The second take of a family is a near-duplicate of the first, so six families make six rows however many are
@@ -497,7 +497,7 @@ async fn index_rows_and_types_shape_the_block_and_the_cache(pool: PgPool) {
     let lean = |rows: Option<u32>| async move {
         let options =
             context::ContextOptions { mode: Some(InjectionMode::Lean), rows, types: vec![ObservationType::Bugfix] };
-        context::render_context_with(state, id, Some(PROJECT), None, "startup", &options).await
+        context::render_context_with(state, id, Some(PROJECT), None, "startup", &options).await.map(|b| b.body)
     };
     sqlx::query("DELETE FROM context_cache").execute(&w.pool).await.unwrap();
     assert_eq!(lean(Some(3)).await.unwrap(), lean(None).await.unwrap());
@@ -531,7 +531,8 @@ async fn the_index_mixes_types_instead_of_filling_up_with_one(pool: PgPool) {
     let options = context::ContextOptions { mode: Some(InjectionMode::Full), rows: Some(8), types: vec![] };
     let md = context::render_context_with(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", &options)
         .await
-        .unwrap();
+        .unwrap()
+        .body;
     assert_eq!(index_rows(&md), 8);
     // Three bug fixes (a third of the rows), the other types, then the bug fixes the limit held back.
     for title in ["Chose Postgres", "Added a CSV export", "Cache misses"] {

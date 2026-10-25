@@ -273,6 +273,7 @@ fn context_query_rows_and_types() {
 fn injection_mode_spellings() {
     assert_eq!(InjectionMode::default(), InjectionMode::Full);
     assert_eq!("lean".parse::<InjectionMode>().unwrap(), InjectionMode::Lean);
+    assert_eq!("smart".parse::<InjectionMode>().unwrap(), InjectionMode::Smart);
     assert!("fat".parse::<InjectionMode>().is_err());
     assert_eq!(serde_json::to_value(InjectionMode::Lean).unwrap(), json!("lean"));
     // A request names a mode or leaves the choice to the user's default; the settings body must name one.

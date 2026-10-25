@@ -38,12 +38,15 @@ pub struct State {
     /// Event posts whose body contains this text are answered 500 (a request the server chokes on).
     pub poison: Option<String>,
     pub context: Option<String>,
+    /// The `X-Memory-Injection` header of `GET /v1/context`.
+    pub injection: Option<String>,
     /// Rows of `GET /v1/observations/by-file`.
     pub by_file: Vec<Value>,
     /// Reply of `POST /v1/context/prompt` (the text may be empty); None = 404.
     pub prompt_context: Option<String>,
-    /// Every reply is held back this long.
+    /// Replies to paths starting with `delayed` (every path by default) are held back this long.
     pub reply_delay: Duration,
+    pub delayed: String,
     pub packets: VecDeque<Value>,
     /// Replies for `POST /v1/work/{id}/result`; empty = 200.
     pub result_replies: VecDeque<(u16, Value)>,
@@ -78,9 +81,11 @@ impl Fake {
             next_seq: 0,
             poison: None,
             context: None,
+            injection: None,
             by_file: vec![],
             prompt_context: None,
             reply_delay: Duration::ZERO,
+            delayed: String::new(),
             packets: VecDeque::new(),
             result_replies: VecDeque::new(),
             me_status: 200,
@@ -185,20 +190,30 @@ fn handle(mut stream: TcpStream, shared: &Arc<Mutex<State>>) {
         buf.extend_from_slice(&chunk[..n]);
     }
     let body: Value = serde_json::from_slice(&buf[header_end..]).unwrap_or(Value::Null);
+    let is_context = method == "GET" && path.split('?').next() == Some("/v1/context");
+    let delayed = shared.lock().unwrap().delayed.clone();
+    let slow = path.starts_with(&delayed);
     let req = Req { method, path, headers, body };
 
-    let (status, ctype, reply, delay) = {
+    let (status, ctype, reply, delay, injection) = {
         let mut state = shared.lock().unwrap();
         let (status, ctype, reply) = route(&mut state, req);
-        (status, ctype, reply, state.reply_delay)
+        (
+            status,
+            ctype,
+            reply,
+            if slow { state.reply_delay } else { Duration::ZERO },
+            state.injection.clone().filter(|_| is_context),
+        )
     };
     std::thread::sleep(delay);
+    let injection = injection.map(|mode| format!("X-Memory-Injection: {mode}\r\n")).unwrap_or_default();
     let text = reply.to_string();
     let text = if ctype == "text/markdown" { reply.as_str().unwrap_or_default().to_string() } else { text };
     let retry_after = if status == 429 { "Retry-After: 0\r\n" } else { "" };
     let _ = write!(
         stream,
-        "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\n{retry_after}Content-Length: {}\r\nConnection: close\r\n\r\n{text}",
+        "HTTP/1.1 {status} X\r\nContent-Type: {ctype}\r\n{retry_after}{injection}Content-Length: {}\r\nConnection: close\r\n\r\n{text}",
         text.len()
     );
 }

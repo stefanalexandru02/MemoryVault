@@ -23,7 +23,7 @@ use memvault_core::http::api_router;
 use memvault_core::schemas::common::OutputSchemaName;
 use memvault_core::schemas::prompts::PromptSpec;
 use memvault_core::schemas::recall::RecallResponse;
-use memvault_core::{AppState, AppliersRegistry, Db, system_tx};
+use memvault_core::{AppState, AppliersRegistry, Db, estimate_tokens, system_tx};
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
 use sqlx::PgPool;
@@ -165,6 +165,21 @@ pub struct Report {
     pub contradictions: i64,
     pub packets_failed: usize,
     pub per_question: Vec<QuestionResult>,
+    /// What each injection mode puts in front of the model before it asks for anything (see [`InjectionResult`]).
+    pub injection: Vec<InjectionResult>,
+}
+
+/// One injection mode over the questions. A question is asked as the first prompt of a new session on the project:
+/// `found` is the share of its expectations whose text is in what that session was handed (the SessionStart block,
+/// and in `smart` mode the memories for the question), without a single tool call; `tokens` is what it cost.
+#[derive(Debug, Clone, Serialize)]
+pub struct InjectionResult {
+    pub mode: String,
+    pub found: f64,
+    /// Mean estimated tokens handed over per question.
+    pub tokens: f64,
+    /// Questions for which the first prompt added memories (`smart` only).
+    pub prompt_injections: Option<usize>,
 }
 
 impl Report {
@@ -184,6 +199,12 @@ impl Report {
                 q.recall_at_5,
                 q.first_hit_rank.map_or("-".to_string(), |r| r.to_string())
             );
+        }
+        println!("injection          found in context without a tool call, tokens handed over per question");
+        for i in &self.injection {
+            let added =
+                i.prompt_injections.map_or(String::new(), |n| format!("  (first prompt added memories for {n})"));
+            println!("  {:<8} found {:.2}  tokens {:.0}{added}", i.mode, i.found, i.tokens);
         }
     }
 }
@@ -267,6 +288,7 @@ pub async fn replay(state: &AppState, set: &EvalSet, options: &ReplayOptions) ->
     for q in &set.questions {
         per_question.push(ask(&api, q, options.rerank).await?);
     }
+    let injection = injection_modes(&api, set).await?;
     let hits: Vec<&QuestionResult> = per_question.iter().filter(|q| q.first_hit_rank.is_some()).collect();
     let mean = |it: Vec<f64>| (!it.is_empty()).then(|| it.iter().sum::<f64>() / it.len() as f64);
     let facts = extracted_facts(state, space_id).await?;
@@ -280,6 +302,7 @@ pub async fn replay(state: &AppState, set: &EvalSet, options: &ReplayOptions) ->
         contradictions: facts.contradictions,
         packets_failed,
         per_question,
+        injection,
     })
 }
 
@@ -606,6 +629,81 @@ async fn ask(api: &Api, q: &Question, rerank: bool) -> Result<QuestionResult> {
         first_hit_rank: first.map(|i| i + 1),
         tokens_to_hit: first.map(|i| items[..=i].iter().map(|r| r.tokens).sum()),
     })
+}
+
+// ---------- injection modes ----------
+
+/// Whether the text (lowercase) contains what the expectation names: the title or summary text, or a fact's subject
+/// and predicate.
+fn in_text(e: &Expect, text: &str) -> bool {
+    let has = |needle: &str| text.contains(&needle.to_lowercase());
+    match (&e.observation, &e.fact, &e.summary) {
+        (Some(o), ..) => has(o),
+        (None, Some(f), _) => has(&f.predicate) && has(&f.subject),
+        (None, None, Some(s)) => has(s),
+        (None, None, None) => false,
+    }
+}
+
+/// Percent-encodes everything but unreserved characters.
+fn encode(s: &str) -> String {
+    s.bytes()
+        .map(|b| {
+            if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+                (b as char).to_string()
+            } else {
+                format!("%{b:02X}")
+            }
+        })
+        .collect()
+}
+
+/// `full`, `lean` and `smart` over the questions: each question is the first prompt of a new session on each project
+/// of the recorded sessions (the best project counts), see [`InjectionResult`].
+async fn injection_modes(api: &Api, set: &EvalSet) -> Result<Vec<InjectionResult>> {
+    let mut projects: Vec<&str> = set.sessions.iter().filter_map(|s| s.project_key.as_deref()).collect();
+    projects.sort_unstable();
+    projects.dedup();
+    let mut out = Vec::new();
+    for mode in ["full", "lean", "smart"] {
+        let (mut found, mut tokens, mut injections) = (0.0, 0.0, 0usize);
+        for q in &set.questions {
+            let (mut best, mut cost, mut added) = (0.0f64, 0.0, false);
+            for project in &projects {
+                let uri = format!("/v1/context?project_key={}&device_id=evals&mode={mode}", encode(project));
+                let (status, block) = api.call(Method::GET, &uri, None).await?;
+                if !status.is_success() {
+                    bail!("context for {project} in {mode} mode: {status} {block}");
+                }
+                let mut text = block.as_str().unwrap_or_default().to_string();
+                if mode == "smart" {
+                    let body = json!({"prompt": q.query, "project_key": project});
+                    let (status, extra) = api.post("/v1/context/prompt", body).await?;
+                    if !status.is_success() {
+                        bail!("prompt context for question {}: {status} {extra}", q.id);
+                    }
+                    let extra = extra.as_str().unwrap_or_default();
+                    added |= !extra.is_empty();
+                    text = format!("{text}\n{extra}");
+                }
+                let lower = text.to_lowercase();
+                let present = q.expect.iter().filter(|e| in_text(e, &lower)).count();
+                best = best.max(if q.expect.is_empty() { 1.0 } else { present as f64 / q.expect.len() as f64 });
+                cost += f64::from(estimate_tokens(&text));
+            }
+            found += best;
+            tokens += cost / projects.len() as f64;
+            injections += usize::from(added);
+        }
+        let n = set.questions.len().max(1) as f64;
+        out.push(InjectionResult {
+            mode: mode.to_string(),
+            found: found / n,
+            tokens: tokens / n,
+            prompt_injections: (mode == "smart").then_some(injections),
+        });
+    }
+    Ok(out)
 }
 
 // ---------- facts ----------

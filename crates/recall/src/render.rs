@@ -345,6 +345,16 @@ fn index_with_legend(entries: &[IndexEntry]) -> String {
     }
 }
 
+/// One line saying what the rows under it are.
+pub const SMART_HEADER: &str = "memory: earlier work that may matter for this prompt (memory_get id for details)";
+
+/// What smart injection adds for a prompt: [`SMART_HEADER`] and the rows as an index with the legend of the glyphs
+/// shown; empty for no rows.
+pub fn smart_block(entries: &[IndexEntry]) -> String {
+    let index = index_with_legend(entries);
+    if index.is_empty() { index } else { format!("{SMART_HEADER}\n{index}") }
+}
+
 fn row_entries(rows: &[IndexRow], collapse: bool) -> Vec<IndexEntry> {
     if !collapse {
         return rows.iter().map(IndexEntry::from_row).collect();

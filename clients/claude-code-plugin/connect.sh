@@ -1,12 +1,13 @@
 #!/usr/bin/env bash
 # Connects (or disconnects) this machine's Claude Code, Codex CLI or Gemini CLI to a MemoryVault server.
 #
-#   connect.sh connect --url URL [--token TOKEN] [--device ID] [--injection lean|full] [--client claude|codex|gemini]
+#   connect.sh connect --url URL [--token TOKEN] [--device ID] [--injection lean|full|smart] [--client claude|codex|gemini]
 #       builds mem-hook, writes ~/.memory/config, installs the hook plugin, registers the MCP server and
 #       pre-approves its tools. Without --token the token already in ~/.memory/config is kept. --injection
 #       writes MEM_INJECTION: "full" is the budgeted context block at session start, "lean" only the profile,
-#       open work and a short rubric for the search tools; without it the setting in the config (or, if there
-#       is none, the per-user default on the server) stays. --client picks the agent CLI (default claude):
+#       open work and a short rubric for the search tools, "smart" the lean block plus, on the first prompt of
+#       a session, the few memories that prompt matches (none when nothing is relevant); without it the
+#       setting in the config (or, if there is none, the per-user default on the server) stays. --client picks the agent CLI (default claude):
 #       codex and gemini register the MCP server and the `mem-hook event --client ...` hooks in that tool's own
 #       config file (see clients/README.md).
 #   connect.sh disconnect [--client claude|codex|gemini] [--purge]
@@ -413,7 +414,7 @@ cmd_connect() {
     esac
   done
   [ -n "$url" ] || die "--url is required"
-  case $injection in ""|lean|full) ;; *) die "--injection must be lean or full (got '$injection')" ;; esac
+  case $injection in ""|lean|full|smart) ;; *) die "--injection must be lean, full or smart (got '$injection')" ;; esac
   check_client "$client"
   url=$(normalize_url "$url")
   [ -n "$token" ] || token=$(cfg_get MEMORY_TOKEN)

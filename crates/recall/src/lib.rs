@@ -5,6 +5,7 @@
 //!   (shared with the MCP tools in memvault-memories; each opens its own `user_tx`).
 //! - [`context::render_context`]: the SessionStart block, used by `GET /v1/context` and by the
 //!   worker through [`cache::rerender`].
+//! - [`smart`]: `POST /v1/context/prompt`, the memories a session's first prompt matches (smart injection).
 //! - [`cache`]: context cache, `LISTEN memory_invalidate` loop.
 //! - [`settings`]: `GET`/`PUT /v1/me/settings` (the default injection mode); [`stats`]: `GET /v1/stats/recall`.
 //! - [`render`]: deterministic markdown (citations, index with glyph legend, bodies, trace).
@@ -16,17 +17,20 @@ pub mod engine;
 pub mod render;
 pub mod scoring;
 pub mod settings;
+pub mod smart;
 pub mod stats;
 
 use axum::Router;
 use axum::extract::State;
-use axum::http::{HeaderMap, HeaderValue, StatusCode, header};
+use axum::http::{HeaderMap, HeaderName, HeaderValue, StatusCode, header};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use memvault_core::auth::{MEMORIES_READ, MEMORIES_WRITE};
 use memvault_core::http::{Json, Path, Query};
 use memvault_core::schemas::memories::{ByFileQuery, GetRequest, SearchQuery, TimelineQuery};
-use memvault_core::schemas::recall::{ContextQuery, FeedbackRequest, RecallRequest, StatsQuery, UserSettings};
+use memvault_core::schemas::recall::{
+    ContextQuery, FeedbackRequest, PromptContextRequest, RecallRequest, StatsQuery, UserSettings,
+};
 use memvault_core::{ApiError, AppState, Identity, require_scope};
 use uuid::Uuid;
 
@@ -37,6 +41,7 @@ pub fn router() -> Router<AppState> {
         .route("/recall", post(recall))
         .route("/recall/{retrieval_id}/feedback", post(feedback))
         .route("/context", get(context))
+        .route("/context/prompt", post(prompt_context))
         .route("/search", get(search))
         .route("/timeline", get(timeline))
         .route("/memories/get", post(get_memories))
@@ -66,6 +71,10 @@ async fn feedback(
     Ok(Json(engine::feedback(&state, &identity, retrieval_id, body).await?))
 }
 
+/// The injection mode a context block was rendered in (absent for `resume`, which has none), for clients that
+/// act on it: `smart` asks them for the first prompt's memories.
+const INJECTION_HEADER: HeaderName = HeaderName::from_static("x-memory-injection");
+
 /// `text/markdown` with a strong ETag of the body; `If-None-Match` answers 304.
 async fn context(
     State(state): State<AppState>,
@@ -76,7 +85,7 @@ async fn context(
     require_scope(&state, &identity, MEMORIES_READ).await?;
     q.validate()?;
     let options = context::ContextOptions { mode: q.mode, rows: q.rows, types: q.types.unwrap_or_default() };
-    let body = context::render_context_with(
+    let block = context::render_context_with(
         &state,
         &identity,
         q.project_key.as_deref(),
@@ -85,22 +94,47 @@ async fn context(
         &options,
     )
     .await?;
+    let (body, mode) = (block.body, block.mode);
     let etag = cache::etag(&body);
     let etag_value = HeaderValue::from_str(&etag).map_err(|e| ApiError::internal(e.to_string()))?;
     let matches = headers
         .get(header::IF_NONE_MATCH)
         .and_then(|v| v.to_str().ok())
         .is_some_and(|v| v.split(',').any(|t| t.trim() == etag || t.trim() == "*"));
-    if matches {
-        return Ok((StatusCode::NOT_MODIFIED, [(header::ETAG, etag_value)]).into_response());
+    let mut response = if matches {
+        (StatusCode::NOT_MODIFIED, [(header::ETAG, etag_value)]).into_response()
+    } else {
+        (
+            [
+                (header::CONTENT_TYPE, HeaderValue::from_static("text/markdown; charset=utf-8")),
+                (header::ETAG, etag_value),
+                (header::CACHE_CONTROL, HeaderValue::from_static("private, no-cache")),
+            ],
+            body,
+        )
+            .into_response()
+    };
+    if let Some(mode) = mode {
+        response.headers_mut().insert(INJECTION_HEADER, HeaderValue::from_static(mode.as_str()));
     }
+    Ok(response)
+}
+
+/// The memories the first prompt of a session matches, as `text/markdown`; an empty body when none is relevant.
+async fn prompt_context(
+    State(state): State<AppState>,
+    identity: Identity,
+    Json(body): Json<PromptContextRequest>,
+) -> Result<Response, ApiError> {
+    require_scope(&state, &identity, MEMORIES_READ).await?;
+    body.validate()?;
+    let text = smart::prompt_context(&state, &identity, body).await?;
     Ok((
         [
             (header::CONTENT_TYPE, HeaderValue::from_static("text/markdown; charset=utf-8")),
-            (header::ETAG, etag_value),
-            (header::CACHE_CONTROL, HeaderValue::from_static("private, no-cache")),
+            (header::CACHE_CONTROL, HeaderValue::from_static("no-store")),
         ],
-        body,
+        text,
     )
         .into_response())
 }

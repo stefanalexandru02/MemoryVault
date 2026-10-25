@@ -21,6 +21,9 @@ pub struct Cache {
     /// Estimated tokens `file-context` has added to the session so far.
     #[serde(default)]
     pub file_context_tokens: u32,
+    /// Smart injection: the next prompt is the first since the session started in `smart` mode.
+    #[serde(default)]
+    pub smart_pending: bool,
 }
 
 pub fn sessions_dir(home: &Path) -> PathBuf {
@@ -105,6 +108,16 @@ pub fn take_file_context_budget(home: &Path, claude_sid: &str, tokens: u32, budg
         c.file_context_tokens = spent;
         true
     })
+}
+
+/// Whether the next prompt of the session may be answered with memories (set at session start in `smart` mode).
+pub fn set_smart_pending(home: &Path, claude_sid: &str, pending: bool) {
+    update_cache(home, claude_sid, |c| c.smart_pending = pending);
+}
+
+/// True once after `set_smart_pending(.., true)`: the first prompt of a smart session.
+pub fn take_smart_pending(home: &Path, claude_sid: &str) -> bool {
+    update_cache(home, claude_sid, |c| std::mem::take(&mut c.smart_pending))
 }
 
 /// What is left of the session's `budget` of `file-context` output.
@@ -193,6 +206,16 @@ mod tests {
         assert!(first_surface(dir.path(), "s2", "/a/b.rs"));
         // The sequence counters share the cache file and are untouched.
         assert_eq!(alloc_seq(dir.path(), "s1", false), 0);
+    }
+
+    #[test]
+    fn smart_injection_is_for_the_first_prompt_only() {
+        let dir = tempfile::tempdir().unwrap();
+        assert!(!take_smart_pending(dir.path(), "s1"));
+        set_smart_pending(dir.path(), "s1", true);
+        assert!(!take_smart_pending(dir.path(), "s2"));
+        assert!(take_smart_pending(dir.path(), "s1"));
+        assert!(!take_smart_pending(dir.path(), "s1"));
     }
 
     #[test]

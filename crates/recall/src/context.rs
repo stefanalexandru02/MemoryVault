@@ -4,7 +4,8 @@
 //! from `context_cache` ([`crate::cache`]); the health banner and since-you-were-here are computed
 //! live on every request and spliced in. The observation index is sized (`rows`) and limited (`types`) by the
 //! request; both are part of the cache key. In `lean` mode the block is only the profile, open work
-//! and a rubric for the pull tools ([`render::LEAN_RUBRIC`]), with no since-you-were-here.
+//! and a rubric for the pull tools ([`render::LEAN_RUBRIC`]), with no since-you-were-here; `smart` mode starts with
+//! the same block and adds memories for the first prompt ([`crate::smart`]).
 
 use std::time::Instant;
 
@@ -80,6 +81,13 @@ pub struct ContextOptions {
     pub types: Vec<ObservationType>,
 }
 
+/// A rendered block and the mode it was rendered in (None for a `resume`, which has no block).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ContextBlock {
+    pub body: String,
+    pub mode: Option<InjectionMode>,
+}
+
 /// [`render_context_with`] with the default index: the mode is the request's or the user's default.
 pub async fn render_context(
     state: &AppState,
@@ -90,7 +98,7 @@ pub async fn render_context(
     mode: Option<InjectionMode>,
 ) -> Result<String, ApiError> {
     let options = ContextOptions { mode, ..ContextOptions::default() };
-    render_context_with(state, identity, project_key, device_id, source, &options).await
+    Ok(render_context_with(state, identity, project_key, device_id, source, &options).await?.body)
 }
 
 /// The SessionStart markdown block: profile, since-you-were-here (live), open work, procedures,
@@ -103,26 +111,26 @@ pub async fn render_context_with(
     device_id: Option<&str>,
     source: &str,
     options: &ContextOptions,
-) -> Result<String, ApiError> {
+) -> Result<ContextBlock, ApiError> {
     if source == "resume" {
-        return Ok(String::new());
+        return Ok(ContextBlock { body: String::new(), mode: None });
     }
     let started = Instant::now();
     let project_key = project_key.map(str::trim).filter(|p| !p.is_empty());
     let device = device_id.map(str::trim).filter(|d| !d.is_empty()).unwrap_or(&identity.device_id);
     let mut tx = user_tx(&state.db.app, identity).await?;
     let spaces = resolve_read_spaces(&mut tx, identity, None).await?;
-    if spaces.is_empty() {
-        return Ok(render::assemble_context(&[], "", ""));
-    }
     let mode = match options.mode {
         Some(mode) => mode,
         None => settings::injection_mode(&mut tx).await?,
     };
+    if spaces.is_empty() {
+        return Ok(ContextBlock { body: render::assemble_context(&[], "", ""), mode: Some(mode) });
+    }
     let variant = variant_of(mode, options);
     let budgets = match mode {
         InjectionMode::Full => context_budgets(variant.rows),
-        InjectionMode::Lean => LEAN_BUDGETS,
+        InjectionMode::Lean | InjectionMode::Smart => LEAN_BUDGETS,
     };
     let scopes = context_scopes(project_key, device);
     let key = cache::cache_key(identity.user_id, &spaces, &scopes, device, source, &variant);
@@ -150,7 +158,7 @@ pub async fn render_context_with(
             let pack = build_pack(state, &mut tx, &spaces, &scopes, &opts).await?;
             let body = match mode {
                 InjectionMode::Full => render::context_body(&pack.slots),
-                InjectionMode::Lean => render::lean_body(&pack.slots),
+                InjectionMode::Lean | InjectionMode::Smart => render::lean_body(&pack.slots),
             };
             let entry = CacheEntry {
                 key: &key,
@@ -197,7 +205,7 @@ pub async fn render_context_with(
         }
     }
     tx.commit().await?;
-    Ok(out)
+    Ok(ContextBlock { body: out, mode: Some(mode) })
 }
 
 /// The index only exists in the full block: the other modes ignore its size and types, so they share a cache entry.

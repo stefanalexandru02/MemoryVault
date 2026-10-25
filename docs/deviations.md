@@ -288,6 +288,24 @@ and repeated items are merged. The last section lists the gaps that are still op
   lean block is the Profile and Open work sections (budgets 120/60/80 for profile, pinned facts and work state) plus a
   fixed rubric of about 120 tokens; it has no since-you-were-here section. A re-render job carries the mode of the
   block it replaces.
+- **Smart injection (not in the spec).** A third injection mode, `smart`, is opt-in (`MEM_INJECTION=smart`, the
+  user default in `PUT /v1/me/settings`, `INJECTION=smart` for `make connect-*`). Its session start is the lean block
+  (cached apart, so `retrieval_log` and the stats tell it from `lean`) and the response carries
+  `X-Memory-Injection: smart`; the hook keeps a flag in the session cache and, on the first `UserPromptSubmit` only,
+  sends the first 500 characters of the prompt to `POST /v1/context/prompt` (800 ms), printing the answer as
+  `additionalContext` if it is non-empty and at most 250 estimated tokens. The server answers within 600 ms (an empty
+  body on a timeout). It searches observations of the global, project and device scopes (no subagent or secret
+  rows) with the keyword and vector legs of recall, fuses them (RRF, top 20) and decides relevance as follows: RRF
+  scores cannot be compared across queries, so when the reranker answered and is a cross-encoder
+  (`Embedder::calibrated_rerank`, false for `FAKE_TEI`) a row needs a rerank score of at least `SMART_RERANK_MIN`
+  (default 0.5, the sigmoid output's own boundary; not calibrated on this deployment's data); otherwise a row needs two
+  distinct non-stopword prompt terms in its title, subtitle or narrative. Qualifying rows go through the index's
+  duplicate and type limits, are cut to five rows and then, from the last, until the block fits 250 tokens. Only answers
+  that add rows are written to `retrieval_log` (mode `smart`, injection `smart`, with the prompt as the query, its
+  tokens and rows) so the stats show what smart costs when it speaks; every call is counted in
+  `memsvc_smart_context_total{outcome=injected|nothing|timeout}`. The first prompt of a `compact` or `clear` start
+  is a first prompt again; a `resume` start has no block and no flag. Other agent CLIs (`mem-hook event --client`) do
+  not ask for prompt context.
 - **Context calls are logged on cache hits too.** `retrieval_log` gained `tokens`, `hits` and `injection`. A hit logs
   a row with no candidates, so `GET /v1/stats/recall` (own calls; `all=true` for admin tokens) counts every call. Rows
   from before migration 0203 have no tokens and are left out.
@@ -530,6 +548,13 @@ and repeated items are merged. The last section lists the gaps that are still op
     wrong. It is `None` without gold.
   - Contradictions is the number of `(subject, predicate, scope)` groups with more than one distinct `value_text`
     among active and candidate facts.
+- **Injection modes.** The report also compares `full`, `lean` and `smart` (`injection`): each question is the first
+  prompt of a new session on the recorded project, and `found` is the share of its expected items whose text (an
+  observation title, a fact's subject and predicate, summary text) is in what the session was handed without a tool
+  call (the SessionStart block, plus for `smart` the memories for the question), with the estimated tokens handed
+  over. It is not part of the baseline check. With the fake embedder `smart` always uses its term-overlap rule, and
+  the example set is so small that the full block holds all of it, so it says what the modes cost and miss there, not
+  how they compare on a large history.
 - **Baseline check.** The check is relative. It fails when `(baseline - recall@5) / baseline > 0.05`. A missing
   `baseline.json` skips the check. `--update-baseline` writes the measured value instead of checking.
 - **Comparison with claude-mem.** `compare` matches claude-mem's `sdk_sessions.content_session_id` to this service's

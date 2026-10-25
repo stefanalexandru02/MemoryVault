@@ -9,7 +9,7 @@ pub struct Config {
     pub token: String,
     pub device: String,
     pub claude_bin: String,
-    /// `MEM_INJECTION`: `lean` or `full`, sent as `mode` with the SessionStart request. Unset (or anything
+    /// `MEM_INJECTION`: `lean`, `full` or `smart`, sent as `mode` with the SessionStart request. Unset (or anything
     /// else) leaves the choice to the user's default on the server.
     pub injection: Option<String>,
     /// `MEM_CONTEXT_ROWS` (1 to 30): rows of the observation index of the full block, sent as `rows`. Unset (or
@@ -114,7 +114,7 @@ impl Config {
             token,
             device: get("DEVICE_ID").unwrap_or_else(hostname),
             claude_bin: get("CLAUDE_BIN").unwrap_or_else(|| "claude".into()),
-            injection: get("MEM_INJECTION").filter(|m| matches!(m.as_str(), "lean" | "full")),
+            injection: get("MEM_INJECTION").filter(|m| matches!(m.as_str(), "lean" | "full" | "smart")),
             context_rows: get("MEM_CONTEXT_ROWS").and_then(|v| v.parse().ok()).filter(|r| (1..=30).contains(r)),
             context_types: get("MEM_CONTEXT_TYPES").map(|v| known_types(&v)).unwrap_or_default(),
             file_context_budget: get("MEM_FILE_CONTEXT_BUDGET")

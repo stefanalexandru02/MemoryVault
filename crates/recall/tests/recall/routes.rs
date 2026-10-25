@@ -224,6 +224,17 @@ async fn context_mode_query_and_user_settings(pool: PgPool) {
     let full = send(&app, Method::GET, &format!("{uri}&mode=full"), Some(token), None).await;
     assert!(full.text().contains("Chose pgvector") && !full.text().contains("### Memory tools"), "{}", full.text());
     assert_ne!(lean.headers[header::ETAG], full.headers[header::ETAG]);
+    assert_eq!(
+        (lean.headers["x-memory-injection"].to_str().unwrap(), full.headers["x-memory-injection"].to_str().unwrap()),
+        ("lean", "full")
+    );
+
+    // Smart is a default like the others, and its session start is the lean block.
+    let put = send(&app, Method::PUT, "/v1/me/settings", Some(token), Some(json!({"injection_mode": "smart"}))).await;
+    assert_eq!((put.status, put.json()), (StatusCode::OK, json!({"injection_mode": "smart"})));
+    let smart = send(&app, Method::GET, &uri, Some(token), None).await;
+    assert_eq!(smart.headers["x-memory-injection"], "smart");
+    assert_eq!(smart.text(), lean.text());
 
     // Validation and scopes.
     let resp = send(&app, Method::GET, &format!("{uri}&mode=bogus"), Some(token), None).await;

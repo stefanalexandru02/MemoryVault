@@ -36,9 +36,12 @@ fn config_injection_is_sent_as_mode() {
     let (fake, env) = TestEnv::with_fake();
     fake.state().context = Some(BLOCK.into());
     let config = std::fs::read_to_string(env.home.join("config")).unwrap();
-    for (setting, mode) in
-        [("MEM_INJECTION=lean", Some("lean")), ("MEM_INJECTION=full", Some("full")), ("MEM_INJECTION=fat", None)]
-    {
+    for (setting, mode) in [
+        ("MEM_INJECTION=lean", Some("lean")),
+        ("MEM_INJECTION=full", Some("full")),
+        ("MEM_INJECTION=smart", Some("smart")),
+        ("MEM_INJECTION=fat", None),
+    ] {
         std::fs::write(env.home.join("config"), format!("{config}{setting}\n")).unwrap();
         start(&env, "startup");
         let path = fake.matching("GET", "/v1/context").last().unwrap().path.clone();

@@ -18,6 +18,11 @@ const LOW_IMPORTANCE: f64 = 0.4;
 const TITLE_CHARS: usize = 80;
 /// A header and one title cost about this much: with less left in the session's budget the server is not asked.
 const MIN_BLOCK_TOKENS: u32 = 30;
+const PROMPT_CONTEXT_TIMEOUT: Duration = Duration::from_millis(800);
+/// Characters of the prompt sent to the server.
+const PROMPT_CHARS: usize = 500;
+/// The most the server may add for a prompt; more is not shown.
+const PROMPT_CONTEXT_TOKENS: u32 = 250;
 
 /// `PreToolUse` on `Read`: tells the agent what earlier sessions learned about the file it is about to read, as a
 /// header and at most [`FILE_ROWS_SHOWN`] titles. It speaks at most once per file, stays within the session's
@@ -53,6 +58,30 @@ pub fn file_context(hook: &Hook) {
     let block = file_block(&display_path(path, &hook.target.cwd), &rows);
     if store::take_file_context_budget(home, sid, util::estimate_tokens(&block), budget) {
         let out = json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": block } });
+        println!("{out}");
+    }
+}
+
+/// `UserPromptSubmit` in `smart` mode: the first prompt of the session goes to the server (the beginning of it, 800 ms
+/// at most), which answers with up to five index rows when the prompt clears its relevance bar and with nothing
+/// otherwise. Later prompts, other modes, errors and timeouts add nothing, and the prompt goes on regardless.
+pub fn prompt_context(hook: &Hook) {
+    let Some(prompt) = hook.str("prompt").filter(|p| !p.trim().is_empty()) else { return };
+    if !store::take_smart_pending(hook.app.home(), &hook.target.claude_session_id) {
+        return;
+    }
+    let body = json!({
+        "prompt": prompt.chars().take(PROMPT_CHARS).collect::<String>(),
+        "project_key": hook.target.project_key,
+        "device_id": hook.app.cfg.device,
+    });
+    let Some(resp) = hook.app.api.post("/v1/context/prompt", &body, PROMPT_CONTEXT_TIMEOUT).ok().filter(|r| r.ok())
+    else {
+        return;
+    };
+    let block = resp.body.trim();
+    if !block.is_empty() && util::estimate_tokens(block) <= PROMPT_CONTEXT_TOKENS {
+        let out = json!({ "hookSpecificOutput": { "hookEventName": "UserPromptSubmit", "additionalContext": block } });
         println!("{out}");
     }
 }

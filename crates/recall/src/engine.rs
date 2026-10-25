@@ -151,7 +151,7 @@ fn rerank_text(row: &TierRow) -> String {
     }
 }
 
-async fn embed_query(state: &AppState, query: &str) -> Option<Vec<f32>> {
+pub(crate) async fn embed_query(state: &AppState, query: &str) -> Option<Vec<f32>> {
     match state.tei.embed(&[query.to_string()]).await {
         Ok(mut v) if !v.is_empty() => Some(v.swap_remove(0)),
         Ok(_) => None,
@@ -164,7 +164,7 @@ async fn embed_query(state: &AppState, query: &str) -> Option<Vec<f32>> {
 
 /// Rerank the fused top 40 across tiers; the rerank score replaces RRF as the base (11.3).
 /// False on timeout or error, leaving RRF in place.
-async fn rerank(state: &AppState, query: &str, cands: &mut [&mut Candidate]) -> bool {
+pub(crate) async fn rerank(state: &AppState, query: &str, cands: &mut [&mut Candidate]) -> bool {
     cands.sort_by(|a, b| b.rrf.total_cmp(&a.rrf).then(a.table.cmp(&b.table)).then(a.id.cmp(&b.id)));
     let n = cands.len().min(RERANK_TOP);
     let top = &mut cands[..n];
@@ -748,7 +748,7 @@ pub async fn log_cached_retrieval(
     insert_retrieval(conn, identity, rec, json!([]), json!([]), false).await
 }
 
-async fn insert_retrieval(
+pub(crate) async fn insert_retrieval(
     conn: &mut PgConnection,
     identity: &Identity,
     rec: RetrievalRecord<'_>,
@@ -893,7 +893,7 @@ pub async fn feedback(
 
 // ---------- index rows (search, timeline, by-file) ----------
 
-fn index_row(row: &TierRow, score: Option<f64>, anchor: bool) -> IndexRow {
+pub(crate) fn index_row(row: &TierRow, score: Option<f64>, anchor: bool) -> IndexRow {
     let (table, row_type, title, created_at, tokens) = match row {
         TierRow::Obs(r) => {
             let tokens = if r.token_estimate > 0 {

@@ -48,7 +48,7 @@ MEMORY_TOKEN=
 # Optional:
 # DEVICE_ID=laptop-x1
 # CLAUDE_BIN=/usr/local/bin/claude
-# MEM_INJECTION=lean                  # lean or full: what a session starts with (see the README)
+# MEM_INJECTION=lean                  # lean, full or smart: what a session starts with (see the README)
 # MEM_CONTEXT_ROWS=12                 # rows of the observation index in the full block (1-30)
 # MEM_CONTEXT_TYPES=decision,bugfix   # limit that index to these observation types
 # MEM_FILE_CONTEXT_BUDGET=1200        # tokens per session for notes shown before a file is read; 0 turns it off

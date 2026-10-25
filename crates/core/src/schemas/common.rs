@@ -177,12 +177,14 @@ str_enum!(Sensitivity { Normal = "normal", Sensitive = "sensitive", Secret = "se
 
 str_enum!(
     /// How `GET /v1/context` injects memory at session start: `full` is the budgeted block, `lean` only the
-    /// profile, open work and a rubric on when to call the pull tools.
+    /// profile, open work and a rubric on when to call the pull tools, and `smart` the lean block followed, on the
+    /// first prompt of the session, by the few memories that prompt matches (`POST /v1/context/prompt`) if any does.
     #[derive(Default)]
     InjectionMode {
         #[default]
         Full = "full",
         Lean = "lean",
+        Smart = "smart",
     }
 );
 

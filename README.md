@@ -173,14 +173,15 @@ The viewer is three static files compiled into the server (`crates/server/assets
 inline script or style, same-origin requests only) and renders memory text as text, never as markup, because
 that text comes from tool output.
 
-## Full and lean session context
+## Full, lean and smart session context
 
-Every session start fetches `GET /v1/context`. Two modes trade tokens against recall:
+Every session start fetches `GET /v1/context`. Three modes trade tokens against recall:
 
 | Mode | What the session starts with | About |
 |---|---|---|
 | `full` (default) | profile, open work, procedures, an index of 12 recent observations, recent sessions and what other devices did since your last visit here | about 400 to 550 tokens, paid at every session start, `clear` and `compact` |
 | `lean` | profile, open work and a short rubric saying when to call `memory_search`, `memory_timeline`, `memory_get` and `memory_remember` | up to about 350 tokens |
+| `smart` | the lean block, and on the first prompt of the session up to five index rows for the memories that prompt matches, or nothing | lean, plus at most 250 tokens once, and only when something is relevant |
 
 Lean starts cheaper but the agent has to ask: it sees recent work only if it searches, and it searches only
 when the task or the rubric tells it to. Full costs more on every start whether or not the session needs the
@@ -188,7 +189,7 @@ history, but the index and the hand-off are already in front of the model. Lean 
 sessions and long-running ones that compact often; full suits work that continues from earlier sessions on
 other devices. The tokens are estimates (characters / 4), the same ones the budgets use.
 
-The mode is the first of these that is set: the `mode=lean|full` query parameter of `GET /v1/context`; `MEM_INJECTION`
+The mode is the first of these that is set: the `mode=lean|full|smart` query parameter of `GET /v1/context`; `MEM_INJECTION`
 in `~/.memory/config`, which `mem-hook` sends as that parameter; the user's default on the server, set with
 `PUT /v1/me/settings` (`{"injection_mode": "lean"}`, read back with `GET`) or the selector in the viewer's
 header; then `full`. A cached block is kept per mode, so changing the default needs no invalidation.
@@ -199,7 +200,19 @@ type taking more than a third of the rows; each row is about 20 tokens. `GET /v1
 many and `types=decision,bugfix` limits them to some observation types; `mem-hook` sends `MEM_CONTEXT_ROWS` and
 `MEM_CONTEXT_TYPES` from `~/.memory/config`. Observations made by subagents are left out of the index (search
 finds them).
-`make connect-local INJECTION=lean` writes `MEM_INJECTION`. A `resume` start returns nothing in either mode.
+`make connect-local INJECTION=lean` (or `full`, `smart`) writes `MEM_INJECTION`. A `resume` start returns nothing in any mode.
+
+Smart mode is opt-in. `GET /v1/context` answers with the lean block and an `X-Memory-Injection: smart` header; on the
+first prompt of that session `mem-hook` sends the first 500 characters of it to `POST /v1/context/prompt` (800 ms at
+most, nothing on any error or timeout) and adds the answer to the prompt as context. The server looks for observations
+of the project, device and global scopes with the same keyword and vector search as `memory_search`, then keeps a
+memory only if it is relevant, and returns at most five rows (day-grouped, short ids, `~tok`) within 250 tokens, or an
+empty answer. Relevance cannot be a threshold on the fused rank, which differs from query to query, so with a
+reranker the memory must score at least `SMART_RERANK_MIN` (default 0.5, the model's own relevant/not relevant
+boundary; not tuned on a corpus) and without one (`FAKE_TEI`, the reranker down or too slow) it must share at least
+two distinct non-stopword terms of the prompt with its title, subtitle or narrative. Later prompts of the session add
+nothing. Each answer that adds rows is one `smart` row in `GET /v1/stats/recall` and the viewer; calls that add
+nothing are only counted in `memsvc_smart_context_total{outcome}`.
 
 `GET /v1/stats/recall?days=7` returns, for your own calls, the count and the average, median and 95th percentile
 of tokens served (and the average number of memories selected) per call kind (`context`, `recall`) and
