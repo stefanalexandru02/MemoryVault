@@ -1,12 +1,18 @@
 //! `memvault`: serve, worker, planner, migrate, admin, evals (spec 2, 14).
+//!
+//! `serve` applies pending migrations before it takes traffic; `worker` and `planner` wait for them.
+//! `migrate` runs the same step by hand.
 
 use anyhow::Context;
 use clap::{Parser, Subcommand};
-use memvault_core::db::MIGRATOR;
+use memvault_core::db;
 use memvault_core::{AppState, Db, Settings};
 use memvault_server::{all_appliers, serve, shutdown_signal};
 use tokio_util::sync::CancellationToken;
 use tracing_subscriber::EnvFilter;
+
+/// How long the worker and the planner wait for the API to finish migrating.
+const SCHEMA_WAIT: std::time::Duration = std::time::Duration::from_secs(300);
 
 #[derive(Parser)]
 #[command(name = "memvault", version, about = "MemoryVault shared memory server")]
@@ -17,21 +23,21 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Run the HTTP API and MCP server.
+    /// Run the HTTP API and MCP server, applying pending migrations first.
     Serve {
         #[arg(long)]
         host: Option<String>,
         #[arg(long)]
         port: Option<u16>,
     },
-    /// Run the worker loop (embed jobs, sweeps, re-render, retention).
+    /// Run the worker loop (embed jobs, sweeps, re-render, retention); waits for the API to migrate.
     Worker,
-    /// Run one consolidation planning pass.
+    /// Run one consolidation planning pass (waits for the schema, like the worker).
     Planner {
         #[arg(long)]
         space_id: Option<uuid::Uuid>,
     },
-    /// Apply pending SQL migrations (default: DATABASE_SYSTEM_URL, else DATABASE_URL).
+    /// Apply pending SQL migrations by hand: `serve` already does this at start-up (default: DATABASE_SYSTEM_URL, else DATABASE_URL).
     Migrate {
         #[arg(long)]
         dsn: Option<String>,
@@ -77,6 +83,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Worker => {
             let state = AppState::connect(settings, all_appliers()).await?;
+            db::wait_for_schema(&state.db.system, SCHEMA_WAIT).await?;
             let shutdown = CancellationToken::new();
             let signal = {
                 let shutdown = shutdown.clone();
@@ -92,6 +99,7 @@ async fn main() -> anyhow::Result<()> {
         }
         Command::Planner { space_id } => {
             let state = AppState::connect(settings, all_appliers()).await?;
+            db::wait_for_schema(&state.db.system, SCHEMA_WAIT).await?;
             let result = memvault_consolidate::planner::run_planner(&state, space_id).await?;
             println!("{}", serde_json::to_string_pretty(&result)?);
             Ok(())
@@ -99,10 +107,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Migrate { dsn } => {
             let dsn = dsn.unwrap_or_else(|| settings.system_database_url().to_string());
             let pool = sqlx::PgPool::connect(&dsn).await.context("connecting for migrations")?;
-            let before: i64 = applied_count(&pool).await;
-            MIGRATOR.run(&pool).await.context("applying migrations")?;
-            let after = applied_count(&pool).await;
-            println!("applied {} migration(s); {} total", after - before, after);
+            let before = db::applied_migrations(&pool).await;
+            db::migrate(&pool).await.context("applying migrations")?;
+            let after = db::applied_migrations(&pool).await;
+            println!("applied {} migration(s); {after} total", after - before);
             Ok(())
         }
         Command::Admin { args } => {
@@ -117,8 +125,4 @@ async fn main() -> anyhow::Result<()> {
             memvault_evals::cli::run(state, args).await
         }
     }
-}
-
-async fn applied_count(pool: &sqlx::PgPool) -> i64 {
-    sqlx::query_scalar("SELECT count(*) FROM _sqlx_migrations WHERE success").fetch_one(pool).await.unwrap_or(0)
 }

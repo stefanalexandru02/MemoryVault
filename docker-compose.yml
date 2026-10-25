@@ -1,5 +1,5 @@
-# Local MemoryVault stack: Postgres (pgvector + pg_search), TEI embed and rerank, migrations, API,
-# worker and a planner scheduler. Same image and settings as deploy/k8s, minus Kubernetes.
+# Local MemoryVault stack: Postgres (pgvector + pg_search), TEI embed and rerank, API (which migrates the
+# database as it starts), worker and a planner scheduler. Same image and settings as deploy/k8s, minus Kubernetes.
 #
 #   make up        full stack (first start downloads the two TEI models, about 4.5 GB)
 #   make up-lite   no TEI: FAKE_TEI=1 deterministic embeddings, for trying the plumbing
@@ -27,8 +27,6 @@ x-memvault: &memvault
     LOG_LEVEL: ${LOG_LEVEL:-info}
     LOG_FORMAT: text
   depends_on: &memvault-deps
-    migrate:
-      condition: service_completed_successfully
     tei-embed:
       condition: service_started
       required: false
@@ -74,17 +72,14 @@ services:
     volumes:
       - tei-models:/data
 
-  migrate:
-    <<: *memvault
-    restart: "no"
-    command: ["migrate"]
-    depends_on:
-      postgres:
-        condition: service_healthy
-
+  # Applies pending migrations before it takes traffic, so the first start waits for the database here.
   api:
     <<: *memvault
     command: ["serve"]
+    depends_on:
+      <<: *memvault-deps
+      postgres:
+        condition: service_healthy
     ports:
       - "${BIND_ADDR:-127.0.0.1}:${MEMVAULT_PORT:-8000}:8000"
     healthcheck:
@@ -98,6 +93,10 @@ services:
   worker:
     <<: *memvault
     command: ["worker"]
+    depends_on:
+      <<: *memvault-deps
+      api:
+        condition: service_healthy
     environment:
       <<: *memvault-env
       DATABASE_URL: postgres://memsvc_system:${MEMSVC_SYSTEM_PASSWORD}@postgres:5432/memsvc

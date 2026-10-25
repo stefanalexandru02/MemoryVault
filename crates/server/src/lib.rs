@@ -4,6 +4,7 @@ pub mod viewer;
 
 use std::time::Duration;
 
+use anyhow::Context;
 use axum::Router;
 use axum::extract::State;
 use axum::http::{StatusCode, header};
@@ -94,13 +95,18 @@ async fn metrics() -> impl IntoResponse {
     ([(header::CONTENT_TYPE, "text/plain; version=0.0.4")], memvault_core::metrics::prometheus_handle().render())
 }
 
-/// `memvault serve` on a bound listener until `shutdown` resolves: the full router, the
-/// context-cache invalidation listener (spec 11.6) and Prometheus recorder upkeep.
+/// `memvault serve` on a bound listener until `shutdown` resolves: first the pending migrations, then the
+/// full router, the context-cache invalidation listener (spec 11.6) and Prometheus recorder upkeep.
 pub async fn serve(
     state: AppState,
     tcp: tokio::net::TcpListener,
     shutdown: impl Future<Output = ()> + Send + 'static,
 ) -> anyhow::Result<()> {
+    // This process owns the schema: replicas started together take turns on sqlx's advisory lock, and the
+    // worker waits for the result (`memvault_core::db::wait_for_schema`). There is no separate migrate job.
+    memvault_core::db::migrate(&state.db.system).await.context("applying migrations")?;
+    let migrations = memvault_core::db::applied_migrations(&state.db.system).await;
+    tracing::info!(migrations, "database schema is up to date");
     let handle = memvault_core::metrics::prometheus_handle();
     let stop = CancellationToken::new();
     let upkeep = {

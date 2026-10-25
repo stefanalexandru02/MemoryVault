@@ -1,5 +1,8 @@
 # API: `memvault serve`. Rust, so one process per pod with the tokio runtime; 2 replicas and an HPA 2-4 on CPU.
 # Spec section 14, with the Rust resource numbers (250m / 128Mi requests instead of the Python 500m / 512 MB).
+# The API applies pending database migrations as it starts (as memsvc_system, over DATABASE_SYSTEM_URL), so there
+# is no migrate Job. Replicas that start together take turns on a Postgres advisory lock; the worker and the
+# consolidation CronJob wait for the result.
 apiVersion: apps/v1
 kind: Deployment
 metadata:
@@ -64,6 +67,15 @@ spec:
             limits:
               cpu: "1"
               memory: 512Mi
+          # Migrations run before the API takes traffic, so a first install or a large migration needs a while:
+          # up to 5 minutes before the liveness probe starts counting.
+          startupProbe:
+            httpGet:
+              path: /health
+              port: http
+            periodSeconds: 5
+            timeoutSeconds: 3
+            failureThreshold: 60
           # /health runs SELECT 1 and checks TEI. TEI down is `degraded` (still 200), so a TEI outage
           # does not restart the API pods.
           readinessProbe:

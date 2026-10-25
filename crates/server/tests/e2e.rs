@@ -184,8 +184,25 @@ async fn context(http: &reqwest::Client, base: &str, token: &str, device: &str) 
 async fn hook_to_recall_end_to_end(pool: PgPool) {
     let db = database_url(&pool);
 
-    // Fresh database: migrate, then an admin creates the user (with a private space) and two device tokens.
-    memvault(&db, &["migrate", "--dsn", &db]);
+    // The server on a random port, FakeTei, every applier. It starts on a fresh, empty database and
+    // migrates it itself: there is no separate migrate step.
+    let (state, _tei) = test_state_with(pool.clone(), test_settings(), all_appliers());
+    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let base = format!("http://{}", tcp.local_addr().unwrap());
+    let stop = CancellationToken::new();
+    let server = tokio::spawn(serve(state.clone(), tcp, stop.clone().cancelled_owned()));
+    eventually(
+        30,
+        || "the server to migrate the database and report healthy".into(),
+        async || {
+            let up = reqwest::get(format!("{base}/health")).await.ok()?.status().is_success();
+            (up && memvault_core::db::applied_migrations(&pool).await > 0).then_some(())
+        },
+    )
+    .await;
+    assert_eq!(memvault_core::db::applied_migrations(&pool).await, memvault_core::db::MIGRATOR.iter().count() as i64);
+
+    // An admin creates the user (with a private space) and two device tokens.
     let user = memvault(&db, &["admin", "user", "create", "alex", "--display-name", "Alex"]);
     let space_id = user["default_space_id"].as_str().expect("private space").to_string();
     let laptop =
@@ -195,13 +212,6 @@ async fn hook_to_recall_end_to_end(pool: PgPool) {
     let (laptop, desktop) = (laptop["token"].as_str().unwrap(), desktop["token"].as_str().unwrap());
 
     let hook = mem_hook_binary();
-
-    // The server on a random port, FakeTei, every applier.
-    let (state, _tei) = test_state_with(pool.clone(), test_settings(), all_appliers());
-    let tcp = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-    let base = format!("http://{}", tcp.local_addr().unwrap());
-    let stop = CancellationToken::new();
-    let server = tokio::spawn(serve(state.clone(), tcp, stop.clone().cancelled_owned()));
 
     // One Claude Code turn on the laptop through the real hook binary.
     let machine = Machine::new(hook, &base, laptop, "laptop-x1");
@@ -290,4 +300,19 @@ async fn hook_to_recall_end_to_end(pool: PgPool) {
 
     stop.cancel();
     server.await.unwrap().unwrap();
+}
+
+/// `memvault migrate` stays as a manual step; it runs the same code as the start-up migration.
+#[sqlx::test(migrations = false)]
+async fn migrate_command_applies_pending_migrations(pool: PgPool) {
+    let db = database_url(&pool);
+    let out = Command::new(env!("CARGO_BIN_EXE_memvault"))
+        .args(["migrate", "--dsn", &db])
+        .env("DATABASE_URL", &db)
+        .output()
+        .unwrap();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(out.status.success(), "{}\n{stdout}", String::from_utf8_lossy(&out.stderr));
+    let total = memvault_core::db::MIGRATOR.iter().count();
+    assert_eq!(stdout.trim(), format!("applied {total} migration(s); {total} total"));
 }

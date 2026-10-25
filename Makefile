@@ -34,7 +34,7 @@ ADMIN   := $(COMPOSE) exec -T -e LOG_LEVEL=warn api memvault admin
 CONNECT := ./clients/claude-code-plugin/connect.sh
 
 .DEFAULT_GOAL := help
-.PHONY: help env build up up-lite down restart ps logs migrate bootstrap user token tokens admin \
+.PHONY: help env build up up-lite down restart ps logs bootstrap user token tokens admin \
         consolidate reindex psql connect-local connect-remote connect-status disconnect install-plugin test clean
 
 help: ## List the targets
@@ -58,7 +58,7 @@ env: .env ## Create .env with fresh secrets (kept if it exists)
 build: .env ## Build the memvault image
 	$(COMPOSE) build
 
-up: .env ## Start the full stack (Postgres, TEI, migrations, API, worker, scheduler)
+up: .env ## Start the full stack (Postgres, TEI, API, worker, scheduler); the API migrates the database
 	COMPOSE_PROFILES=tei FAKE_TEI=0 $(COMPOSE) up -d --build --wait
 	@echo "API: $(MEMORY_URL)  viewer: $(MEMORY_URL)/viewer  (first start: TEI downloads its models, see 'make logs SERVICE=tei-embed')"
 
@@ -76,9 +76,6 @@ ps: ## Show service status
 
 logs: ## Follow logs (SERVICE=api for one service)
 	COMPOSE_PROFILES=tei $(COMPOSE) logs -f --tail=100 $(SERVICE)
-
-migrate: ## Apply pending migrations
-	$(COMPOSE) run --rm migrate
 
 bootstrap: user token ## Create user HANDLE and a token for CLIENT, print the client config
 
