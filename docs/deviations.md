@@ -452,8 +452,8 @@ and repeated items are merged. The last section lists the gaps that are still op
   or schema means adding a line to `kustomization.yaml`. Symlink handling under kustomize is not confirmed.
 - **Prompt rule for subagents.** The server-side step was replaced by a prompt rule, because only `prompts/*.yaml` was
   owned at the time. Subagent tagging is now also done in code (section 6).
-- **Worker manifest.** The worker's container port, Service, ServiceMonitor and ingress policy were meant to be removed,
-  because the worker binds no listener. See section 14 for what remains.
+- **Worker metrics listener.** The worker serves `/metrics` on `WORKER_METRICS_ADDR` (port 8000), so its Deployment keeps a
+  container port, a Service, a ServiceMonitor and an ingress policy for Prometheus. Spec 14 did not list a worker listener.
 - **API gets the system role.** The API Deployment has `DATABASE_SYSTEM_URL` (`memsvc_system`) as well as `DATABASE_URL`
   (`memsvc_app`). Spec 14 lists only the app role for the API. The API process is the broker (spec 4.7). Result
   application runs in `system_tx`, and every `/v1/admin` route does too. Without this, both fail in production.
