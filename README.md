@@ -220,6 +220,31 @@ injection mode. Every context call is counted, cached or rendered. `days` is 1 t
 `all=true` for every user. `make connect-status` prints the same table, and the viewer's Work state tab shows it.
 Compare the two modes there before settling on one.
 
+## Context cost
+
+What MemoryVault puts into a session, in estimated tokens (characters / 4, the estimator the server budgets with).
+The numbers come from the seeded sample project of the budget tests and a scratch server (about 250 observations);
+real histories vary mostly in how long the titles are.
+
+| Surface | Cost | When | Knob |
+|---|---|---|---|
+| Tool definitions (7 MCP tools) | about 900 | every session, unless the client defers tools | the plugin's MCP server entry |
+| Skill frontmatter | about 80 (`recall`, `remember`) | every session; `brief`, `handoff`, `ingest` and `how-it-works` cost nothing until you invoke them | `disable-model-invocation` in a skill |
+| Session start, `full` | about 400 to 550 for 12 index rows; about 20 more per row, 850 at the 30-row limit | start, `clear`, `compact` | `MEM_INJECTION`, `MEM_CONTEXT_ROWS` (1 to 30), `MEM_CONTEXT_TYPES` |
+| Session start, `lean` | about 210 to 250 | start, `clear`, `compact` | `MEM_INJECTION=lean` |
+| Session start, `smart` | lean, plus at most 250 (about 75 for one row) on the first prompt, and nothing when no memory is relevant | first prompt of a session | `MEM_INJECTION=smart`, `SMART_RERANK_MIN` (server) |
+| Earlier notes on a file | 60 to 110 on the first read of a file (a header and at most 3 titles), at most `MEM_FILE_CONTEXT_BUDGET` (1,200) per session | first `Read` of each file | `MEM_FILE_CONTEXT_BUDGET`, 0 turns it off |
+| `memory_search`, 5 rows | about 130 | when the agent searches | `limit` |
+| `memory_get`, one observation | about 150 | when the agent fetches | the ids asked for |
+| `memory_timeline`, default window | about 290 | when the agent asks | `before`, `after` |
+| Recording hooks | 0 | every event | |
+
+Before the second token pass the same sample cost about 980 for a full session start (28 index rows), 190 for the
+first read of a file with 5 notes and 300 for skill frontmatter. The index is cheaper because it shows 12 rows that
+differ from each other instead of 28 that often did not. Put the knobs in `~/.memory/config`; `make connect-status`
+and the viewer's Work state tab show what each mode has actually served on your data, and `memvault evals replay`
+compares the modes on a recorded set. Observations made by subagents never enter the session-start index.
+
 ## Installing the Claude Code plugin
 
 `make connect-local` and `make connect-remote` (above) do all of this in one step. The manual route is below.

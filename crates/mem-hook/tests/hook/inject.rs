@@ -117,7 +117,7 @@ fn smart_env() -> (crate::fake_server::Fake, TestEnv) {
 }
 
 fn start(env: &TestEnv) {
-    env.hook("session-start", &env.input("SessionStart", json!({"source": "startup", "model": "opus"})));
+    env.hook("session-start", &env.input("SessionStart", json!({"source": "startup", "model": "test-model"})));
 }
 
 fn prompt(env: &TestEnv, text: &str) -> Out {
