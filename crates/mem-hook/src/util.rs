@@ -2,6 +2,7 @@
 //! sanitising. The platform-specific parts (permissions, process groups, detaching) are gated with
 //! `cfg(unix)` / `cfg(windows)`.
 
+use std::collections::HashSet;
 use std::fs::{File, OpenOptions};
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -235,6 +236,71 @@ pub fn sanitize_component(s: &str) -> String {
     if out.is_empty() || out.chars().all(|c| c == '.') { "_".into() } else { out }
 }
 
+/// Percent-encodes everything but unreserved characters.
+pub fn encode(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
+            out.push(b as char);
+        } else {
+            out.push_str(&format!("%{b:02X}"));
+        }
+    }
+    out
+}
+
+/// Characters of an id shown at least, as in the memory tables.
+const SHORT_ID_MIN: usize = 6;
+
+/// The last characters of each id (hyphens ignored) that tell it from the others, at least [`SHORT_ID_MIN`]; the
+/// memory tools take such an ending in place of the whole id.
+pub fn short_ids(ids: &[&str]) -> Vec<String> {
+    let plain: Vec<String> = ids.iter().map(|id| id.replace('-', "")).collect();
+    let tail = |id: &str, len: usize| id.get(id.len().saturating_sub(len)..).unwrap_or(id).to_string();
+    plain
+        .iter()
+        .map(|own| {
+            let len = (SHORT_ID_MIN..own.len())
+                .find(|&len| plain.iter().all(|other| other == own || tail(other, len) != tail(own, len)))
+                .unwrap_or(own.len());
+            tail(own, len)
+        })
+        .collect()
+}
+
+/// The server's token estimate: a quarter of the characters, rounded up.
+pub fn estimate_tokens(text: &str) -> u32 {
+    u32::try_from(text.chars().count().div_ceil(4)).unwrap_or(u32::MAX)
+}
+
+/// The server's rule for "the same title said twice": lowercase, punctuation as spaces, whitespace collapsed.
+pub fn normalize_title(title: &str) -> String {
+    let kept: String =
+        title.to_lowercase().chars().map(|c| if c.is_alphanumeric() || c.is_whitespace() { c } else { ' ' }).collect();
+    kept.split_whitespace().collect::<Vec<_>>().join(" ")
+}
+
+/// Whether two titles are the same note worded twice (the server's rule for its index): the words they share are at least three quarters of the
+/// words they use between them (equal titles, or ones that differ in a number or a word).
+pub fn similar_titles(a: &str, b: &str) -> bool {
+    let (a, b) = (normalize_title(a), normalize_title(b));
+    if a.is_empty() || b.is_empty() {
+        return false;
+    }
+    let (wa, wb): (HashSet<&str>, HashSet<&str>) = (a.split(' ').collect(), b.split(' ').collect());
+    let shared = wa.intersection(&wb).count();
+    shared * 4 >= wa.union(&wb).count() * 3
+}
+
+/// `text` cut to `limit` characters with a trailing `…`.
+pub fn truncate(text: &str, limit: usize) -> String {
+    if text.chars().count() <= limit {
+        return text.to_string();
+    }
+    let cut: String = text.chars().take(limit.saturating_sub(1)).collect();
+    format!("{}…", cut.trim_end())
+}
+
 /// True when `bin` is an existing file (a path) or one found in a `PATH` directory (a bare name).
 pub fn on_path(bin: &str) -> bool {
     if bin.contains(['/', '\\']) {
@@ -282,6 +348,35 @@ mod tests {
         assert!(on_path(&bin.to_string_lossy()));
         assert!(!on_path(&dir.path().join("nope").to_string_lossy()));
         assert!(!on_path("definitely-not-a-real-binary-name"));
+    }
+
+    #[test]
+    fn short_ids_keep_six_characters_unless_rows_end_alike() {
+        let ids = [
+            "01930000-0000-7000-8000-0000001a1b2c3",
+            "01930000-0000-7000-8000-0000002a1b2c3",
+            "01930000-0000-7000-8000-000000ffffff",
+        ];
+        assert_eq!(short_ids(&ids), ["1a1b2c3", "2a1b2c3", "ffffff"]);
+        assert_eq!(short_ids(&["x"]), ["x"]);
+    }
+
+    #[test]
+    fn encodes_query_values() {
+        assert_eq!(encode("github.com/alex/home lab"), "github.com%2Falex%2Fhome%20lab");
+    }
+
+    #[test]
+    fn titles_and_tokens_follow_the_server() {
+        assert_eq!(normalize_title("Fix: the  Webhook-retry (again)!"), "fix the webhook retry again");
+        assert!(similar_titles(
+            "Retries come every 15 minutes in module 12",
+            "retries come every 15 minutes in module 7"
+        ));
+        assert!(!similar_titles("Retries come every 15 minutes", "Money is stored as integer minor units"));
+        assert_eq!(estimate_tokens("abcde"), 2);
+        assert_eq!(truncate("abcdefgh", 5), "abcd…");
+        assert_eq!(truncate("abc", 5), "abc");
     }
 
     #[test]

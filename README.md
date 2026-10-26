@@ -173,14 +173,15 @@ The viewer is three static files compiled into the server (`crates/server/assets
 inline script or style, same-origin requests only) and renders memory text as text, never as markup, because
 that text comes from tool output.
 
-## Full and lean session context
+## Full, lean and smart session context
 
-Every session start fetches `GET /v1/context`. Two modes trade tokens against recall:
+Every session start fetches `GET /v1/context`. Three modes trade tokens against recall:
 
 | Mode | What the session starts with | About |
 |---|---|---|
-| `full` (default) | profile, open work, procedures, an index of recent observations, recent sessions and what other devices did since your last visit here | 1,000 tokens, paid at every session start, `clear` and `compact` |
-| `lean` | profile, open work and a short rubric saying when and how to call `memory_search`, `memory_timeline`, `memory_get` and `memory_remember` | 300 to 400 tokens |
+| `full` (default) | profile, open work, procedures, an index of 12 recent observations, recent sessions and what other devices did since your last visit here | about 400 to 550 tokens, paid at every session start, `clear` and `compact` |
+| `lean` | profile, open work and a short rubric saying when to call `memory_search`, `memory_timeline`, `memory_get` and `memory_remember` | up to about 350 tokens |
+| `smart` | the lean block, and on the first prompt of the session up to five index rows for the memories that prompt matches, or nothing | lean, plus at most 250 tokens once, and only when something is relevant |
 
 Lean starts cheaper but the agent has to ask: it sees recent work only if it searches, and it searches only
 when the task or the rubric tells it to. Full costs more on every start whether or not the session needs the
@@ -188,17 +189,61 @@ history, but the index and the hand-off are already in front of the model. Lean 
 sessions and long-running ones that compact often; full suits work that continues from earlier sessions on
 other devices. The tokens are estimates (characters / 4), the same ones the budgets use.
 
-The mode is the first of these that is set: the `mode=lean|full` query parameter of `GET /v1/context`; `MEM_INJECTION`
+The mode is the first of these that is set: the `mode=lean|full|smart` query parameter of `GET /v1/context`; `MEM_INJECTION`
 in `~/.memory/config`, which `mem-hook` sends as that parameter; the user's default on the server, set with
 `PUT /v1/me/settings` (`{"injection_mode": "lean"}`, read back with `GET`) or the selector in the viewer's
 header; then `full`. A cached block is kept per mode, so changing the default needs no invalidation.
-`make connect-local INJECTION=lean` writes `MEM_INJECTION`. A `resume` start returns nothing in either mode.
+
+The index of the full block holds 12 rows by default. They are the observations with the best importance and
+recency (a decision of last month can beat a minor change of today), without near-duplicate titles and with no
+type taking more than a third of the rows; each row is about 20 tokens. `GET /v1/context?rows=` (1 to 30) sets how
+many and `types=decision,bugfix` limits them to some observation types; `mem-hook` sends `MEM_CONTEXT_ROWS` and
+`MEM_CONTEXT_TYPES` from `~/.memory/config`. Observations made by subagents are left out of the index (search
+finds them).
+`make connect-local INJECTION=lean` (or `full`, `smart`) writes `MEM_INJECTION`. A `resume` start returns nothing in any mode.
+
+Smart mode is opt-in. `GET /v1/context` answers with the lean block and an `X-Memory-Injection: smart` header; on the
+first prompt of that session `mem-hook` sends the first 500 characters of it to `POST /v1/context/prompt` (800 ms at
+most, nothing on any error or timeout) and adds the answer to the prompt as context. The server looks for observations
+of the project, device and global scopes with the same keyword and vector search as `memory_search`, then keeps a
+memory only if it is relevant, and returns at most five rows (day-grouped, short ids, `~tok`) within 250 tokens, or an
+empty answer. Relevance cannot be a threshold on the fused rank, which differs from query to query, so with a
+reranker the memory must score at least `SMART_RERANK_MIN` (default 0.5, the model's own relevant/not relevant
+boundary; not tuned on a corpus) and without one (`FAKE_TEI`, the reranker down or too slow) it must share at least
+two distinct non-stopword terms of the prompt with its title, subtitle or narrative. Later prompts of the session add
+nothing. Each answer that adds rows is one `smart` row in `GET /v1/stats/recall` and the viewer; calls that add
+nothing are only counted in `memsvc_smart_context_total{outcome}`.
 
 `GET /v1/stats/recall?days=7` returns, for your own calls, the count and the average, median and 95th percentile
 of tokens served (and the average number of memories selected) per call kind (`context`, `recall`) and
 injection mode. Every context call is counted, cached or rendered. `days` is 1 to 90; an admin token can add
 `all=true` for every user. `make connect-status` prints the same table, and the viewer's Work state tab shows it.
 Compare the two modes there before settling on one.
+
+## Context cost
+
+What MemoryVault puts into a session, in estimated tokens (characters / 4, the estimator the server budgets with).
+The numbers come from the seeded sample project of the budget tests and a scratch server (about 250 observations);
+real histories vary mostly in how long the titles are.
+
+| Surface | Cost | When | Knob |
+|---|---|---|---|
+| Tool definitions (7 MCP tools) | about 900 | every session, unless the client defers tools | the plugin's MCP server entry |
+| Skill frontmatter | about 80 (`recall`, `remember`) | every session; `brief`, `handoff`, `ingest` and `how-it-works` cost nothing until you invoke them | `disable-model-invocation` in a skill |
+| Session start, `full` | about 400 to 550 for 12 index rows; about 20 more per row, 850 at the 30-row limit | start, `clear`, `compact` | `MEM_INJECTION`, `MEM_CONTEXT_ROWS` (1 to 30), `MEM_CONTEXT_TYPES` |
+| Session start, `lean` | about 210 to 250 | start, `clear`, `compact` | `MEM_INJECTION=lean` |
+| Session start, `smart` | lean, plus at most 250 (about 75 for one row) on the first prompt, and nothing when no memory is relevant | first prompt of a session | `MEM_INJECTION=smart`, `SMART_RERANK_MIN` (server) |
+| Earlier notes on a file | 60 to 110 on the first read of a file (a header and at most 3 titles), at most `MEM_FILE_CONTEXT_BUDGET` (1,200) per session | first `Read` of each file | `MEM_FILE_CONTEXT_BUDGET`, 0 turns it off |
+| `memory_search`, 5 rows | about 130 | when the agent searches | `limit` |
+| `memory_get`, one observation | about 150 | when the agent fetches | the ids asked for |
+| `memory_timeline`, default window | about 290 | when the agent asks | `before`, `after` |
+| Recording hooks | 0 | every event | |
+
+Before the second token pass the same sample cost about 980 for a full session start (28 index rows), 190 for the
+first read of a file with 5 notes and 300 for skill frontmatter. The index is cheaper because it shows 12 rows that
+differ from each other instead of 28 that often did not. Put the knobs in `~/.memory/config`; `make connect-status`
+and the viewer's Work state tab show what each mode has actually served on your data, and `memvault evals replay`
+compares the modes on a recorded set. Observations made by subagents never enter the session-start index.
 
 ## Installing the Claude Code plugin
 
@@ -226,6 +271,9 @@ Python, `curl` or `jq`.
    # DEVICE_ID=laptop-x1
    # CLAUDE_BIN=/usr/local/bin/claude
    # MEM_INJECTION=lean
+   # MEM_CONTEXT_ROWS=12
+   # MEM_CONTEXT_TYPES=decision,bugfix
+   # MEM_FILE_CONTEXT_BUDGET=1200
    ```
 
    Export it in the shell where you run the commands below: `set -a; . ~/.memory/config; set +a`.
@@ -249,8 +297,8 @@ Python, `curl` or `jq`.
    Start a new session. `claude --plugin-dir /path/to/clients/claude-code-plugin` loads the plugin for one
    session without installing it.
 
-The plugin brings seven skills (`recall`, `remember`, `brief`, `project-history`, `handoff`, `ingest`,
-`how-it-works`), the MCP tools and the hooks. The plugin README lists them.
+The plugin brings six skills (`recall`, `remember`, `brief`, `handoff`, `ingest`, `how-it-works`; only the first two
+are loaded into every session), the MCP tools and the hooks. The plugin README lists them.
 
 Each hook event runs one `mem-hook` subcommand: `session-start`, `prompt`, `tool`, `tool-failure`, `stop`,
 `subagent-stop`, `session-end` and `file-context`. Hooks exit 0 in every case. Undelivered requests go to

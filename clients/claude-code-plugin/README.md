@@ -5,26 +5,28 @@ A Claude Code plugin with four parts:
 - **Hooks** that record a session into MemoryVault, inject recalled context when it starts, and mention earlier
   work on a file the first time it is read. All behavior lives in one Rust binary, `bin/mem-hook`, with one
   subcommand per hook event (spec section 8).
-- **The MCP server** `memory` (`.mcp.json`), with the tools `memory_search`, `memory_timeline`, `memory_get`,
-  `memory_explain`, `memory_history`, `memory_remember`, `memory_forget`, `memory_feedback` and `work_state_write`. It reads its URL and token from the
+- **The MCP server** `memory` (`.mcp.json`), with the tools `memory_search`, `memory_timeline`, `memory_get` (with
+  `trace`, it adds where a memory came from and how it changed), `memory_remember`, `memory_forget`,
+  `memory_feedback` and `work_state_write`. It reads its URL and token from the
   plugin's own settings (`userConfig`); the token is kept in the keychain, not in a file you edit.
-- **Skills**, invoked as `/memory:<name>` or picked up by Claude from the description:
+- **Skills**, invoked as `/memory:<name>`. Only `recall` and `remember` are loaded into every session (about 80
+  estimated tokens of frontmatter) and picked up by Claude from their description; the others are set to
+  `disable-model-invocation`, so they cost nothing until you invoke them:
 
   | Skill | Use it to |
   |---|---|
-  | `recall` | search earlier work (search, then timeline, then get), look at it as of an earlier date, trace where a memory came from, and tell memory when a recalled fact was wrong or outdated |
+  | `recall` | search earlier work (search, then timeline, then get), look at it as of an earlier date, trace where a memory came from, write a project's history over a period, and tell memory when a recalled fact was wrong or outdated |
   | `remember` | store a fact, note or procedure on request, or forget one after confirming it |
-  | `brief` | compile a sourced briefing on a topic from facts, procedures and past work |
-  | `project-history` | write a narrative of a project over a period from the recorded timeline, using `as_of` and `memory_history` for what changed |
-  | `handoff` | leave the goal, state and next steps as work state for the next session, on any machine |
-  | `ingest` | send the repository's docs (ADRs, READMEs, runbooks) to memory with `mem-hook ingest`; only on request |
-  | `how-it-works` | explain what is captured, where it lives, and how to inspect or delete it |
+  | `brief` | compile a sourced briefing on a topic from facts, procedures and past work (you invoke it) |
+  | `handoff` | leave the goal, state and next steps as work state for the next session, on any machine (you invoke it) |
+  | `ingest` | send the repository's docs (ADRs, READMEs, runbooks) to memory with `mem-hook ingest` (you invoke it) |
+  | `how-it-works` | explain what is captured, where it lives, and how to inspect or delete it (you invoke it) |
 
 - **Install and wiring scripts**: `install.sh` builds the binary, `connect.sh` wires a machine up in one step.
 
 The quick way, from the repository root: `make connect-local` (this machine's own stack) or
 `make connect-remote URL=... TOKEN=...`; `make disconnect` undoes it. Add `INJECTION=lean` to start sessions with
-only the profile, open work and a rubric for the search tools instead of the full block (see "Full and lean
+only the profile, open work and a rubric for the search tools instead of the full block (see "Full, lean and smart
 session context" in the main README); `make connect-status` shows the tokens served. The manual steps follow.
 Codex CLI and Gemini CLI can be wired to the same server (`make connect-local AGENT=codex|gemini`); see
 [clients/README.md](../README.md), which also documents the generic `mem-hook event --client <name>` input.
@@ -88,11 +90,11 @@ Headless runs that should use memory pass `--allowedTools "mcp__plugin_memory_me
 
 | Subcommand | Hook | Behavior |
 |---|---|---|
-| `session-start` | SessionStart | Replays the spool (oldest first, at most 1.5 s), posts a `system` event, fetches `GET /v1/context` (3 s; with `&mode=lean` or `&mode=full` when `MEM_INJECTION` is set) and prints it as `additionalContext`. On failure it prints the cached block from `~/.memory/cache/<project_key>.md` prefixed with `> memory: server unreachable, showing cached context from <time>`. On `resume` the event is posted but no context is returned. |
-| `prompt` | UserPromptSubmit | Posts `user_prompt`. Returns nothing. |
-| `tool` | PostToolUse | Posts `tool_use`. When the server answers `window_closed: true`, starts the observer. |
+| `session-start` | SessionStart | Replays the spool (oldest first, at most 1.5 s), posts a `system` event, fetches `GET /v1/context` (3 s; with `&mode=`, `&rows=` and `&types=` when `MEM_INJECTION`, `MEM_CONTEXT_ROWS` and `MEM_CONTEXT_TYPES` are set) and prints it as `additionalContext`. On failure it prints the cached block from `~/.memory/cache/<project_key>.md` prefixed with `> memory: server unreachable, showing cached context from <time>`. On `resume` the event is posted but no context is returned. |
+| `prompt` | UserPromptSubmit | Posts `user_prompt`. In `smart` mode, on the first prompt of a session, it first sends the start of the prompt (500 characters) to `POST /v1/context/prompt` (800 ms) and prints the memories that come back, if any (at most 250 estimated tokens), as `additionalContext`. Otherwise it returns nothing. |
+| `tool` | PostToolUse | Posts `tool_use` (with `agent_id` and `agent_type` for a call made inside a subagent, whose observations then stay out of the session-start index). When the server answers `window_closed: true`, starts the observer. |
 | `tool-failure` | PostToolUseFailure | Posts `tool_failure`; same observer rule. |
-| `file-context` | PreToolUse (`Read`) | Looks up observations that touched the file (`GET /v1/observations/by-file`, 1.5 s) and, the first time a file is read in a session, prints up to five of them (date, type, title, id) as `additionalContext`. It never blocks or changes the read, and prints nothing when there is nothing to say. |
+| `file-context` | PreToolUse (`Read`) | The first time a file is read in a session, looks up observations that touched it (`GET /v1/observations/by-file`, 1 s) and prints a one-line header with at most three titles and short ids (about 60 to 110 estimated tokens) as `additionalContext`. Minor observations and near-duplicate titles are left out, and nothing is printed when nothing is left. A session may spend `MEM_FILE_CONTEXT_BUDGET` estimated tokens this way (default 1,200; 0 turns the hook off). It never blocks or changes the read. |
 | `stop` | Stop | Posts `assistant_message` and starts the observer. Nothing is posted while `stop_hook_active` is true. |
 | `subagent-stop` | SubagentStop | Posts `subagent_stop`. |
 | `session-end` | SessionEnd | `POST /v1/sessions/{id}/end` within a 1 s budget, then starts the observer with `--final`. |
@@ -200,9 +202,9 @@ leases packets of any session. Run it from cron on an always-on machine with `cl
 
 | Path | Content |
 |---|---|
-| `config` | `MEMORY_URL`, `MEMORY_TOKEN`, optional `DEVICE_ID`, `CLAUDE_BIN`, `MEM_INJECTION` (`lean` or `full`), `MEMORY_ADMIN_TOKEN` (mode 0600) |
+| `config` | `MEMORY_URL`, `MEMORY_TOKEN`, optional `DEVICE_ID`, `CLAUDE_BIN`, `MEM_INJECTION` (`lean`, `full` or `smart`), `MEM_CONTEXT_ROWS` (1 to 30), `MEM_CONTEXT_TYPES` (`decision,bugfix`), `MEM_FILE_CONTEXT_BUDGET`, `MEMORY_ADMIN_TOKEN` (mode 0600) |
 | `exclude` | project keys to ignore |
-| `sessions/` | per-session cache: server session id, next sequence number, window, prompt count (`<client>_<id>` for sessions of other clients) |
+| `sessions/` | per-session cache: server session id, next sequence number, window, prompt count, files and tokens `file-context` has used (`<client>_<id>` for sessions of other clients) |
 | `spool/` | undelivered requests, one JSON line each |
 | `last-delivery` | modification time = last request the server accepted (for `doctor`) |
 | `cache/` | last context block per project |

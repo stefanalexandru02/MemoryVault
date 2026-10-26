@@ -14,6 +14,7 @@ mod deliver;
 mod doctor;
 mod hooks;
 mod ingest;
+mod inject;
 mod observe;
 mod project;
 mod spool;

@@ -38,6 +38,11 @@ pub trait Embedder: Send + Sync {
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, TeiError>;
     /// Relevance score per text, aligned with `texts`.
     async fn rerank(&self, query: &str, texts: &[String]) -> Result<Vec<f32>, TeiError>;
+    /// Whether `rerank` scores are a cross-encoder's relevance in 0 to 1, so that one threshold means the same for
+    /// every query. False for [`FakeTei`], whose score is the share of the query's words found in the text.
+    fn calibrated_rerank(&self) -> bool {
+        true
+    }
     async fn health(&self) -> TeiHealth;
 }
 
@@ -255,6 +260,10 @@ impl Embedder for FakeTei {
                 q.iter().filter(|w| words.contains(w)).count() as f32 / q.len() as f32
             })
             .collect())
+    }
+
+    fn calibrated_rerank(&self) -> bool {
+        false
     }
 
     async fn health(&self) -> TeiHealth {

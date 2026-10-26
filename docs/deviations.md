@@ -152,8 +152,13 @@ and repeated items are merged. The last section lists the gaps that are still op
   to candidate. Candidates with no stored embedding are embedded on the fly through TEI. Active facts the worker has
   not embedded yet are not found. Clusters are capped at 25 rows, candidates first.
 - **Subagent tagging in code.** `extract::tag_subagent_observations` adds `subagent:<agent_type>` to an
-  observation's entities when its `source_event_seqs` point at packet input events that carry `agent_type`. It does
-  not rely on the model following the prompt rule.
+  observation's entities when its `source_event_seqs` point at packet input events that carry an `agent_id` (`agent`
+  stands for a missing `agent_type`). It does not rely on the model following the prompt rule. Claude Code sets
+  `agent_id` only for hooks that fire inside a subagent; `agent_type` alone also appears on the main thread of a
+  session started with `--agent`, so `agent_id` is the signal. `mem-hook` records both on `tool_use` and
+  `tool_failure` events (`agent_type` only together with an `agent_id`), where it used to record the id alone and so
+  never tagged anything but a `subagent_stop`. The SessionStart index hides tagged observations; search and
+  `memory_get` still return them.
 - **Writes to unknown ids.** Ids may be full UUIDs or 6-hex short ids, optionally prefixed `fact#`. They must belong
   to the packet's `inputs.fact_ids`. Rejected decisions are counted under `rejected` in the applied counts and logged
   with `tracing::warn`. They write no audit row.
@@ -169,9 +174,12 @@ and repeated items are merged. The last section lists the gaps that are still op
 - **Prompt files.** Each file carries an extra `description` field, which `PromptSpec` allows. Event objects are
   rendered with `tojson`, one JSON line per event, so the templates do not depend on which optional event fields are
   present. Prompt versions are strings like `v1`, not `1`, because `PromptRegistry` requires `v<digits>`.
-- **Profile slot.** Profiles are `- <subject>: <predicate> = <value_text> [fact#<short> · <conf> · <devices> ·
-  <first_seen>]`, pinned first, then by importance times confidence, up to 400 tokens. `facts_version` is a hash of
-  the active facts' rendering inputs.
+- **Profile slot.** Profiles are `- <subject>: <predicate> = <value_text> [fact#<short>]`, with the caution
+  (`disputed`, `unconfirmed N months`) after the id when there is one; pinned first, then by importance times
+  confidence, up to 400 tokens. Spec 11.5 also puts confidence, devices and first-seen date in the tag; they cost
+  about 20 tokens a line at every session start and are in `memory_get` with `trace` instead. `facts_version` is a
+  hash of the active facts' rendering inputs, which no longer include the devices, so profiles written in the old
+  format are rendered again by the next planner run.
 - **Profile re-render.** Appliers re-render the profile and notify the context-cache invalidation channel for touched
   scopes in the same transaction.
 - **Summary planning.** Day packets use `grain = 'session'` summaries only, over a 14-day lookback, never for today.
@@ -243,14 +251,24 @@ and repeated items are merged. The last section lists the gaps that are still op
 
 ## 8. Recall and context
 
-- **Context budgets are constants.** Profile 300, facts 150 (pinned facts only), procedures 200, observations 700 (at
-  most 30 rows), summaries 200, work_state 150. `expand` is 0, and rerank is off.
+- **Context budgets are constants.** Profile 300, facts 150 (pinned facts only), procedures 200, observations 60
+  per index row (a ceiling; the rows asked for size the index), summaries 200, work_state 150. `expand` is 0, and
+  rerank is off.
 - **Profile slot.** Profile rows are joined in scope order, then space order, until the budget is used. The first
   scope with a row is not the only one used. With no `profiles` row, the top active facts are rendered instead, and
   those facts are left out of the facts slot.
 - **Budget costs.** Facts, procedures, summaries and index rows cost the token estimate of their rendered line.
   Expanded observations cost their stored `token_estimate`.
-- **Index.** The index (progressive disclosure) rows are picked by score, then shown newest first.
+- **Index.** The index (progressive disclosure) holds 12 rows by default (`rows=` 1 to 30, `types=` limits it to
+  some observation types; `mem-hook` sends `MEM_CONTEXT_ROWS` and `MEM_CONTEXT_TYPES`). The pool is the 60 live
+  observations with the best final score for a candidate without a query (11.4 with the observer's importance and
+  the recency half-lives, so an important decision of last month can beat a minor change of today), then MMR.
+  Rows are chosen from that order so the index tells something new: a title that is a near-duplicate of one
+  already chosen (three quarters of the words shared) is skipped, and no type takes more than a third of the rows
+  while other types are available (rows the limit held back fill what is left). They are shown newest first, and the
+  legend lists only the glyphs shown. The default was 28 rows by budget (700 tokens); the budgets test measures
+  about 20 estimated tokens per row, so 12 rows are about 510 tokens of a 510-token block where 28 undiversified rows
+  were about 980. A request for fewer or more rows keeps the same order.
 - **Type boosts (11.4 left these open).** Decision 1.2, `security_alert` 1.2, `bugfix` 1.1. Summaries score with
   importance 0.5.
 - **SessionStart extras.** The block adds two things the spec layout lacks. There is a "Recent sessions" section (up
@@ -260,14 +278,34 @@ and repeated items are merged. The last section lists the gaps that are still op
   this client's newest session on the project, but only if it started within the last 10 minutes. The line shows the
   session summary, or the latest prompt summary while the session is still running. agentic-os clients are labelled
   `assistant`.
-- **Cache key (11.6).** The key is sha256 of `(user_id, sorted space_ids, sorted scopes, device_id, source, mode)`. Spec
-  11.6 has no `user_id`. It is added because `context_cache` rows are per user (RLS), and `cache_key` is the primary
-  key. `mode` is the injection mode (below).
+- **Cache key (11.6).** The key is sha256 of `(user_id, sorted space_ids, sorted scopes, device_id, source, mode, rows,
+  types)`. Spec 11.6 has no `user_id`. It is added because `context_cache` rows are per user (RLS), and `cache_key`
+  is the primary key. `mode` is the injection mode (below); `rows` and `types` are the size and types of the
+  index of a full block (other modes ignore them and share one entry). They are columns of `context_cache`
+  (`obs_rows`, `obs_types`, migration 0204), so a re-render job renders the block it replaces.
 - **Injection modes.** `GET /v1/context` takes `mode=full|lean`; without it the user's default from `user_settings`
   (`GET`/`PUT /v1/me/settings`), else `full`. `mem-hook` sends `MEM_INJECTION` from `~/.memory/config` as `mode`. The
   lean block is the Profile and Open work sections (budgets 120/60/80 for profile, pinned facts and work state) plus a
-  fixed rubric of about 140 tokens; it has no since-you-were-here section. A re-render job carries the mode of the
+  fixed rubric of about 120 tokens; it has no since-you-were-here section. A re-render job carries the mode of the
   block it replaces.
+- **Smart injection (not in the spec).** A third injection mode, `smart`, is opt-in (`MEM_INJECTION=smart`, the
+  user default in `PUT /v1/me/settings`, `INJECTION=smart` for `make connect-*`). Its session start is the lean block
+  (cached apart, so `retrieval_log` and the stats tell it from `lean`) and the response carries
+  `X-Memory-Injection: smart`; the hook keeps a flag in the session cache and, on the first `UserPromptSubmit` only,
+  sends the first 500 characters of the prompt to `POST /v1/context/prompt` (800 ms), printing the answer as
+  `additionalContext` if it is non-empty and at most 250 estimated tokens. The server answers within 600 ms (an empty
+  body on a timeout). It searches observations of the global, project and device scopes (no subagent or secret
+  rows) with the keyword and vector legs of recall, fuses them (RRF, top 20) and decides relevance as follows: RRF
+  scores cannot be compared across queries, so when the reranker answered and is a cross-encoder
+  (`Embedder::calibrated_rerank`, false for `FAKE_TEI`) a row needs a rerank score of at least `SMART_RERANK_MIN`
+  (default 0.5, the sigmoid output's own boundary; not calibrated on this deployment's data); otherwise a row needs two
+  distinct non-stopword prompt terms in its title, subtitle or narrative. Qualifying rows go through the index's
+  duplicate and type limits, are cut to five rows and then, from the last, until the block fits 250 tokens. Only answers
+  that add rows are written to `retrieval_log` (mode `smart`, injection `smart`, with the prompt as the query, its
+  tokens and rows) so the stats show what smart costs when it speaks; every call is counted in
+  `memsvc_smart_context_total{outcome=injected|nothing|timeout}`. The first prompt of a `compact` or `clear` start
+  is a first prompt again; a `resume` start has no block and no flag. Other agent CLIs (`mem-hook event --client`) do
+  not ask for prompt context.
 - **Context calls are logged on cache hits too.** `retrieval_log` gained `tokens`, `hits` and `injection`. A hit logs
   a row with no candidates, so `GET /v1/stats/recall` (own calls; `all=true` for admin tokens) counts every call. Rows
   from before migration 0203 have no tokens and are left out.
@@ -297,8 +335,17 @@ and repeated items are merged. The last section lists the gaps that are still op
   observations are.
 - **Search window.** `offset + limit` for `GET /v1/search` is capped at 1000.
 - **Output caps.** `memory_get` output is capped at about 24k characters, by shortening the longest bodies first.
-  Search, timeline and explain are capped at about 8k characters. Search output ends with a hint about
-  `memory_timeline` and `memory_get`.
+  Search and timeline are capped at about 8k characters.
+- **Lean rendering of pull output (7, 11.5).** What goes into the model's context is kept small. `memory_search`,
+  `memory_timeline` and `memory_get` print the 6-hex short id, lengthened to the shortest ending that tells apart the
+  rows shown (the full UUID stays in REST JSON and the viewer). Rows are grouped under one `**2026-10-22**` line per
+  day and show only the time; days appear in the order of their first row, so a relevance-ordered search is regrouped
+  by day. The glyph legend ends only the SessionStart index (full mode); search, timeline and get repeat neither it nor
+  a "next step" footer, and the lean block has no legend. Near-duplicate rows (same table, type, scope and normalized
+  title, as in `title_norm_key`) fold into the newest one with `(+N similar)` in the SessionStart index and in search;
+  the timeline lists every row. Since-you-were-here and Recent sessions do not list a session twice: the summary the
+  first section uses is left out of the second. Spec 11.5 shows dates on every row, the legend after every table and a
+  confidence, devices and date tag on facts, procedures and sessions; those are the costs this removes.
 
 ## 9. MCP and memory writes
 
@@ -324,7 +371,7 @@ and repeated items are merged. The last section lists the gaps that are still op
   single `wrong` queues a fact, a single `outdated` does not. Nothing is retracted by the request itself.
 - **Cautions.** A fact is shown as `disputed` when it is queued or its confidence is under 0.4, else as `unconfirmed N
   months` when `last_confirmed_at` is 90 or more days old; a procedure that failed more than it worked is `disputed`.
-  The tag is the last part of the citation (`[fact#a91c2e · 0.83 · laptop · 2026-10-02 · unconfirmed 4 months]`),
+  The tag is the last part of the citation (`[fact#a91c2e · unconfirmed 4 months]`),
   appears after the title in index rows (`IndexRow.caution`, `FactFull.caution`) and in rendered profiles. Pinned facts
   carry none. Scoring is unchanged: it already uses confidence, and facts still have no recency term.
 - **Tool errors.** Tool failures (bad arguments, 403, 404, scope errors) come back as `CallToolResult` with
@@ -341,8 +388,13 @@ and repeated items are merged. The last section lists the gaps that are still op
 - **`memory_search since`** accepts RFC 3339, `YYYY-MM-DD`, or a span (`24h`, `7d`, `2w`).
 - **Work state.** `POST` returns the folded list (200). `GET` without a scope uses the caller's default scopes (global,
   current project, device). It folds with `memvault_recall::engine::fold_work_state`.
-- **`memory_get` references.** It accepts full ids, `obs#a1b2c3` and 6-hex short ids through
-  `memvault_recall::engine::resolve_refs`. If no id resolves to a visible row, it is a tool error.
+- **`memory_get` references.** It accepts full ids, `obs#a1b2c3` and short ids through
+  `memvault_recall::engine::resolve_refs`; the other tools that take an id (`memory_timeline`, `memory_forget`,
+  `memory_feedback`) do the same. A short id is the last 4 or more hex characters of an id (the random end of a UUIDv7,
+  not its time-ordered start), and tables show it lengthened when two rows shown end alike. One that matches more than
+  one visible row is a tool error naming the candidates with enough characters to tell them apart (`memory_get` still
+  returns the ids that did resolve, and lists the ambiguous ones after them); if no id resolves to a visible row, it is
+  a tool error.
 - **Forget.** Summaries cannot be forgotten through the tool (422). Admin hard delete works on them. Forgetting twice is
   a no-op with no extra audit row. Reader roles get 403 `space_forbidden`. Rows the caller cannot see get 404.
 - **Hard delete (admin, REST only).** It removes the row and its embeddings. It nulls references to the row
@@ -356,7 +408,12 @@ and repeated items are merged. The last section lists the gaps that are still op
   confirmations, but it keeps its confidence.
 - **Promotion.** `promote_scope` supports only `to: global`. Promotion to project, device or agent is rejected,
   because a decision carries no scope key to derive it from.
-- **Explain.** `explain` is implemented in the API and the tool. Its output is capped as in section 8.
+- **Explain and history (7).** `GET /v1/memories/{id}/explain` and `/history` are implemented as in the spec, but the
+  MCP tools `memory_explain` and `memory_history` are not: `memory_get` takes `trace: true`, which appends the
+  provenance (session, events, extractor, evidence), the audit trail and, for a fact or procedure with more than one
+  version, the supersession chain to each body. Nine tool definitions cost about 1,400 tokens in every session, seven
+  about 900. The result is capped with the bodies (section 8). The session id is left out of the trace; no tool takes
+  it.
 - **Document sources.** `POST /v1/sources` (memories:write), `GET /v1/sources` and `DELETE /v1/sources` ingest files
   as memory of a new kind `document`; the spec has nothing like it. A source is `(space, scope, uri)` with a
   project or the global scope. `content` is chunked in `memvault_memories::chunk` (markdown by heading, text by
@@ -491,6 +548,13 @@ and repeated items are merged. The last section lists the gaps that are still op
     wrong. It is `None` without gold.
   - Contradictions is the number of `(subject, predicate, scope)` groups with more than one distinct `value_text`
     among active and candidate facts.
+- **Injection modes.** The report also compares `full`, `lean` and `smart` (`injection`): each question is the first
+  prompt of a new session on the recorded project, and `found` is the share of its expected items whose text (an
+  observation title, a fact's subject and predicate, summary text) is in what the session was handed without a tool
+  call (the SessionStart block, plus for `smart` the memories for the question), with the estimated tokens handed
+  over. It is not part of the baseline check. With the fake embedder `smart` always uses its term-overlap rule, and
+  the example set is so small that the full block holds all of it, so it says what the modes cost and miss there, not
+  how they compare on a large history.
 - **Baseline check.** The check is relative. It fails when `(baseline - recall@5) / baseline > 0.05`. A missing
   `baseline.json` skips the check. `--update-baseline` writes the measured value instead of checking.
 - **Comparison with claude-mem.** `compare` matches claude-mem's `sdk_sessions.content_session_id` to this service's
@@ -573,11 +637,15 @@ and repeated items are merged. The last section lists the gaps that are still op
   the token as an environment reference. The plugin now ships `.mcp.json` and takes the URL and token from its own
   `userConfig` (token in the keychain, or `~/.claude/.credentials.json` where there is none), so no shell profile
   is involved and IDE and desktop apps connect too. Tool names become `mcp__plugin_memory_memory__*`. The plugin
-  also ships seven skills (`recall`, `remember`, `brief`, `project-history`, `handoff`, `ingest`, `how-it-works`), which the
-  spec does not list. `make connect-local`, `make connect-remote` and `make disconnect` wrap the setup.
-- **File-context hook is informational.** Phase 4's file-context hook is built as a `PreToolUse` hook on `Read`
-  (`mem-hook file-context`). It adds earlier observations for the file as context, once per file per session, and
-  never blocks or replaces the read. claude-mem's file-read gate can replace a read of a large unchanged file with
+  also ships six skills (`recall`, `remember`, `brief`, `handoff`, `ingest`, `how-it-works`), which the
+  spec does not list; only `recall` and `remember` are model-invocable, so their frontmatter is all the skills put
+  into a session (the project history guide is a section of `recall`). `make connect-local`, `make connect-remote`
+  and `make disconnect` wrap the setup.
+- **File-context hook is informational and small.** Phase 4's file-context hook is built as a `PreToolUse` hook on
+  `Read` (`mem-hook file-context`). It adds a one-line header and at most three titles with short ids for the file
+  (project-relative path; minor observations, importance below 0.4, and near-duplicate titles left out; silent when
+  nothing is left), once per file per session, within `MEM_FILE_CONTEXT_BUDGET` estimated tokens per session
+  (default 1,200; 0 turns the hook off), and never blocks or replaces the read. claude-mem's file-read gate can replace a read of a large unchanged file with
   its timeline; this one does not, because a wrong block costs the agent the file.
 - **Web viewer.** Phase 4's admin viewer is a static page at `/viewer` that signs in with a bearer token. It lists,
   searches and forgets memories, shows provenance and work state, and for admin tokens lists and revokes tokens and
@@ -593,7 +661,7 @@ and repeated items are merged. The last section lists the gaps that are still op
   created). Observations and summaries count from `created_at`, observations until `archived_at`. Recall ranks relative to
   `as_of`, rebuilds the profile from the facts valid then instead of the rendered `profiles` row, and leaves work state
   out. `/v1/context`, the timeline and by-file do not take `as_of`; the context cache is not time-aware.
-- **History endpoint.** `GET /v1/memories/{id}/history` and the MCP `memory_history` follow `supersedes_id` in both
+- **History endpoint.** `GET /v1/memories/{id}/history` and `memory_get` with `trace` follow `supersedes_id` in both
   directions (at most 50 links each way) under the caller's RLS, so links in spaces the caller cannot read drop out and
   an invisible id is a 404. Only facts and procedures chain; an observation or summary is a chain of one. Other
   `secret` rows in a chain are left out. Procedures have no `superseded_by` or end time columns, so both are derived

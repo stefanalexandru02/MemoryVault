@@ -7,24 +7,22 @@ use serde_json::{Value, json};
 
 use crate::config::{self, Config};
 use crate::deliver::{self, App, CLAUDE_CODE, Delivered, Entry, Fail, Target};
-use crate::{project, spool, store, util};
+use crate::{inject, project, spool, store, util};
 
 const LIVE_BUDGET: Duration = Duration::from_secs(3);
 const DRAIN_BUDGET: Duration = Duration::from_millis(1500);
 const CONTEXT_TIMEOUT: Duration = Duration::from_secs(3);
 const END_BUDGET: Duration = Duration::from_secs(1);
-const FILE_CONTEXT_TIMEOUT: Duration = Duration::from_millis(1500);
-const FILE_CONTEXT_ROWS: usize = 5;
 
 /// Claude Code's hook input plus everything derived from it.
-struct Hook {
-    app: App,
-    input: Value,
-    target: Target,
+pub struct Hook {
+    pub app: App,
+    pub input: Value,
+    pub target: Target,
 }
 
 impl Hook {
-    fn str(&self, key: &str) -> Option<&str> {
+    pub fn str(&self, key: &str) -> Option<&str> {
         self.input.get(key).and_then(Value::as_str)
     }
 
@@ -76,6 +74,7 @@ pub fn run(event: &str) {
     match event {
         "session-start" => session_start(&mut hook),
         "prompt" => {
+            inject::prompt_context(&hook);
             let prompt = hook.field("prompt");
             record(&hook, "user_prompt", json!({ "prompt": prompt }), true);
         }
@@ -88,6 +87,7 @@ pub fn run(event: &str) {
                 "error": hook.field("error"),
                 "is_interrupt": hook.field("is_interrupt"),
                 "agent_id": hook.field("agent_id"),
+                "agent_type": agent_type(&hook.input),
             });
             observe_if_window_closed(&hook, record(&hook, "tool_failure", payload, false));
         }
@@ -113,7 +113,7 @@ pub fn run(event: &str) {
             record(&hook, "subagent_stop", payload, false);
         }
         "session-end" => session_end(&hook),
-        "file-context" => file_context(&hook),
+        "file-context" => inject::file_context(&hook),
         _ => eprintln!("mem-hook: unknown event {event:?}"),
     }
 }
@@ -194,6 +194,13 @@ pub fn run_generic(client: &str) {
     }
 }
 
+/// The `agent_type` of a call made inside a subagent. Claude Code sets `agent_id` only there; the main thread of a
+/// session started with `--agent` has an `agent_type` too, but it is not a subagent, so it is not recorded.
+fn agent_type(input: &Value) -> Value {
+    let in_subagent = text_of(input, &["agent_id"]).is_some();
+    input.get("agent_type").filter(|_| in_subagent).cloned().unwrap_or(Value::Null)
+}
+
 fn tool_payload(input: &Value) -> Value {
     let field = |key: &str| input.get(key).cloned().unwrap_or(Value::Null);
     json!({
@@ -203,6 +210,7 @@ fn tool_payload(input: &Value) -> Value {
         "tool_use_id": field("tool_use_id"),
         "duration_ms": field("duration_ms"),
         "agent_id": field("agent_id"),
+        "agent_type": agent_type(input),
     })
 }
 
@@ -271,13 +279,25 @@ fn session_start(hook: &mut Hook) {
         return;
     }
     let key = &hook.target.project_key;
-    let mut query =
-        format!("/v1/context?project_key={}&device_id={}&source={source}", encode(key), encode(&hook.app.cfg.device));
-    if let Some(mode) = &hook.app.cfg.injection {
-        query.push_str("&mode=");
-        query.push_str(mode);
+    let mut query = format!(
+        "/v1/context?project_key={}&device_id={}&source={source}",
+        util::encode(key),
+        util::encode(&hook.app.cfg.device)
+    );
+    let cfg = &hook.app.cfg;
+    if let Some(mode) = &cfg.injection {
+        query.push_str(&format!("&mode={mode}"));
+    }
+    if let Some(rows) = cfg.context_rows {
+        query.push_str(&format!("&rows={rows}"));
+    }
+    if !cfg.context_types.is_empty() {
+        query.push_str(&format!("&types={}", cfg.context_types.join(",")));
     }
     let fetched = hook.app.api.get(&query, CONTEXT_TIMEOUT).ok().filter(|r| r.ok());
+    // In smart mode the first prompt of the session asks the server for the memories it matches.
+    let smart = fetched.as_ref().is_some_and(|r| r.injection.as_deref() == Some("smart"));
+    store::set_smart_pending(&home, &hook.target.claude_session_id, smart);
     let block = match fetched {
         Some(resp) => {
             store::save_context(&home, key, &resp.body);
@@ -301,55 +321,6 @@ fn session_start(hook: &mut Hook) {
     println!("{out}");
 }
 
-/// `PreToolUse` on `Read`: tells the agent what earlier sessions learned about the file it is about to read.
-/// It never blocks or rewrites the read, and speaks at most once per file per session.
-fn file_context(hook: &Hook) {
-    if hook.str("tool_name") != Some("Read") {
-        return;
-    }
-    let Some(path) = hook.input.get("tool_input").and_then(|i| i.get("file_path")).and_then(Value::as_str) else {
-        return;
-    };
-    if path.is_empty() || !store::first_surface(hook.app.home(), &hook.target.claude_session_id, path) {
-        return;
-    }
-    let query = format!(
-        "/v1/observations/by-file?path={}&project_key={}&limit={FILE_CONTEXT_ROWS}",
-        encode(path),
-        encode(&hook.target.project_key)
-    );
-    let Some(rows) = hook
-        .app
-        .api
-        .get(&query, FILE_CONTEXT_TIMEOUT)
-        .ok()
-        .filter(|r| r.ok())
-        .and_then(|r| r.json())
-        .and_then(|v| v.get("rows").and_then(Value::as_array).cloned())
-    else {
-        return;
-    };
-    let lines: Vec<String> = rows
-        .iter()
-        .filter_map(|row| {
-            let id = row.get("id")?.as_str()?;
-            let title = row.get("title")?.as_str()?;
-            let day = row.get("created_at").and_then(Value::as_str).map(|t| &t[..t.len().min(10)]).unwrap_or("");
-            let kind = row.get("type").and_then(Value::as_str).unwrap_or("note");
-            Some(format!("- {day} [{kind}] {title} (id {id})"))
-        })
-        .collect();
-    if lines.is_empty() {
-        return;
-    }
-    let block = format!(
-        "memory: earlier sessions touched {path}, newest first. Fetch details with memory_get when one matters:\n{}",
-        lines.join("\n")
-    );
-    let out = json!({ "hookSpecificOutput": { "hookEventName": "PreToolUse", "additionalContext": block } });
-    println!("{out}");
-}
-
 fn session_end(hook: &Hook) {
     let reason = hook.str("reason").unwrap_or("other").to_string();
     let entry = Entry::end(&hook.target, &reason);
@@ -358,29 +329,11 @@ fn session_end(hook: &Hook) {
     }
 }
 
-/// Percent-encodes everything but unreserved characters.
-fn encode(s: &str) -> String {
-    let mut out = String::new();
-    for b in s.bytes() {
-        if b.is_ascii_alphanumeric() || b"-._~".contains(&b) {
-            out.push(b as char);
-        } else {
-            out.push_str(&format!("%{b:02X}"));
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use serde_json::json;
 
     use super::{Mapped, map_event, valid_client};
-
-    #[test]
-    fn encodes_query_values() {
-        assert_eq!(super::encode("github.com/alex/home lab"), "github.com%2Falex%2Fhome%20lab");
-    }
 
     #[test]
     fn generic_events_map_onto_the_hook_events() {

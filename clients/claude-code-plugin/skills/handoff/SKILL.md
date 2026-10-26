@@ -1,6 +1,6 @@
 ---
 name: handoff
-description: Leave a hand-off for the next session, possibly on another machine, so work continues exactly where it stopped. Use when a session is getting long, the user is switching machines or stopping for the day, or they say "hand off", "pick this up later" or "save where we are".
+description: Use when stopping or switching machines, to leave a hand-off so the next session continues where this one stopped.
 disable-model-invocation: true
 ---
 

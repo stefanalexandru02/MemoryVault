@@ -79,7 +79,7 @@
     loading: false,
     selected: null, // {id, table}
     live: true,
-    injection: null, // 'full' | 'lean': the user's default for what a session starts with; null when unknown
+    injection: null, // 'full' | 'lean' | 'smart': the user's default for what a session starts with; null when unknown
   };
   const PAGE = 50;
 
@@ -220,7 +220,7 @@
 
   // The user's default injection mode (PUT /v1/me/settings). A MEM_INJECTION in a client's ~/.memory/config
   // and a mode in the request take precedence over it.
-  const INJECTION_MODES = [['full', 'Full context'], ['lean', 'Lean context']];
+  const INJECTION_MODES = [['full', 'Full context'], ['lean', 'Lean context'], ['smart', 'Smart context']];
   function injectionToggle() {
     if (!state.injection) return null;
     const sel = h('select', {
@@ -734,7 +734,7 @@
   }
 
   // Tokens served per session start (by injection mode) and per recall (GET /v1/stats/recall).
-  const CALL_LABELS = { context: 'Session start', recall: 'Recall' };
+  const CALL_LABELS = { context: 'Session start', smart: 'First prompt', recall: 'Recall' };
   function statsPanel() {
     const days = h('select', { class: 'input', 'aria-label': 'Window', onchange: () => load() },
       [1, 7, 30, 90].map((d) => h('option', { value: String(d), text: d === 1 ? 'Last day' : `Last ${d} days` })));
@@ -757,7 +757,7 @@
     load();
     return h('div', { class: 'page-inner' },
       h('h2', { text: 'Tokens served' }),
-      h('p', { class: 'muted', text: 'Estimated tokens per call. The full context is a budgeted block with recent observations and sessions (about 1,000 tokens); the lean context is the profile, open work and a short rubric (about 400) and leaves the rest to the search tools. Change the default in the header.' }),
+      h('p', { class: 'muted', text: 'Estimated tokens per call. The full context is a budgeted block with an index of recent observations and sessions (about 400 to 550 tokens); the lean context is the profile, open work and a short rubric (about 250) and leaves the rest to the search tools; the smart context starts lean and adds at most 250 tokens of memories on the first prompt, only when the prompt matches some (first-prompt calls count only those that added something). Change the default in the header.' }),
       h('div', { class: 'toolbar' }, h('label', { class: 'field' }, h('span', { text: 'Window' }), days),
         all ? h('label', { class: 'field' }, h('span', { text: 'All users' }), all) : null),
       out);

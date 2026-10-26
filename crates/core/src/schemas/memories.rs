@@ -109,6 +109,9 @@ pub struct IndexRow {
     /// `disputed` / `unconfirmed 4 months` for a fact or procedure to treat with care (see [`fact_caution`]).
     #[serde(default)]
     pub caution: Option<String>,
+    /// Observations only: how much the observer rated it, 0 to 1.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub importance: Option<f64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

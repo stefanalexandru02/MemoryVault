@@ -1,6 +1,7 @@
 ---
 name: brief
-description: Compile a sourced briefing on one topic from everything memory holds about it: facts, procedures and past work. Use when the user asks "what do we know about X", wants to get up to speed on a topic, or asks for the standing rules, preferences or how-tos about something.
+description: Use when the user wants a sourced briefing on one topic: its facts, procedures and past work.
+disable-model-invocation: true
 ---
 
 # Brief me on a topic

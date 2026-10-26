@@ -10,7 +10,7 @@ use axum::response::IntoResponse;
 use chrono::Utc;
 use memvault_core::auth::{ADMIN, MEMORIES_WRITE, resolve_write_space, writable_space_ids};
 use memvault_core::http::{Json, Path, Query};
-use memvault_core::ids::new_id;
+use memvault_core::ids::{new_id, short_id};
 use memvault_core::invalidate::notify_invalidate;
 use memvault_core::jobs::enqueue_embed;
 use memvault_core::schemas::common::{MemoryTable, Scope, ScopeKind, estimate_tokens};
@@ -301,7 +301,7 @@ async fn remember_fact(
 
 fn fact_response(id: Uuid, f: &RememberFact) -> RememberResponse {
     let subject = if f.subject.kind == "user" { String::new() } else { format!("{} ", f.subject.name) };
-    let tag = render::fact_tag(&id, f64::from(EXPLICIT_CONFIDENCE), &[], Some(Utc::now()), None);
+    let tag = render::fact_tag(&id, None);
     RememberResponse {
         id,
         table: MemoryTable::Facts,
@@ -368,12 +368,13 @@ async fn remember_observation(
         tokens,
         anchor: false,
         caution: None,
+        similar: 0,
     };
     Ok(RememberResponse {
         id,
         table: MemoryTable::Observations,
         status: "created".into(),
-        rendered: render::index_line(&entry, false),
+        rendered: render::index_line(&entry, &short_id(&id)),
     })
 }
 
@@ -441,7 +442,7 @@ async fn remember_procedure(
     };
     record_audit(conn, identity, audit).await?;
     enqueue_embed(conn, MemoryTable::Procedures.as_str(), id).await?;
-    let tag = render::procedure_tag(&id, version, Some(Utc::now()), None);
+    let tag = render::procedure_tag(&id, None);
     Ok(RememberResponse {
         id,
         table: MemoryTable::Procedures,

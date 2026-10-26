@@ -1,6 +1,6 @@
 ---
 name: remember
-description: Store or remove durable memories in shared memory. Use when the user asks to remember, note, keep or save something for later ("remember that", "from now on", "always", "for next time"), or asks to forget or correct something that was remembered.
+description: Store or forget a durable fact, procedure or note when the user says remember, "from now on", "always" or forget.
 ---
 
 # Remember and forget

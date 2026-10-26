@@ -35,6 +35,9 @@ pub struct Settings {
     pub tei_rerank_timeout: Duration,
     /// `FAKE_TEI=1`: deterministic in-process [`crate::tei::FakeTei`] (tests, local dev).
     pub fake_tei: bool,
+    /// Smart injection: the lowest reranker score (0 to 1) at which a memory is shown for a prompt. The score is the
+    /// probability-like output of a cross-encoder, 0.5 being the model's own relevant/not-relevant boundary.
+    pub smart_rerank_min: f64,
 
     // --- prompts and output schemas (spec 10.1, 9.4) ---
     pub prompts_dir: PathBuf,
@@ -98,6 +101,7 @@ impl Default for Settings {
             tei_embed_batch_timeout: Duration::from_secs(60),
             tei_rerank_timeout: Duration::from_millis(250),
             fake_tei: false,
+            smart_rerank_min: 0.5,
             prompts_dir: "prompts".into(),
             schemas_dir: "schemas".into(),
             token_pepper: String::new(),
@@ -161,6 +165,8 @@ impl Settings {
     /// Read the environment. Durations are given in (fractional) seconds, e.g. `TEI_RERANK_TIMEOUT_S=0.25`.
     pub fn from_env() -> Result<Self> {
         let d = Self::default();
+        let smart_rerank_min: f64 = parse("SMART_RERANK_MIN", d.smart_rerank_min)?;
+        anyhow::ensure!((0.0..=1.0).contains(&smart_rerank_min), "SMART_RERANK_MIN must be between 0 and 1");
         Ok(Self {
             database_url: var("DATABASE_URL").unwrap_or(d.database_url),
             database_system_url: var("DATABASE_SYSTEM_URL"),
@@ -174,6 +180,7 @@ impl Settings {
             tei_embed_batch_timeout: secs("TEI_EMBED_BATCH_TIMEOUT_S", d.tei_embed_batch_timeout)?,
             tei_rerank_timeout: secs("TEI_RERANK_TIMEOUT_S", d.tei_rerank_timeout)?,
             fake_tei: parse_bool("FAKE_TEI", d.fake_tei)?,
+            smart_rerank_min,
             prompts_dir: var("PROMPTS_DIR").map(PathBuf::from).unwrap_or(d.prompts_dir),
             schemas_dir: var("SCHEMAS_DIR").map(PathBuf::from).unwrap_or(d.schemas_dir),
             token_pepper: var("TOKEN_PEPPER").unwrap_or(d.token_pepper),

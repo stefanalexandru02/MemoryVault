@@ -23,6 +23,8 @@ use serde_json::Value;
 use sqlx::{PgConnection, Postgres, QueryBuilder};
 use uuid::Uuid;
 
+use crate::scoring::{HALF_LIFE_OBS, HALF_LIFE_OBS_LONG, type_boost};
+
 pub const KEYWORD_LIMIT: i64 = 40;
 pub const VECTOR_LIMIT: i64 = 60;
 /// Parts fetched per wanted owner before `DISTINCT ON`.
@@ -321,6 +323,31 @@ pub async fn recent_leg(
     let mut qb = QueryBuilder::<Postgres>::new(format!("SELECT t.id FROM {} t WHERE ", s.sql_table));
     push_where(&mut qb, table, f);
     qb.push(format_args!(" ORDER BY {} LIMIT ", s.recent_order)).push_bind(limit).push(" OFFSET ").push_bind(offset);
+    qb.build_query_scalar::<Uuid>().fetch_all(conn).await
+}
+
+/// The SessionStart pool: live observations by the final score of 11.4 for a candidate without a query
+/// (`(0.5 + 0.5·importance) × (0.3 + 0.7·recency) × type boost`, the weights of [`crate::scoring`]), newest on
+/// ties, so an important decision of a month ago can beat a minor change of today.
+pub async fn ranked_observation_leg(
+    conn: &mut PgConnection,
+    f: &Filters,
+    limit: i64,
+) -> Result<Vec<Uuid>, sqlx::Error> {
+    let mut qb = QueryBuilder::<Postgres>::new("SELECT t.id FROM observations t WHERE ");
+    push_where(&mut qb, MemoryTable::Observations, f);
+    qb.push(format_args!(
+        " ORDER BY (0.5 + 0.5 * t.importance)
+                   * (0.3 + 0.7 * power(0.5, greatest(extract(epoch FROM now() - t.created_at) / 86400.0, 0)
+                                             / CASE WHEN t.type IN ('decision', 'bugfix') THEN {HALF_LIFE_OBS_LONG}
+                                                    ELSE {HALF_LIFE_OBS} END))
+                   * CASE t.type WHEN 'decision' THEN {decision} WHEN 'security_alert' THEN {decision}
+                                 WHEN 'bugfix' THEN {bugfix} ELSE 1.0 END DESC,
+                   t.created_at DESC, t.id DESC LIMIT ",
+        decision = type_boost("decision"),
+        bugfix = type_boost("bugfix"),
+    ))
+    .push_bind(limit);
     qb.build_query_scalar::<Uuid>().fetch_all(conn).await
 }
 

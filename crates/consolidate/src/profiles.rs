@@ -23,21 +23,15 @@ struct ProfileFact {
     predicate: String,
     value_text: String,
     confidence: f64,
-    first_seen_at: DateTime<Utc>,
     last_confirmed_at: DateTime<Utc>,
     pinned: bool,
     disputed: bool,
-    devices: String,
 }
 
-/// One profile line: `- <subject>: <predicate> = <value> [fact#abc123 · 0.83 · laptop+desktop · 2026-10-02]`,
-/// with `disputed` or `unconfirmed N months` as a last tag part for a fact to treat with care.
+/// One profile line: `- <subject>: <predicate> = <value> [fact#abc123]`, with `disputed` or `unconfirmed N months`
+/// after the id for a fact to treat with care. Confidence, devices and evidence are in `memory_get` with `trace`.
 fn render_line(f: &ProfileFact, now: DateTime<Utc>) -> String {
-    let mut tag = vec![format!("fact#{}", short_id(&f.id)), format!("{:.2}", f.confidence)];
-    if !f.devices.is_empty() {
-        tag.push(f.devices.clone());
-    }
-    tag.push(f.first_seen_at.format("%Y-%m-%d").to_string());
+    let mut tag = vec![format!("fact#{}", short_id(&f.id))];
     tag.extend(fact_caution(f.confidence, f.last_confirmed_at, f.disputed, f.pinned, now));
     format!("- {}: {} = {} [{}]", f.subject, f.predicate, f.value_text.replace('\n', " "), tag.join(" · "))
 }
@@ -70,7 +64,7 @@ async fn facts_version(
     sqlx::query_scalar(
         "SELECT hashtextextended(coalesce(string_agg(
                   id::text || '|' || confidence::text || '|' || importance::text || '|' || pinned::text || '|'
-                  || value_text || '|' || learned_on_client_ids::text || '|' || (disputed_at IS NOT NULL)::text || '|'
+                  || value_text || '|' || (disputed_at IS NOT NULL)::text || '|'
                   || CASE WHEN now() - last_confirmed_at >= make_interval(days => $4)
                           THEN floor(extract(epoch FROM now() - last_confirmed_at) / 2592000)::text ELSE '' END,
                   ';' ORDER BY id), ''), 0)
@@ -105,9 +99,7 @@ pub async fn refresh_scope(
     .await?;
     let facts: Vec<ProfileFact> = sqlx::query_as(
         "SELECT f.id, e.canonical_name AS subject, f.predicate, f.value_text, f.confidence::float8 AS confidence,
-                f.first_seen_at, f.last_confirmed_at, f.pinned, f.disputed_at IS NOT NULL AS disputed,
-                coalesce((SELECT string_agg(c.device_id, '+' ORDER BY c.device_id)
-                            FROM clients c WHERE c.id = ANY (f.learned_on_client_ids)), '') AS devices
+                f.last_confirmed_at, f.pinned, f.disputed_at IS NOT NULL AS disputed
            FROM facts f JOIN entities e ON e.id = f.subject_id
           WHERE f.space_id = $1 AND f.scope_kind = $2 AND f.scope_key = $3 AND f.status = 'active'
             AND f.sensitivity <> 'secret'
@@ -184,11 +176,9 @@ mod tests {
             predicate: "prefers.editor".into(),
             value_text: "x".repeat(n),
             confidence: 0.83,
-            first_seen_at: seen(),
             last_confirmed_at: seen(),
             pinned: false,
             disputed: false,
-            devices: "desktop+laptop".into(),
         }
     }
 
@@ -199,17 +189,17 @@ mod tests {
     #[test]
     fn line_format() {
         let line = render_line(&fact(3), seen());
-        assert_eq!(line, "- alex: prefers.editor = xxx [fact#000000 · 0.83 · desktop+laptop · 2026-09-21]");
+        assert_eq!(line, "- alex: prefers.editor = xxx [fact#000000]");
     }
 
     #[test]
     fn line_carries_the_caution_tag() {
         let later = seen() + chrono::Duration::days(125);
-        assert!(render_line(&fact(3), later).ends_with("· 2026-09-21 · unconfirmed 4 months]"));
+        assert!(render_line(&fact(3), later).ends_with("[fact#000000 · unconfirmed 4 months]"));
         let disputed = ProfileFact { disputed: true, ..fact(3) };
-        assert!(render_line(&disputed, seen()).ends_with("· 2026-09-21 · disputed]"));
+        assert!(render_line(&disputed, seen()).ends_with("[fact#000000 · disputed]"));
         let pinned = ProfileFact { disputed: true, pinned: true, ..fact(3) };
-        assert!(render_line(&pinned, later).ends_with("· 2026-09-21]"));
+        assert!(render_line(&pinned, later).ends_with("[fact#000000]"));
     }
 
     #[test]

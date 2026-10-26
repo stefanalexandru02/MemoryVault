@@ -36,14 +36,36 @@ fn config_injection_is_sent_as_mode() {
     let (fake, env) = TestEnv::with_fake();
     fake.state().context = Some(BLOCK.into());
     let config = std::fs::read_to_string(env.home.join("config")).unwrap();
-    for (setting, mode) in
-        [("MEM_INJECTION=lean", Some("lean")), ("MEM_INJECTION=full", Some("full")), ("MEM_INJECTION=fat", None)]
-    {
+    for (setting, mode) in [
+        ("MEM_INJECTION=lean", Some("lean")),
+        ("MEM_INJECTION=full", Some("full")),
+        ("MEM_INJECTION=smart", Some("smart")),
+        ("MEM_INJECTION=fat", None),
+    ] {
         std::fs::write(env.home.join("config"), format!("{config}{setting}\n")).unwrap();
         start(&env, "startup");
         let path = fake.matching("GET", "/v1/context").last().unwrap().path.clone();
         let want = "/v1/context?project_key=local%2Fproj&device_id=laptop-x1&source=startup";
         assert_eq!(path, mode.map_or(want.to_string(), |m| format!("{want}&mode={m}")));
+    }
+}
+
+#[test]
+fn config_index_size_and_types_are_sent() {
+    let (fake, env) = TestEnv::with_fake();
+    fake.state().context = Some(BLOCK.into());
+    let want = "/v1/context?project_key=local%2Fproj&device_id=laptop-x1&source=startup";
+    for (setting, suffix) in [
+        ("MEM_CONTEXT_ROWS=8", "&rows=8"),
+        ("MEM_CONTEXT_ROWS=0\nMEM_CONTEXT_TYPES=Decision,bugfix,opinion", "&types=decision,bugfix"),
+        ("MEM_CONTEXT_ROWS=31\nMEM_CONTEXT_TYPES=everything", ""),
+        ("MEM_CONTEXT_ROWS=6\nMEM_CONTEXT_TYPES=decision\nMEM_INJECTION=full", "&mode=full&rows=6&types=decision"),
+    ] {
+        env.write_config(&fake.url);
+        env.append_config(setting);
+        start(&env, "startup");
+        let path = fake.matching("GET", "/v1/context").last().unwrap().path.clone();
+        assert_eq!(path, format!("{want}{suffix}"), "{setting}");
     }
 }
 

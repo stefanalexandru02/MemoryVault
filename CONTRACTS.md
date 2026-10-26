@@ -65,7 +65,7 @@ take turns on sqlx's advisory lock; migrations the binary does not know are igno
 |---|---|
 | 0001-0099 | foundation (0099 = grants) |
 | 0100-0199 | ingest (0100 exists: `session_windows`, lease bookkeeping) |
-| 0200-0299 | recall (0200-0203 exist: context cache columns, invalidations, injection modes) |
+| 0200-0299 | recall (0200-0205 exist: context cache columns, invalidations, injection modes, index size and types, smart mode) |
 | 0300-0399 | memories / mcp |
 | 0400-0499 | consolidation (0400 exists: decay and revert bookkeeping) |
 | 0500-0599 | worker |
@@ -96,7 +96,7 @@ Full DDL of spec 4.1-4.7 plus:
   consumed_at, created_at)` - 10.4 step 4.
 - `context_cache(cache_key PK, user_id, space_id, space_ids uuid[], scopes text[] ('kind:key'), device_id, source,
   body_md, etag, token_estimate, rendered_at, mode, hit_count)` - 11.6. RLS: a user sees only own rows.
-- `user_settings(user_id PK, injection_mode 'full'|'lean', updated_at)` - the user's defaults. RLS: own row only
+- `user_settings(user_id PK, injection_mode 'full'|'lean'|'smart', updated_at)` - the user's defaults. RLS: own row only
   (no `space_id`, so `memsvc_apply_space_rls` is not used).
 - `rate_limits(subject, window_start, count)` - 5.1. Old windows are pruned by the worker's retention job.
 - SQL functions: `app_user_id()`, `app_client_id()`, `readable_spaces()`, `writable_spaces()`,
@@ -128,6 +128,11 @@ Full DDL of spec 4.1-4.7 plus:
 - **0203 recall**: `user_settings`; `retrieval_log.tokens`, `.hits`, `.injection` (`full`|`lean`, context calls only)
   and an index on `(client_id, created_at)`; `context_cache.mode`, `.hit_count`; `memsvc_recall_invalidate` is
   recreated returning `mode` as well (same grants). The cache key is `v2` and includes the mode.
+- **0204 recall**: `context_cache.obs_rows` (default 12) and `.obs_types` (text[]): the size and types of a full block's
+  observation index (`GET /v1/context?rows=&types=`); `memsvc_recall_invalidate` returns both. The cache key is `v3`
+  and includes them (`cache::Variant`; lean blocks ignore them).
+- **0205 recall**: the check constraints of `user_settings.injection_mode`, `retrieval_log.injection` and `context_cache.mode`
+  also allow `smart` (the lean block at session start; the first prompt asks `POST /v1/context/prompt`).
 - **0401 consolidation**: `scope_planning(space_id, scope_kind, scope_key, last_planned_at)` (when the planner last
   processed a scope), `planner_runs(run_id, space_id, scope_kind?, scope_key?, trigger, packets, actions, created_at)`
   (one row per run and space; trigger `nightly|session_end|threshold|manual`), both with forced space RLS, and the
@@ -163,7 +168,7 @@ Full DDL of spec 4.1-4.7 plus:
   `search_tsv @@ websearch_to_tsquery('simple', $q)` with `ts_rank_cd`. Vector leg: call
   `db::tune_vector_search(&mut tx, &caps, 80)` first (sets `hnsw.iterative_scan` only when supported).
 - **Ids**: `memvault_core::ids::new_id()` (UUIDv7); `short_id(&id)` = last 6 hex chars for citation tags;
-  `id_time(&id)`.
+  `short_ids(&[id])` = those, lengthened where two ids of the set end alike (what tables show); `id_time(&id)`.
 - **Time**: `timestamptz` / `chrono::DateTime<Utc>` everywhere.
 - **token_estimate** = `ceil(chars / 4)`: `memvault_core::estimate_tokens(&str) -> i32` (replaces tiktoken).
 - **Scopes**: `schemas::common::Scope { kind: ScopeKind, key }`; global key `""`; text form `kind:key`
@@ -203,8 +208,8 @@ Full DDL of spec 4.1-4.7 plus:
   ingest must use the core path).
 - **Job types** (`jobs`, worker lanes): `embed` `{owner_table, owner_id, model?}` (`model` set by reindex; a job
   for another model than `EMBED_MODEL` fails permanently); `render_context` = `memvault_recall::cache::
-  RenderContextJob {cache_key, user_id, client_id, project_key, device_id, source, mode}` (`mode` defaults to `full`
-  for jobs queued before it existed), queued by the API's cache
+  RenderContextJob {cache_key, user_id, client_id, project_key, device_id, source, mode, obs_rows, obs_types}` (`mode`
+  defaults to `full` and `obs_rows`/`obs_types` to 12/all for jobs queued before they existed), queued by the API's cache
   listener with `run_after = now() + CONTEXT_RERENDER_DEBOUNCE_S`, coalesced per `cache_key`, run by
   `memvault_recall::cache::rerender(&state, &payload) -> Result<bool, ApiError>` (false: user or client gone; the
   job is done either way); `plan` = `memvault_core::jobs::PlanJob {space_id, scope, trigger}`, queued by
@@ -229,7 +234,7 @@ Full DDL of spec 4.1-4.7 plus:
 `DATABASE_URL` (app role), `DATABASE_SYSTEM_URL` (system role; unset = the app URL, and `system_tx` errors unless
 that login is superuser or BYPASSRLS), `DB_POOL_MAX` (10), `TEI_EMBED_URL`, `TEI_RERANK_URL`, `EMBED_MODEL`
 (`bge-m3`, the value stored in `embeddings.model`), `EMBED_DIMS` (1024), `RERANK_MODEL`, `TEI_EMBED_TIMEOUT_S`
-(2.0), `TEI_RERANK_TIMEOUT_S` (0.25), `FAKE_TEI` (bool), `PROMPTS_DIR` (`prompts`), `SCHEMAS_DIR` (`schemas`),
+(2.0), `TEI_RERANK_TIMEOUT_S` (0.25), `FAKE_TEI` (bool), `SMART_RERANK_MIN` (0.5, reranker score a memory needs for smart injection), `PROMPTS_DIR` (`prompts`), `SCHEMAS_DIR` (`schemas`),
 `TOKEN_PEPPER`, `RATE_LIMIT_EVENTS_PER_MIN` (600), `RATE_LIMIT_DEFAULT_PER_MIN` (120), `WINDOW_TOOL_USES` (8),
 `WINDOW_IDLE_SECONDS` (90), `LEASE_SECONDS_DEFAULT` (600), `PREFERRED_RUNNER_SECONDS` (600),
 `WORKER_SWEEP_INTERVAL_S` (30), `EMBED_BATCH_SIZE` (64), `EMBED_CONCURRENCY` (2), `EMBED_MAX_PART_TOKENS` (512),
@@ -341,6 +346,7 @@ the packet done. The server builds the registry with `memvault_ingest::register_
     fn model(&self) -> &str; fn dims(&self) -> usize;
     async fn embed(&self, texts: &[String]) -> Result<Vec<Vec<f32>>, TeiError>;          // L2-normalised, input order
     async fn rerank(&self, query: &str, texts: &[String]) -> Result<Vec<f32>, TeiError>; // aligned with texts
+    fn calibrated_rerank(&self) -> bool { true }   // false for FakeTei: its score is a share of words, not a probability
     async fn health(&self) -> TeiHealth { embed, rerank };
 }
 TeiClient::new(embed_url, rerank_url, model, dims, embed_timeout, rerank_timeout) / ::from_settings(&s)
@@ -373,7 +379,8 @@ CLI `memvault`: `serve [--host] [--port]` (graceful shutdown on SIGINT/SIGTERM),
 | `engine::get_memories(&AppState, &Identity, &[Uuid]) -> Result<GetResponse, ApiError>` | recall | 6.4 |
 | `engine::explain(&AppState, &Identity, Uuid) -> Result<ExplainResponse, ApiError>` | recall | 12.5 |
 | `engine::history(&AppState, &Identity, Uuid) -> Result<HistoryResponse, ApiError>` | recall | 6.4 |
-| `context::render_context(&AppState, &Identity, project_key: Option<&str>, device_id: Option<&str>, source: &str) -> Result<String, ApiError>` | recall | 6.3, 11.5-11.7 |
+| `context::render_context(&AppState, &Identity, project_key: Option<&str>, device_id: Option<&str>, source: &str, mode: Option<InjectionMode>) -> Result<String, ApiError>` (`render_context_with(.., &ContextOptions { mode, rows, types })` adds the index size and types) | recall | 6.3, 11.5-11.7 |
+| `smart::prompt_context(&AppState, &Identity, PromptContextRequest) -> Result<String, ApiError>` (`POST /v1/context/prompt`: up to 5 index rows, 250 tokens, 600 ms; empty when nothing is relevant) | recall | - |
 | `cache::spawn_listener(AppState, CancellationToken) -> JoinHandle<()>` | recall | 11.6 |
 | `cache::rerender(&AppState, &RenderContextJob) -> Result<bool, ApiError>` | recall | 11.6 |
 | `mcp::service(AppState) -> axum::Router` (applies its own bearer auth; mount with `nest_service("/mcp", ..)`) | memories | 7 |

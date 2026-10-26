@@ -3,7 +3,8 @@
 # Quick start:
 #   make up                       # full stack with TEI (or `make up-lite` without the models)
 #   make connect-local            # wire Claude Code on this machine to the stack (token, hooks, MCP)
-#                                 # INJECTION=lean sends a ~400 token block at session start instead of the full one
+#                                 # INJECTION=lean sends a ~250 token block at session start instead of the full one;
+#                                 # INJECTION=smart adds, on the first prompt, the few memories it matches
 #   make disconnect               # undo that
 #   make connect-local AGENT=codex    # the same for Codex CLI (AGENT=gemini for Gemini CLI); make disconnect AGENT=codex
 #   make connect-remote URL=https://memory.example.ts.net TOKEN=mem_...   # wire it to another server
@@ -130,7 +131,7 @@ connect-local: .env ## One step: mint a token for this machine, install the hook
 
 connect-remote: ## Same, for a server somewhere else: make connect-remote URL=https://... TOKEN=mem_...
 	@[ "$(origin URL)" = "command line" ] && [ "$(origin TOKEN)" = "command line" ] \
-	  || { echo "usage: make connect-remote URL=https://memory.example.ts.net TOKEN=mem_... [CLIENT=device-name] [INJECTION=lean|full] [AGENT=codex|gemini]" >&2; exit 2; }
+	  || { echo "usage: make connect-remote URL=https://memory.example.ts.net TOKEN=mem_... [CLIENT=device-name] [INJECTION=lean|full|smart] [AGENT=codex|gemini]" >&2; exit 2; }
 	@$(CONNECT) connect --url "$(URL)" --token "$(TOKEN)" --device "$(CLIENT)" $(if $(INJECTION),--injection "$(INJECTION)") $(if $(AGENT),--client "$(AGENT)")
 
 connect-status: ## Show what Claude Code, Codex CLI and Gemini CLI are connected to and whether it works

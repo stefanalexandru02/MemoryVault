@@ -12,7 +12,7 @@ use std::time::Instant;
 use chrono::{DateTime, Utc};
 use memvault_core::auth::resolve_read_spaces;
 use memvault_core::db::caps;
-use memvault_core::ids::new_id;
+use memvault_core::ids::{new_id, short_id};
 use memvault_core::schemas::common::{InjectionMode, MemoryTable, Scope, ScopeKind, Sensitivity, SummaryGrain};
 use memvault_core::schemas::memories::{
     AuditEntry, ByFileQuery, DocumentFull, EntityRef, EvidenceObservation, ExplainResponse, FactFull, FeedbackCounts,
@@ -31,10 +31,10 @@ use uuid::Uuid;
 
 use crate::candidates::{
     Filters, KEYWORD_LIMIT, TierRow, VECTOR_LIMIT, VECTOR_PART_FANOUT, best_part_embeddings, hydrate, keyword_leg,
-    query_terms, recent_leg, vector_leg,
+    query_terms, ranked_observation_leg, recent_leg, vector_leg,
 };
 use crate::render;
-use crate::scoring::{Candidate, budget_fill, by_score, mmr_order, rrf_fuse};
+use crate::scoring::{Candidate, budget_fill, by_score, diversify, mmr_order, rrf_fuse};
 use memvault_core::db::tune_vector_search;
 use memvault_core::user_tx;
 
@@ -114,13 +114,15 @@ pub struct PackOptions {
     pub rerank: bool,
     pub exclude_sensitivity: Vec<Sensitivity>,
     /// SessionStart: no query, pinned facts only, no documents, subagent observations hidden, session
-    /// summaries only (at most [`CONTEXT_SUMMARIES`]), at most [`CONTEXT_OBS_ROWS`] index rows.
+    /// summaries only (at most [`CONTEXT_SUMMARIES`]), observations chosen by importance and recency with
+    /// [`scoring::diversify`] into `index_rows` index rows of `index_types` (empty = all).
     pub context: bool,
+    pub index_rows: usize,
+    pub index_types: Vec<String>,
     /// Rank and filter as of this instant instead of now.
     pub as_of: Option<DateTime<Utc>>,
 }
 
-pub const CONTEXT_OBS_ROWS: usize = 30;
 pub const CONTEXT_SUMMARIES: usize = 5;
 
 /// Slots plus what `retrieval_log` records.
@@ -149,7 +151,7 @@ fn rerank_text(row: &TierRow) -> String {
     }
 }
 
-async fn embed_query(state: &AppState, query: &str) -> Option<Vec<f32>> {
+pub(crate) async fn embed_query(state: &AppState, query: &str) -> Option<Vec<f32>> {
     match state.tei.embed(&[query.to_string()]).await {
         Ok(mut v) if !v.is_empty() => Some(v.swap_remove(0)),
         Ok(_) => None,
@@ -162,7 +164,7 @@ async fn embed_query(state: &AppState, query: &str) -> Option<Vec<f32>> {
 
 /// Rerank the fused top 40 across tiers; the rerank score replaces RRF as the base (11.3).
 /// False on timeout or error, leaving RRF in place.
-async fn rerank(state: &AppState, query: &str, cands: &mut [&mut Candidate]) -> bool {
+pub(crate) async fn rerank(state: &AppState, query: &str, cands: &mut [&mut Candidate]) -> bool {
     cands.sort_by(|a, b| b.rrf.total_cmp(&a.rrf).then(a.table.cmp(&b.table)).then(a.id.cmp(&b.id)));
     let n = cands.len().min(RERANK_TOP);
     let top = &mut cands[..n];
@@ -235,6 +237,9 @@ pub async fn build_pack(
         as_of: opts.as_of,
         ..Filters::default()
     };
+    // `types` of the index limit the observations only: summaries and procedures have other kinds.
+    let obs_filters =
+        Filters { types: Some(opts.index_types.clone()).filter(|t| opts.context && !t.is_empty()), ..filters.clone() };
 
     let mut by_tier: BTreeMap<MemoryTable, Vec<Candidate>> = BTreeMap::new();
     for table in TIER_ORDER {
@@ -242,24 +247,26 @@ pub async fn build_pack(
         // The SessionStart block never carries facts beyond the pinned ones, nor documents.
         let in_context = matches!(table, MemoryTable::Facts | MemoryTable::Documents);
         if budget_of(&budgets, table) > 0 && !(in_context && opts.context) {
+            let f = if table == MemoryTable::Observations { &obs_filters } else { &filters };
             if query.is_some() {
                 let kw = if terms.is_empty() && entity_terms.is_empty() {
                     Vec::new()
                 } else {
-                    keyword_leg(conn, db_caps.pg_search, table, &filters, &terms, &entity_terms, KEYWORD_LIMIT).await?
+                    keyword_leg(conn, db_caps.pg_search, table, f, &terms, &entity_terms, KEYWORD_LIMIT).await?
                 };
                 let vec = match &qvec {
-                    Some(v) => vector_leg(conn, table, &filters, v, &model, true, VECTOR_LIMIT).await?,
+                    Some(v) => vector_leg(conn, table, f, v, &model, true, VECTOR_LIMIT).await?,
                     None => Vec::new(),
                 };
                 cands = rrf_fuse(table, &kw, &vec, FUSED_LIMIT);
             } else {
-                let limit = if table == MemoryTable::Observations { NO_QUERY_OBS_LIMIT } else { NO_QUERY_LIMIT };
-                cands = recent_leg(conn, table, &filters, limit, 0)
-                    .await?
-                    .into_iter()
-                    .map(|id| Candidate { rrf: 1.0, ..Candidate::new(id, table) })
-                    .collect();
+                let ids = if opts.context && table == MemoryTable::Observations {
+                    ranked_observation_leg(conn, f, NO_QUERY_OBS_LIMIT).await?
+                } else {
+                    let limit = if table == MemoryTable::Observations { NO_QUERY_OBS_LIMIT } else { NO_QUERY_LIMIT };
+                    recent_leg(conn, table, f, limit, 0).await?
+                };
+                cands = ids.into_iter().map(|id| Candidate { rrf: 1.0, ..Candidate::new(id, table) }).collect();
             }
         }
         by_tier.insert(table, cands);
@@ -339,9 +346,12 @@ pub async fn build_pack(
     slots.procedures = procedures;
     by_slot.insert("procedures".into(), used);
 
-    let max_rows = opts.context.then_some(CONTEXT_OBS_ROWS);
-    let (mut observations, used) =
-        fill_observations(mmr_order(take(MemoryTable::Observations)), budgets.observations, opts.expand, max_rows);
+    let mut obs_order = mmr_order(take(MemoryTable::Observations));
+    if opts.context {
+        obs_order = diversify(obs_order, opts.index_rows);
+    }
+    let max_rows = opts.context.then_some(opts.index_rows);
+    let (mut observations, used) = fill_observations(obs_order, budgets.observations, opts.expand, max_rows);
     if opts.context {
         // The SessionStart index reads newest first, like claude-mem's.
         observations.sort_by(|a, b| b.created_at.cmp(&a.created_at).then(a.item.id.cmp(&b.item.id)));
@@ -415,8 +425,8 @@ fn fill_observations(
             }
         }
         if let Some(item) = observation_item(c, false) {
-            let cost =
-                i64::from(estimate_tokens(&render::index_line(&render::IndexEntry::from_observation(&item), false)));
+            let line = render::index_line(&render::IndexEntry::from_observation(&item), &short_id(&item.item.id));
+            let cost = i64::from(estimate_tokens(&line));
             if used + cost <= budget {
                 used += cost;
                 out.push(item);
@@ -602,8 +612,7 @@ fn slot_item(c: &Candidate, row: &TierRow, token_estimate: i32, citation: String
 fn fact_item(c: &Candidate) -> Option<FactItem> {
     let row @ TierRow::Fact(r) = c.row.as_ref()? else { return None };
     let confidence = f64::from(r.confidence);
-    let citation =
-        render::fact_tag(&r.id, confidence, &r.devices, Some(r.first_seen_at), r.caution(Utc::now()).as_deref());
+    let citation = render::fact_tag(&r.id, r.caution(Utc::now()).as_deref());
     Some(FactItem {
         item: slot_item(c, row, estimate_tokens(&r.value_text), citation),
         subject: r.subject_name.clone(),
@@ -628,12 +637,7 @@ fn procedure_item(c: &Candidate) -> Option<ProcedureItem> {
             c,
             row,
             tokens,
-            render::procedure_tag(
-                &r.id,
-                r.version,
-                Some(r.created_at),
-                procedure_caution(r.success_count, r.failure_count).as_deref(),
-            ),
+            render::procedure_tag(&r.id, procedure_caution(r.success_count, r.failure_count).as_deref()),
         ),
         name: r.name.clone(),
         task_class: r.task_class.clone(),
@@ -674,12 +678,7 @@ fn observation_item(c: &Candidate, expand: bool) -> Option<ObservationItem> {
 fn summary_item(c: &Candidate) -> Option<SummaryItem> {
     let row @ TierRow::Sum(r) = c.row.as_ref()? else { return None };
     Some(SummaryItem {
-        item: slot_item(
-            c,
-            row,
-            r.token_estimate,
-            render::summary_tag(&r.id, r.device_id.as_deref(), Some(r.created_at)),
-        ),
+        item: slot_item(c, row, r.token_estimate, render::summary_tag(&r.id)),
         grain: r.grain,
         request: r.request.clone(),
         learned: r.learned.clone(),
@@ -749,7 +748,7 @@ pub async fn log_cached_retrieval(
     insert_retrieval(conn, identity, rec, json!([]), json!([]), false).await
 }
 
-async fn insert_retrieval(
+pub(crate) async fn insert_retrieval(
     conn: &mut PgConnection,
     identity: &Identity,
     rec: RetrievalRecord<'_>,
@@ -819,6 +818,8 @@ pub async fn recall(state: &AppState, identity: &Identity, req: RecallRequest) -
         rerank: req.rerank,
         exclude_sensitivity: req.exclude_sensitivity.clone(),
         context: false,
+        index_rows: 0,
+        index_types: Vec::new(),
         as_of: req.as_of,
     };
     let pack = build_pack(state, &mut tx, &spaces, &scopes, &opts).await?;
@@ -892,7 +893,7 @@ pub async fn feedback(
 
 // ---------- index rows (search, timeline, by-file) ----------
 
-fn index_row(row: &TierRow, score: Option<f64>, anchor: bool) -> IndexRow {
+pub(crate) fn index_row(row: &TierRow, score: Option<f64>, anchor: bool) -> IndexRow {
     let (table, row_type, title, created_at, tokens) = match row {
         TierRow::Obs(r) => {
             let tokens = if r.token_estimate > 0 {
@@ -939,6 +940,10 @@ fn index_row(row: &TierRow, score: Option<f64>, anchor: bool) -> IndexRow {
         TierRow::Proc(r) => procedure_caution(r.success_count, r.failure_count),
         TierRow::Obs(_) | TierRow::Sum(_) | TierRow::Doc(_) => None,
     };
+    let importance = match row {
+        TierRow::Obs(r) => Some(round6(f64::from(r.importance))),
+        _ => None,
+    };
     IndexRow {
         id: row.id(),
         table,
@@ -950,6 +955,7 @@ fn index_row(row: &TierRow, score: Option<f64>, anchor: bool) -> IndexRow {
         score: score.map(round6),
         is_anchor: anchor,
         caution,
+        importance,
     }
 }
 
@@ -1372,39 +1378,53 @@ async fn feedback_counts(conn: &mut PgConnection, ids: &[Uuid]) -> Result<BTreeM
         .collect())
 }
 
-/// Map display refs (`obs#a1b2c3`, the 6-hex short id, or a full id) to visible row ids, for the
-/// MCP `memory_get` tool whose input may come from the SessionStart index. A ref matching no row,
-/// or more than one, maps to `None`.
+/// What a display ref points at.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RefMatch {
+    One(Uuid),
+    /// No visible row ends with it.
+    Missing,
+    /// More than one visible row ends with it (some of them).
+    Ambiguous(Vec<Uuid>),
+}
+
+/// Map display refs (`obs#a1b2c3`, a short id of 4 or more hex characters, or a full id) to visible row ids, for the
+/// MCP tools whose input may come from an index.
 pub async fn resolve_refs(
     state: &AppState,
     identity: &Identity,
     refs: &[String],
-) -> Result<Vec<(String, Option<Uuid>)>, ApiError> {
+) -> Result<Vec<(String, RefMatch)>, ApiError> {
     let mut tx = user_tx(&state.db.app, identity).await?;
     let mut out = Vec::with_capacity(refs.len());
     for r in refs {
         let text = r.trim().to_lowercase();
         let text = text.rsplit('#').next().unwrap_or("").to_string();
         if let Ok(id) = text.parse::<Uuid>() {
-            out.push((r.clone(), Some(id)));
+            out.push((r.clone(), RefMatch::One(id)));
             continue;
         }
         if text.len() < 4 || !text.chars().all(|c| c.is_ascii_hexdigit()) {
-            out.push((r.clone(), None));
+            out.push((r.clone(), RefMatch::Missing));
             continue;
         }
-        let ids: Vec<Uuid> = sqlx::query_scalar(
+        let mut ids: Vec<Uuid> = sqlx::query_scalar(
             "SELECT id FROM observations WHERE replace(id::text, '-', '') LIKE '%' || $1
              UNION ALL SELECT id FROM summaries WHERE replace(id::text, '-', '') LIKE '%' || $1
              UNION ALL SELECT id FROM facts WHERE replace(id::text, '-', '') LIKE '%' || $1
              UNION ALL SELECT id FROM procedures WHERE replace(id::text, '-', '') LIKE '%' || $1
              UNION ALL SELECT id FROM documents WHERE replace(id::text, '-', '') LIKE '%' || $1
-             LIMIT 2",
+             LIMIT 5",
         )
         .bind(&text)
         .fetch_all(&mut *tx)
         .await?;
-        out.push((r.clone(), if ids.len() == 1 { Some(ids[0]) } else { None }));
+        let found = match ids.len() {
+            0 => RefMatch::Missing,
+            1 => RefMatch::One(ids.remove(0)),
+            _ => RefMatch::Ambiguous(ids),
+        };
+        out.push((r.clone(), found));
     }
     tx.commit().await?;
     Ok(out)

@@ -13,7 +13,10 @@ use std::time::Duration;
 use chrono::{DateTime, Utc};
 use memvault_core::invalidate::{CHANNEL, parse_payload};
 use memvault_core::schemas::common::{InjectionMode, Scope};
+use memvault_core::schemas::recall::DEFAULT_CONTEXT_ROWS;
 use memvault_core::{ApiError, AppState, Identity};
+
+use crate::context::ContextOptions;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use sqlx::postgres::PgListener;
@@ -29,15 +32,25 @@ pub const MAX_AGE_SECONDS: i64 = 3600;
 const RERENDER_IF_USED_WITHIN_DAYS: i32 = 7;
 const RECONNECT_DELAY: Duration = Duration::from_secs(5);
 
+/// What a block was rendered with besides who asked and from where: the injection mode and, in the full
+/// block, the size and types of the observation index (a lean block is not a full one, nor are 6 rows 12).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Variant {
+    pub mode: InjectionMode,
+    pub rows: u32,
+    /// Sorted, without duplicates; empty = every type.
+    pub types: Vec<String>,
+}
+
 /// The 11.6 key `(spaces, sorted scopes, device, source)`, plus the user because rows are per user
-/// (a render reflects that user's memberships) and the injection mode (a lean block is not a full one).
+/// (a render reflects that user's memberships) and the [`Variant`].
 pub fn cache_key(
     user_id: Uuid,
     spaces: &[Uuid],
     scopes: &[Scope],
     device_id: &str,
     source: &str,
-    mode: InjectionMode,
+    variant: &Variant,
 ) -> String {
     let mut spaces = spaces.to_vec();
     spaces.sort();
@@ -46,7 +59,13 @@ pub fn cache_key(
     scopes.sort();
     scopes.dedup();
     let spaces: Vec<String> = spaces.iter().map(Uuid::to_string).collect();
-    let raw = format!("v2\n{user_id}\n{}\n{}\n{device_id}\n{source}\n{mode}", spaces.join(","), scopes.join("\n"));
+    let Variant { mode, rows, types } = variant;
+    let raw = format!(
+        "v3\n{user_id}\n{}\n{}\n{device_id}\n{source}\n{mode}\n{rows}\n{}",
+        spaces.join(","),
+        scopes.join("\n"),
+        types.join(",")
+    );
     hex::encode(&Sha256::digest(raw.as_bytes())[..16])
 }
 
@@ -87,7 +106,7 @@ pub struct CacheEntry<'a> {
     pub project_key: Option<&'a str>,
     pub device_id: &'a str,
     pub source: &'a str,
-    pub mode: InjectionMode,
+    pub variant: &'a Variant,
     /// Memories the block was rendered from.
     pub hits: i32,
     /// When the render began (see [`render_start`]), not when it is stored.
@@ -104,14 +123,14 @@ pub async fn store(conn: &mut PgConnection, entry: &CacheEntry<'_>, body: &str) 
     let scopes: Vec<String> = entry.scopes.iter().map(Scope::as_text).collect();
     sqlx::query(
         "INSERT INTO context_cache (cache_key, user_id, space_id, space_ids, scopes, device_id, source, body_md, etag,
-                                    token_estimate, rendered_at, client_id, project_key, mode, hit_count)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $13, $11, $12, $14, $15)
+                                    token_estimate, rendered_at, client_id, project_key, mode, hit_count, obs_rows, obs_types)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $13, $11, $12, $14, $15, $16, $17)
          ON CONFLICT (cache_key) DO UPDATE SET
            space_id = EXCLUDED.space_id, space_ids = EXCLUDED.space_ids, scopes = EXCLUDED.scopes,
            device_id = EXCLUDED.device_id, source = EXCLUDED.source, body_md = EXCLUDED.body_md,
            etag = EXCLUDED.etag, token_estimate = EXCLUDED.token_estimate, rendered_at = EXCLUDED.rendered_at,
            client_id = EXCLUDED.client_id, project_key = EXCLUDED.project_key, mode = EXCLUDED.mode,
-           hit_count = EXCLUDED.hit_count",
+           hit_count = EXCLUDED.hit_count, obs_rows = EXCLUDED.obs_rows, obs_types = EXCLUDED.obs_types",
     )
     .bind(entry.key)
     .bind(entry.identity.user_id)
@@ -126,8 +145,10 @@ pub async fn store(conn: &mut PgConnection, entry: &CacheEntry<'_>, body: &str) 
     .bind(entry.identity.client_id)
     .bind(entry.project_key)
     .bind(entry.rendered_at)
-    .bind(entry.mode)
+    .bind(entry.variant.mode)
     .bind(entry.hits)
+    .bind(i32::try_from(entry.variant.rows).unwrap_or(i32::MAX))
+    .bind(&entry.variant.types)
     .execute(conn)
     .await?;
     Ok(())
@@ -146,6 +167,15 @@ pub struct RenderContextJob {
     /// Absent in jobs queued before the injection modes existed.
     #[serde(default)]
     pub mode: InjectionMode,
+    /// Index size and types of the block (absent in jobs queued before they were configurable).
+    #[serde(default = "default_rows")]
+    pub obs_rows: i32,
+    #[serde(default)]
+    pub obs_types: Vec<String>,
+}
+
+fn default_rows() -> i32 {
+    i32::try_from(DEFAULT_CONTEXT_ROWS).unwrap_or(i32::MAX)
 }
 
 #[derive(sqlx::FromRow)]
@@ -166,7 +196,7 @@ pub async fn invalidate(
 ) -> Result<u64, sqlx::Error> {
     let mut tx = pool.begin().await?;
     let deleted: Vec<Invalidated> = sqlx::query_as(
-        "SELECT cache_key, user_id, client_id, project_key, device_id, source, mode,
+        "SELECT cache_key, user_id, client_id, project_key, device_id, source, mode, obs_rows, obs_types,
                 rendered_at > now() - make_interval(days => $4) AS recent
            FROM memsvc_recall_invalidate($1, $2, $3)",
     )
@@ -273,13 +303,18 @@ pub async fn rerender(state: &AppState, payload: &serde_json::Value) -> Result<b
         device_id,
         client_kind,
     };
-    crate::context::render_context(
+    let options = ContextOptions {
+        mode: Some(job.mode),
+        rows: u32::try_from(job.obs_rows).ok(),
+        types: job.obs_types.iter().filter_map(|t| t.parse().ok()).collect(),
+    };
+    crate::context::render_context_with(
         state,
         &identity,
         job.project_key.as_deref(),
         job.device_id.as_deref(),
         job.source.as_deref().unwrap_or("startup"),
-        Some(job.mode),
+        &options,
     )
     .await?;
     Ok(true)
@@ -295,13 +330,17 @@ mod tests {
         let (u, a, b) = (Uuid::from_u128(1), Uuid::from_u128(2), Uuid::from_u128(3));
         let s1 = [Scope::global(), Scope::new(ScopeKind::Project, "p")];
         let s2 = [Scope::new(ScopeKind::Project, "p"), Scope::global(), Scope::global()];
-        let key = |u, spaces: &[Uuid], scopes: &[Scope], source, mode| cache_key(u, spaces, scopes, "d", source, mode);
-        let full = InjectionMode::Full;
-        assert_eq!(key(u, &[a, b], &s1, "startup", full), key(u, &[b, a, a], &s2, "startup", full));
-        assert_ne!(key(u, &[a], &s1, "startup", full), key(u, &[a], &s1, "clear", full));
-        assert_ne!(key(u, &[a], &s1, "startup", full), key(a, &[a], &s1, "startup", full));
-        assert_ne!(key(u, &[a], &s1, "startup", full), key(u, &[a], &s1, "startup", InjectionMode::Lean));
-        assert_eq!(key(u, &[a], &s1, "startup", full).len(), 32);
+        let key =
+            |u, spaces: &[Uuid], scopes: &[Scope], source, v: &Variant| cache_key(u, spaces, scopes, "d", source, v);
+        let full = Variant { mode: InjectionMode::Full, rows: 12, types: vec![] };
+        assert_eq!(key(u, &[a, b], &s1, "startup", &full), key(u, &[b, a, a], &s2, "startup", &full));
+        assert_ne!(key(u, &[a], &s1, "startup", &full), key(u, &[a], &s1, "clear", &full));
+        assert_ne!(key(u, &[a], &s1, "startup", &full), key(a, &[a], &s1, "startup", &full));
+        let other = |v: Variant| key(u, &[a], &s1, "startup", &v);
+        assert_ne!(other(full.clone()), other(Variant { mode: InjectionMode::Lean, ..full.clone() }));
+        assert_ne!(other(full.clone()), other(Variant { rows: 6, ..full.clone() }));
+        assert_ne!(other(full.clone()), other(Variant { types: vec!["decision".into()], ..full.clone() }));
+        assert_eq!(key(u, &[a], &s1, "startup", &full).len(), 32);
         assert_eq!(etag("x"), etag("x"));
         assert!(etag("x").starts_with('"'));
     }

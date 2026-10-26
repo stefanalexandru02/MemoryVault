@@ -1,6 +1,7 @@
 ---
 name: how-it-works
-description: Explain how MemoryVault captures, stores and recalls memory, what leaves this machine, and how to inspect or delete it. Use when the user asks how the memory plugin works, what it records, where the data lives, whether it is private, or how to stop or erase it.
+description: Use when the user asks what MemoryVault records, where it lives, or how to inspect, stop or erase it.
+disable-model-invocation: true
 ---
 
 # How MemoryVault works
@@ -28,16 +29,20 @@ revoked by the server's admin. Local files: `~/.memory/config` (URL and device n
 and `cache/` (the last context block, shown if the server is down).
 
 **Recall.** At session start the hook injects a short context block: the profile, open work state, a hand-off
-from other devices and an index of recent observations (the `full` mode, about 1,000 tokens). A `lean` mode
-injects only the profile, open work state and a short rubric on when to call the search tools (300 to 400
-tokens): cheaper at every start, but recent work is then seen only if the agent searches for it. It is set with
-`MEM_INJECTION=lean` in `~/.memory/config` (`make connect-local INJECTION=lean`) or as the default in the viewer's
-header, and `make connect-status` shows the tokens each mode has served. During a session the agent searches with
-`memory_search`, `memory_timeline` and `memory_get`, and a hook mentions earlier work on a file the first time
-it is read. The `recall`, `brief` and `project-history` skills describe how to search well.
+from other devices and an index of 12 recent observations (the `full` mode, about 400 to 550 tokens). A `lean` mode
+injects only the profile, open work state and a short rubric on when to call the search tools (up to about
+250 tokens): cheaper at every start, but recent work is then seen only if the agent searches for it. A `smart`
+mode starts lean and, on the first prompt of a session, adds up to five matching memories (at most 250 tokens)
+when the prompt is relevant to some, and nothing otherwise. The mode is set with `MEM_INJECTION=lean|full|smart` in
+`~/.memory/config` (`make connect-local INJECTION=smart`) or as the default in the viewer's header, and
+`make connect-status` shows the tokens each mode has served. `MEM_CONTEXT_ROWS` and `MEM_CONTEXT_TYPES` size and
+limit the index of the full mode. During a session the agent searches with `memory_search`, `memory_timeline` and
+`memory_get`, and a hook mentions up to three earlier notes on a file the first time it is read
+(`MEM_FILE_CONTEXT_BUDGET` caps that per session; 0 turns it off). The `recall` skill describes how to search well,
+and `brief` how to compile a briefing on a topic.
 
-**Control.** The server's web viewer (`/viewer` on the server's URL, signed in with a device token) lets the user browse, search and forget memories and see where each came from. `memory_remember` stores something on request; `memory_forget` retracts it; `memory_feedback` marks one helpful, wrong or outdated, which lowers or raises a fact's confidence; `memory_explain` shows
-where an entry came from and `memory_history` how a fact or procedure changed over time. To keep one project out of memory entirely, add its key to `~/.memory/exclude`
+**Control.** The server's web viewer (`/viewer` on the server's URL, signed in with a device token) lets the user browse, search and forget memories and see where each came from. `memory_remember` stores something on request; `memory_forget` retracts it; `memory_feedback` marks one helpful, wrong or outdated, which lowers or raises a fact's confidence; `memory_get` with `trace`
+shows where an entry came from and how a fact or procedure changed over time. To keep one project out of memory entirely, add its key to `~/.memory/exclude`
 (one project key per line, such as `github.com/me/private-repo`). To stop capture on this machine, run
 `make disconnect` in the MemoryVault checkout.
 

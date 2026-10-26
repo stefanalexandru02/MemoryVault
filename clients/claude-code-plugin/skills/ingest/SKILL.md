@@ -1,6 +1,6 @@
 ---
 name: ingest
-description: Add this repository's documentation (ADRs, READMEs, runbooks) to shared memory so it can be searched later. Use only when the user asks to ingest, index or load the repo's docs into memory.
+description: Use when the user asks to load this repository's docs (ADRs, READMEs, runbooks) into shared memory.
 disable-model-invocation: true
 ---
 
