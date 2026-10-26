@@ -188,8 +188,8 @@ fn api_models() {
     let req: RecallRequest = serde_json::from_value(json!({"as_of": "2026-10-01T12:00:00Z"})).unwrap();
     assert!(req.as_of.is_some());
 
-    assert!(GetRequest { ids: vec![] }.validate().is_err());
-    assert!(GetRequest { ids: vec![uuid::Uuid::nil(); 21] }.validate().is_err());
+    assert!(GetRequest { ids: vec![], display: false }.validate().is_err());
+    assert!(GetRequest { ids: vec![uuid::Uuid::nil(); 21], display: false }.validate().is_err());
 
     let remember: RememberRequest = serde_json::from_value(json!({
         "kind": "fact", "subject": {"name": "alex"}, "predicate": "prefers.editor", "value": "helix", "value_text": "helix"

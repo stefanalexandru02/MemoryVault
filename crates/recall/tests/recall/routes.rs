@@ -264,7 +264,10 @@ async fn recall_stats_route(pool: PgPool) {
     let token = w.alice.token.as_str();
 
     let empty = stats(&app, token, "").await;
-    assert_eq!((empty.status, empty.json()), (StatusCode::OK, json!({"days": 7, "all_users": false, "modes": []})));
+    let work = json!({"tokens_served": 0, "memories_recalled": 0, "work_tokens_recalled": 0,
+                      "memories_without_work_estimate": 0, "ratio": null});
+    let want = json!({"days": 7, "all_users": false, "modes": [], "work": work});
+    assert_eq!((empty.status, empty.json()), (StatusCode::OK, want));
 
     // Alice: two full contexts (one render, one hit), one lean, one recall.
     let ctx = format!("/v1/context?project_key={PROJECT}");

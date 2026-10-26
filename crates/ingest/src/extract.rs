@@ -118,6 +118,19 @@ struct NewObservation<'a> {
     content_hash: &'a str,
     norm_key: Option<&'a str>,
     event_ids: &'a HashMap<i64, Uuid>,
+    window_tokens: &'a HashMap<i64, i32>,
+}
+
+/// Estimated tokens of each event of the window as the packet's `inputs.events` showed it to the extractor (one
+/// JSON line per event), by seq: what an observation citing the event stands for (`work_tokens`).
+fn window_event_tokens(inputs: &Value) -> HashMap<i64, i32> {
+    inputs
+        .get("events")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|e| Some((e.get("seq")?.as_i64()?, estimate_tokens(&e.to_string()))))
+        .collect()
 }
 
 async fn insert_observation(
@@ -132,17 +145,24 @@ async fn insert_observation(
         vec![obs.title.as_str(), obs.subtitle.as_deref().unwrap_or(""), obs.narrative.as_deref().unwrap_or("")];
     body.extend(obs.facts.iter().map(String::as_str));
     let mut source_ids: Vec<Uuid> = Vec::new();
+    // The window events it cites; None when it cites none the window contained.
+    let mut work_tokens: Option<i32> = None;
     for seq in &obs.source_event_seqs {
         if let Some(id) = n.event_ids.get(seq).filter(|id| !source_ids.contains(id)) {
             source_ids.push(*id);
+            if let Some(tokens) = n.window_tokens.get(seq) {
+                work_tokens = Some(work_tokens.unwrap_or(0).saturating_add(*tokens));
+            }
         }
     }
     let window_no = packet.inputs.get("window_no").and_then(Value::as_i64).and_then(|w| i32::try_from(w).ok());
     sqlx::query(
         "INSERT INTO observations (id, space_id, scope_kind, scope_key, session_id, window_no, type, title, subtitle,
                                    narrative, facts, concepts, entities, files, importance, sensitivity,
-                                   source_event_ids, extracted_by, content_hash, title_norm_key, token_estimate)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21)",
+                                   source_event_ids, extracted_by, content_hash, title_norm_key, token_estimate,
+                                   work_tokens)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21,
+                 $22)",
     )
     .bind(id)
     .bind(packet.space_id)
@@ -165,6 +185,7 @@ async fn insert_observation(
     .bind(n.content_hash)
     .bind(n.norm_key)
     .bind(estimate_tokens(&body.join(" ")))
+    .bind(work_tokens)
     .execute(&mut *conn)
     .await?;
     let after = json!({"type": obs.obs_type, "title": obs.title});
@@ -470,6 +491,7 @@ pub async fn apply_extract(
         .fetch_all(&mut *conn)
         .await?;
     let event_ids: HashMap<i64, Uuid> = rows.into_iter().map(|(s, id)| (i64::from(s), id)).collect();
+    let window_tokens = window_event_tokens(&packet.inputs);
 
     // observations; seq -> observations (new or matched) citing that event, for fact evidence
     let mut obs_by_seq: HashMap<i64, Vec<Uuid>> = HashMap::new();
@@ -494,6 +516,7 @@ pub async fn apply_extract(
                     content_hash: &hash,
                     norm_key: norm_key.as_deref(),
                     event_ids: &event_ids,
+                    window_tokens: &window_tokens,
                 };
                 let id = insert_observation(conn, packet, &session, new).await?;
                 *counts.get_mut("observations").expect("initialised") += 1;

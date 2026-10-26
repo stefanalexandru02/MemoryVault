@@ -420,6 +420,10 @@ impl MemoryItem {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct GetRequest {
     pub ids: Vec<Uuid>,
+    /// A person reads the bodies (the viewer), not a model: they are counted neither as tokens served nor as work
+    /// recalled (`GET /v1/stats/recall`).
+    #[serde(default)]
+    pub display: bool,
 }
 
 impl GetRequest {

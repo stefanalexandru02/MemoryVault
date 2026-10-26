@@ -329,10 +329,30 @@ and repeated items are merged. The last section lists the gaps that are still op
 - **Scope validation.** Scope validation errors return 422 `invalid_request`. Both legs filter scope on the owner row,
   not on the scope columns of the embeddings row.
 - **Logging.** `context` renders on a cache miss are written to `retrieval_log` with `mode = 'context'`.
-- **Cache hits log nothing.** Context-cache hits write no `access_log` row (5.3, 4.6), because the cached block carries
-  no row ids to log. Cache misses and every `/v1/recall` log. Index-only observation lines are not logged. Fact values
-  (including those rendered in the profile, resolved from `fact#` tags), procedure bodies, summaries and expanded
-  observations are.
+- **Cache hits log only what they render in full.** A context-cache hit writes an `access_log` row for the profile
+  facts and procedures of the cached block (`context_cache.recalled_ids`), not for its summaries (5.3, 4.6): the
+  cached block carries no other row ids. Cache misses and every `/v1/recall` log. Index-only observation lines are not
+  logged. Fact values (including those rendered in the profile, resolved from `fact#` tags), procedure bodies,
+  summaries and expanded observations are. A worker re-render (`cache::rerender`) is not served, so it writes
+  neither `retrieval_log` nor `access_log` (it used to log a context call).
+- **Work recalled (no spec section).** `GET /v1/stats/recall` has a `work` block: `tokens_served` (every call the
+  `modes` rows count), `memories_recalled`, `work_tokens_recalled`, `memories_without_work_estimate` and `ratio`. It
+  is named work recalled, not tokens saved, because it is an upper bound: it assumes the model would otherwise have
+  redone the work. `work_tokens` (migration 0901) is, for an observation, the estimated tokens (chars / 4) of the
+  events it cites as the extraction window showed them (one JSON line each); for a prompt or session summary, the
+  events of the prompt's windows or of the whole session, rendered the same way; for a fact or procedure, the sum
+  over its distinct evidence observations (a trigger keeps it in step with `evidence_observation_ids` and
+  `source_observation_ids`); NULL for documents, memories written by hand and day or week summaries (consolidated
+  summaries keep no link to the sessions they fold). The backfill of existing rows uses the estimate ingest stored
+  per event (`events.token_estimate`, the payload as stored, which retention keeps when it trims the payload), not
+  the window text, and leaves an observation NULL when one of its events is gone. Recalled are the memories whose
+  full body reached the model: `memory_get` bodies, the expanded observations, facts and procedures of `/v1/recall`,
+  and the profile facts and procedures of a session-start block (`access_log.recalled_ids`); summaries and documents
+  appear as excerpts and index rows as titles, so they do not count. Requests carry no session id, so a call counts
+  in the newest open session of its client started within a day (`access_log.session_id`), else per user and UTC
+  day; two sessions running at once on one client count as one. Each memory counts once per session. Model reads of
+  `memory_get` are now `get` rows of `retrieval_log` (tokens of the bodies as `memory_get` renders them), so the
+  served side of the ratio includes them; the viewer's detail pane sends `display: true` and is counted as neither.
 - **Search window.** `offset + limit` for `GET /v1/search` is capped at 1000.
 - **Output caps.** `memory_get` output is capped at about 24k characters, by shortening the longest bodies first.
   Search and timeline are capped at about 8k characters.

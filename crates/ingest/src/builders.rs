@@ -2,6 +2,7 @@
 //! summarize packets (spec 9.2), built once at creation.
 
 use chrono::{DateTime, Utc};
+use memvault_core::estimate_tokens;
 use memvault_core::prompts::PromptRegistry;
 use memvault_core::schemas::common::{EventKind, OutputSchemaName, PacketKind};
 use memvault_core::schemas::packets::{
@@ -195,6 +196,29 @@ pub fn packet_event(seq: i32, kind: EventKind, at: DateTime<Utc>, payload: &Valu
         }
     }
     out
+}
+
+/// Estimated tokens of the events a summary covers, each as an extraction window shows it ([`packet_event`]): the
+/// windows of prompt `prompt_no`, or the whole session (`None`). `None` when there are none.
+pub async fn summary_work_tokens(
+    conn: &mut PgConnection,
+    session_id: Uuid,
+    prompt_no: Option<i32>,
+) -> Result<Option<i32>, sqlx::Error> {
+    let events: Vec<(i32, EventKind, DateTime<Utc>, Value)> = sqlx::query_as(
+        "SELECT seq, kind, occurred_at, payload FROM events
+          WHERE session_id = $1
+            AND ($2::int IS NULL
+                 OR window_no IN (SELECT window_no FROM session_windows WHERE session_id = $1 AND prompt_no = $2))",
+    )
+    .bind(session_id)
+    .bind(prompt_no)
+    .fetch_all(conn)
+    .await?;
+    Ok(events
+        .iter()
+        .map(|(seq, kind, at, payload)| estimate_tokens(&packet_event(*seq, *kind, *at, payload).to_string()))
+        .reduce(i32::saturating_add))
 }
 
 fn to_titles(rows: Vec<(Uuid, String, String)>) -> Vec<RecentTitle> {

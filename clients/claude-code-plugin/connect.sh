@@ -18,7 +18,7 @@
 #   connect.sh probe [--url URL] [--token TOKEN]
 #       exit 0 when the token authenticates against the server (defaults come from ~/.memory/config)
 #   connect.sh status
-#       what is configured and whether it works, plus the tokens served by recent context and recall calls
+#       what is configured and whether it works, plus the tokens served by recent calls and the work recalled
 #   connect.sh clients
 #       the names of the Codex CLI and Gemini CLI setups that still hold our entries, one per line
 #
@@ -562,10 +562,10 @@ cmd_probe() {
   token_check "$(normalize_url "$url")" "$token"
 }
 
-# Tokens served by this user's recent context and recall calls (GET $1/v1/stats/recall with bearer $2), one
-# line per call kind and injection mode. Prints nothing when the server cannot be asked.
+# Tokens served by this user's recent context, recall and memory-get calls (GET $1/v1/stats/recall with bearer $2),
+# one line per call kind and injection mode, then the work recalled. Prints nothing when the server cannot be asked.
 print_recall_stats() {
-  local body days rows
+  local body days rows work
   body=$(curl -fsS -m 10 -H "Authorization: Bearer $2" "$1/v1/stats/recall" 2>/dev/null) || return 0
   days=$(printf '%s' "$body" | sed -n 's/.*"days":\([0-9]*\).*/\1/p')
   # Extended regex and `tr` instead of GNU-only sed escapes, so that macOS parses it too: every row ends in `}`.
@@ -577,6 +577,11 @@ print_recall_stats() {
   echo "tokens   served per call over the last ${days:-7} days (avg / p50 / p95)"
   printf '%s\n' "$rows" | awk '{ gsub(/"/, "", $2); if ($2 == "null") $2 = "-"
     printf "         %-8s %-5s %5d calls  %6.0f /%6.0f /%6.0f\n", $1, $2, $3, $4, $5, $6 }'
+  # The session work behind the memories whose full body reached the model: an upper bound, not a saving.
+  work=$(printf '%s' "$body" | sed -nE 's/.*"work":\{"tokens_served":([0-9]+),"memories_recalled":([0-9]+),"work_tokens_recalled":([0-9]+),"memories_without_work_estimate":[0-9]+,"ratio":(null|[0-9.e+-]+)\}.*/\1 \2 \3 \4/p')
+  [ -n "$work" ] && printf '%s\n' "$work" | awk '{ ratio = ($4 == "null") ? "" : sprintf(" (%.1fx)", $4)
+    printf "work     recalled: ~%d tokens behind %d memories, %d served%s, upper bound\n", $3, $2, $1, ratio }'
+  return 0
 }
 
 cmd_status() {

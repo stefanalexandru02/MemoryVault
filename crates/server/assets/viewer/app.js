@@ -490,7 +490,8 @@
     $detail.replaceChildren(h('div', { class: 'empty', text: 'Loading…' }));
     $detail.scrollTop = 0;
     try {
-      const res = await api('/v1/memories/get', { method: 'POST', body: { ids: [id] } });
+      // display: a person reads this body, so it is not counted as served to or recalled by a model.
+      const res = await api('/v1/memories/get', { method: 'POST', body: { ids: [id], display: true } });
       if (!state.selected || state.selected.id !== id) return;
       const item = (res.items || [])[0];
       if (!item) { $detail.replaceChildren(h('div', { class: 'empty', text: 'That memory is gone, or you cannot see it.' })); return; }
@@ -733,8 +734,9 @@
     fill();
   }
 
-  // Tokens served per session start (by injection mode) and per recall (GET /v1/stats/recall).
-  const CALL_LABELS = { context: 'Session start', smart: 'First prompt', recall: 'Recall' };
+  // Tokens served per session start (by injection mode), recall and memory get, and the work recalled
+  // (GET /v1/stats/recall).
+  const CALL_LABELS = { context: 'Session start', smart: 'First prompt', recall: 'Recall', get: 'Memory get' };
   function statsPanel() {
     const days = h('select', { class: 'input', 'aria-label': 'Window', onchange: () => load() },
       [1, 7, 30, 90].map((d) => h('option', { value: String(d), text: d === 1 ? 'Last day' : `Last ${d} days` })));
@@ -751,8 +753,16 @@
           h('thead', {}, h('tr', {}, ['Call', 'Mode', 'Calls', 'Avg tokens', 'p50', 'p95', 'Avg memories'].map((c) => h('th', { text: c })))),
           h('tbody', {}, stats.modes.map((m) => h('tr', {},
             h('td', { text: CALL_LABELS[m.mode] || m.mode }), h('td', { text: m.injection || '–' }),
-            num(m.calls), num(m.avg_tokens), num(m.p50_tokens), num(m.p95_tokens), h('td', { class: 'num', text: m.avg_hits.toFixed(1) })))))));
+            num(m.calls), num(m.avg_tokens), num(m.p50_tokens), num(m.p95_tokens), h('td', { class: 'num', text: m.avg_hits.toFixed(1) })))))),
+          workRecalled(stats.work));
       } catch (e) { if (e.status !== 401) out.replaceChildren(h('div', { class: 'error', text: e.message })); }
+    }
+    // Not a saving: the session work behind the memories whose full body reached the model, which assumes the
+    // model would otherwise have redone it.
+    function workRecalled(w) {
+      const missing = w.memories_without_work_estimate ? `, ${w.memories_without_work_estimate.toLocaleString()} of them without an estimate` : '';
+      const ratio = w.ratio == null ? '' : ` (${w.ratio.toFixed(1)}×)`;
+      return h('p', { text: `Work recalled: ~${w.work_tokens_recalled.toLocaleString()} tokens of session work behind ${w.memories_recalled.toLocaleString()} memories${missing}, against ${w.tokens_served.toLocaleString()} tokens served${ratio}. An upper bound: it assumes the model would otherwise have redone that work.` });
     }
     load();
     return h('div', { class: 'page-inner' },

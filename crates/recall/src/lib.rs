@@ -84,7 +84,8 @@ async fn context(
 ) -> Result<Response, ApiError> {
     require_scope(&state, &identity, MEMORIES_READ).await?;
     q.validate()?;
-    let options = context::ContextOptions { mode: q.mode, rows: q.rows, types: q.types.unwrap_or_default() };
+    let options =
+        context::ContextOptions { mode: q.mode, rows: q.rows, types: q.types.unwrap_or_default(), rerender: false };
     let block = context::render_context_with(
         &state,
         &identity,
@@ -164,7 +165,8 @@ async fn get_memories(
 ) -> Result<impl IntoResponse, ApiError> {
     require_scope(&state, &identity, MEMORIES_READ).await?;
     body.validate()?;
-    Ok(Json(engine::get_memories(&state, &identity, &body.ids).await?))
+    let reader = if body.display { engine::Reader::Person } else { engine::Reader::Model };
+    Ok(Json(engine::get_memories_with(&state, &identity, &body.ids, reader).await?))
 }
 
 async fn explain(

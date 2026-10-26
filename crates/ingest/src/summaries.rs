@@ -12,6 +12,7 @@ use memvault_core::{ApiError, AppliedCounts, PacketApplier, estimate_tokens};
 use serde_json::Value;
 use sqlx::PgConnection;
 
+use crate::builders;
 use crate::extract::{extracted_by, packet_session, scope_for};
 
 /// `summarize_prompt` (grain `prompt`) and `summarize_session` (grain `session`) packets.
@@ -49,6 +50,11 @@ impl PacketApplier for SummaryApplier {
         } else {
             None
         };
+        // A prompt summary without its prompt number cannot tell which windows it covers.
+        let work_tokens = match (prompt, prompt_no) {
+            (true, None) => None,
+            _ => builders::summary_work_tokens(conn, session.id, prompt_no).await?,
+        };
         let (period_start, period_end) =
             if prompt { (None, None) } else { (Some(session.started_at), session.ended_at) };
         let text: Vec<&str> = [
@@ -67,8 +73,8 @@ impl PacketApplier for SummaryApplier {
         sqlx::query(
             "INSERT INTO summaries (id, space_id, scope_kind, scope_key, grain, session_id, prompt_no, period_start,
                                     period_end, request, investigated, learned, completed, next_steps, notes,
-                                    extracted_by, token_estimate)
-             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17)",
+                                    extracted_by, token_estimate, work_tokens)
+             VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18)",
         )
         .bind(id)
         .bind(packet.space_id)
@@ -87,6 +93,7 @@ impl PacketApplier for SummaryApplier {
         .bind(&out.notes)
         .bind(extracted_by(packet))
         .bind(estimate_tokens(&text.join(" ")))
+        .bind(work_tokens)
         .execute(&mut *conn)
         .await?;
         enqueue_embed(conn, "summaries", id).await?;

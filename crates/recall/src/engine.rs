@@ -837,7 +837,8 @@ pub async fn recall(state: &AppState, identity: &Identity, req: RecallRequest) -
         hits: i32::try_from(pack.selected.len()).unwrap_or(i32::MAX),
     };
     let retrieval_id = log_retrieval(&mut tx, identity, rec, &pack).await?;
-    log_pack_access(&mut tx, identity, "recall", &pack.slots).await?;
+    let reads = pack_reads(&mut tx, &pack.slots).await?;
+    log_reads(&mut tx, identity, "recall", &reads).await?;
     tx.commit().await?;
     record_metrics("recall", &pack, started.elapsed().as_secs_f64());
     Ok(RecallResponse {
@@ -1269,32 +1270,30 @@ fn item_space(item: &MemoryItem) -> Uuid {
     }
 }
 
-/// One `access_log` row per space touched.
-pub async fn log_access(
-    conn: &mut PgConnection,
-    identity: &Identity,
-    action: &str,
-    items: &[&MemoryItem],
-) -> Result<(), sqlx::Error> {
-    let targets: Vec<(Uuid, Uuid)> = items.iter().map(|item| (item_space(item), item.id())).collect();
-    log_access_ids(conn, identity, action, &targets).await
+/// The content reads of one call, for `access_log`: `(space, id)` of every memory read, and the ids among them
+/// whose full body reached the model (what `GET /v1/stats/recall` counts as work recalled).
+#[derive(Debug, Default)]
+pub struct Reads {
+    pub targets: Vec<(Uuid, Uuid)>,
+    pub recalled: Vec<Uuid>,
 }
 
-/// `access_log` for what a recall or context pack returned: fact values (also the ones rendered in
-/// the profile, found again by their `fact#` tags), procedure bodies, summaries, document chunks and
-/// expanded observation narratives. Index-only observation lines (titles) are not content reads.
-pub async fn log_pack_access(
-    conn: &mut PgConnection,
-    identity: &Identity,
-    action: &str,
-    slots: &RecallSlots,
-) -> Result<(), sqlx::Error> {
-    let mut targets: Vec<(Uuid, Uuid)> = Vec::new();
-    targets.extend(slots.facts.iter().map(|f| (f.item.space_id, f.item.id)));
-    targets.extend(slots.procedures.iter().map(|p| (p.item.space_id, p.item.id)));
-    targets.extend(slots.summaries.iter().map(|s| (s.item.space_id, s.item.id)));
-    targets.extend(slots.documents.iter().map(|d| (d.item.space_id, d.item.id)));
-    targets.extend(slots.observations.iter().filter(|o| o.expanded).map(|o| (o.item.space_id, o.item.id)));
+/// Reads of whole memories; `recalled` when their bodies go to a model (not to a person, nor an explain trace).
+fn item_reads(items: &[&MemoryItem], recalled: bool) -> Reads {
+    let targets: Vec<(Uuid, Uuid)> = items.iter().map(|item| (item_space(item), item.id())).collect();
+    let recalled = if recalled { targets.iter().map(|t| t.1).collect() } else { Vec::new() };
+    Reads { targets, recalled }
+}
+
+/// Reads of a recall or context pack: fact values (also the ones rendered in the profile, found again by their
+/// `fact#` tags), procedure bodies, summaries, document chunks and expanded observation narratives. Index-only
+/// observation lines (titles) are not content reads. Recalled are the facts, procedures and expanded observations:
+/// summaries and documents show as excerpts.
+pub async fn pack_reads(conn: &mut PgConnection, slots: &RecallSlots) -> Result<Reads, sqlx::Error> {
+    let mut recalled: Vec<(Uuid, Uuid)> = Vec::new();
+    recalled.extend(slots.facts.iter().map(|f| (f.item.space_id, f.item.id)));
+    recalled.extend(slots.procedures.iter().map(|p| (p.item.space_id, p.item.id)));
+    recalled.extend(slots.observations.iter().filter(|o| o.expanded).map(|o| (o.item.space_id, o.item.id)));
     if let Some(profile) = &slots.profile {
         let tags: Vec<String> = profile
             .body_md
@@ -1311,37 +1310,107 @@ pub async fn log_pack_access(
             .bind(&tags)
             .fetch_all(&mut *conn)
             .await?;
-            targets.extend(rows);
+            recalled.extend(rows);
         }
     }
-    log_access_ids(conn, identity, action, &targets).await
+    let mut ids: Vec<Uuid> = Vec::new();
+    for (_, id) in &recalled {
+        if !ids.contains(id) {
+            ids.push(*id);
+        }
+    }
+    let mut targets = recalled;
+    targets.extend(slots.summaries.iter().map(|s| (s.item.space_id, s.item.id)));
+    targets.extend(slots.documents.iter().map(|d| (d.item.space_id, d.item.id)));
+    Ok(Reads { targets, recalled: ids })
 }
 
-async fn log_access_ids(
+/// Reads of a cached session-start block: the facts and procedures it renders in full, as far as they still exist.
+pub async fn cached_reads(conn: &mut PgConnection, recalled: &[Uuid]) -> Result<Reads, sqlx::Error> {
+    if recalled.is_empty() {
+        return Ok(Reads::default());
+    }
+    let targets: Vec<(Uuid, Uuid)> = sqlx::query_as(
+        "SELECT space_id, id FROM facts WHERE id = ANY($1)
+         UNION ALL SELECT space_id, id FROM procedures WHERE id = ANY($1)",
+    )
+    .bind(recalled)
+    .fetch_all(&mut *conn)
+    .await?;
+    let recalled = targets.iter().map(|t| t.1).collect();
+    Ok(Reads { targets, recalled })
+}
+
+/// The session a call's recalled memories are counted in: the newest session of the caller's client that is still
+/// open and started within the last day (requests carry no session id; the hooks open the session before they
+/// ask for context). `None` outside one: the stats then count per user and UTC day.
+async fn current_session(conn: &mut PgConnection, identity: &Identity) -> Result<Option<Uuid>, sqlx::Error> {
+    sqlx::query_scalar(
+        "SELECT id FROM sessions WHERE client_id = $1 AND ended_at IS NULL AND started_at > now() - interval '1 day'
+          ORDER BY started_at DESC, id DESC LIMIT 1",
+    )
+    .bind(identity.client_id)
+    .fetch_optional(conn)
+    .await
+}
+
+/// One `access_log` row per space touched, with the recalled ids among its targets and the session they count in.
+pub async fn log_reads(
     conn: &mut PgConnection,
     identity: &Identity,
     action: &str,
-    targets: &[(Uuid, Uuid)],
+    reads: &Reads,
 ) -> Result<(), sqlx::Error> {
-    let mut per_space: BTreeMap<Uuid, Vec<Uuid>> = BTreeMap::new();
-    for (space, id) in targets {
-        per_space.entry(*space).or_default().push(*id);
+    let session = if reads.recalled.is_empty() { None } else { current_session(conn, identity).await? };
+    let mut per_space: BTreeMap<Uuid, (Vec<Uuid>, Vec<Uuid>)> = BTreeMap::new();
+    for (space, id) in &reads.targets {
+        let (targets, recalled) = per_space.entry(*space).or_default();
+        targets.push(*id);
+        if reads.recalled.contains(id) && !recalled.contains(id) {
+            recalled.push(*id);
+        }
     }
-    for (space, ids) in per_space {
-        sqlx::query("INSERT INTO access_log (id, space_id, client_id, action, target_ids) VALUES ($1, $2, $3, $4, $5)")
-            .bind(new_id())
-            .bind(space)
-            .bind(identity.client_id)
-            .bind(action)
-            .bind(ids)
-            .execute(&mut *conn)
-            .await?;
+    for (space, (targets, recalled)) in per_space {
+        sqlx::query(
+            "INSERT INTO access_log (id, space_id, client_id, action, target_ids, recalled_ids, session_id)
+             VALUES ($1, $2, $3, $4, $5, $6, $7)",
+        )
+        .bind(new_id())
+        .bind(space)
+        .bind(identity.client_id)
+        .bind(action)
+        .bind(targets)
+        .bind(recalled)
+        .bind(session)
+        .execute(&mut *conn)
+        .await?;
     }
     Ok(())
 }
 
-/// Full bodies for up to 20 ids; writes `access_log` (spec 6.4).
+/// Who reads the bodies [`get_memories_with`] returns.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Reader {
+    /// An agent (`memory_get`, `POST /v1/memories/get`): tokens served and work recalled.
+    Model,
+    /// A person (the viewer): a content read only.
+    Person,
+}
+
+/// Full bodies for up to 20 ids, read by a model; writes `access_log` (spec 6.4) and `retrieval_log`.
 pub async fn get_memories(state: &AppState, identity: &Identity, ids: &[Uuid]) -> Result<GetResponse, ApiError> {
+    get_memories_with(state, identity, ids, Reader::Model).await
+}
+
+/// [`get_memories`] for `reader`. A model's read is also a `get` row of `retrieval_log` (the bodies' estimated
+/// tokens as `memory_get` renders them), and its memories count as recalled.
+pub async fn get_memories_with(
+    state: &AppState,
+    identity: &Identity,
+    ids: &[Uuid],
+    reader: Reader,
+) -> Result<GetResponse, ApiError> {
+    let started = Instant::now();
     if ids.is_empty() || ids.len() > MAX_GET_IDS {
         return Err(ApiError::invalid(format!("ids must hold 1-{MAX_GET_IDS} items")));
     }
@@ -1355,7 +1424,29 @@ pub async fn get_memories(state: &AppState, identity: &Identity, ids: &[Uuid]) -
     let mut found = load_items(&mut tx, &wanted).await?;
     let items: Vec<MemoryItem> = wanted.iter().filter_map(|id| found.remove(id)).collect();
     let missing = wanted.iter().filter(|id| !items.iter().any(|i| i.id() == **id)).copied().collect();
-    log_access(&mut tx, identity, "get", &items.iter().collect::<Vec<_>>()).await?;
+    let model = reader == Reader::Model;
+    log_reads(&mut tx, identity, "get", &item_reads(&items.iter().collect::<Vec<_>>(), model)).await?;
+    if model && !items.is_empty() {
+        let mut spaces: Vec<Uuid> = Vec::new();
+        for item in &items {
+            if !spaces.contains(&item_space(item)) {
+                spaces.push(item_space(item));
+            }
+        }
+        let rec = RetrievalRecord {
+            mode: "get",
+            query: None,
+            spaces: &spaces,
+            scopes: &[],
+            budgets: None,
+            latency_ms: i64::try_from(started.elapsed().as_millis()).unwrap_or(i64::MAX),
+            injection: None,
+            tokens: estimate_tokens(&render::memory_items_markdown(&items)),
+            hits: i32::try_from(items.len()).unwrap_or(i32::MAX),
+        };
+        let selected = items.iter().map(|i| json!({ "id": i.id(), "slot": i.table() })).collect();
+        insert_retrieval(&mut tx, identity, rec, json!([]), Value::Array(selected), false).await?;
+    }
     let found_ids: Vec<Uuid> = items.iter().map(MemoryItem::id).collect();
     let feedback = feedback_counts(&mut tx, &found_ids).await?;
     tx.commit().await?;
@@ -1535,7 +1626,7 @@ pub async fn explain(state: &AppState, identity: &Identity, id: Uuid) -> Result<
     .bind(id)
     .fetch_all(&mut *tx)
     .await?;
-    log_access(&mut tx, identity, "explain", &[&item]).await?;
+    log_reads(&mut tx, identity, "explain", &item_reads(&[&item], false)).await?;
     tx.commit().await?;
     let audit = audit
         .into_iter()
