@@ -74,11 +74,12 @@ pub fn etag(body: &str) -> String {
     format!("\"{}\"", hex::encode(&Sha256::digest(body.as_bytes())[..12]))
 }
 
-/// A cached block and the number of memories it was rendered from.
+/// A cached block, the number of memories it was rendered from and the ones it renders in full.
 #[derive(Debug, Clone, sqlx::FromRow)]
 pub struct Cached {
     pub body: String,
     pub hits: i32,
+    pub recalled: Vec<Uuid>,
 }
 
 /// The cached block for `key` if it is younger than [`MAX_AGE_SECONDS`] and no matching invalidation
@@ -86,7 +87,7 @@ pub struct Cached {
 /// `user_tx` (rows are visible to their user only).
 pub async fn lookup(conn: &mut PgConnection, key: &str) -> Result<Option<Cached>, sqlx::Error> {
     sqlx::query_as(
-        "SELECT body_md AS body, hit_count AS hits FROM context_cache
+        "SELECT body_md AS body, hit_count AS hits, recalled_ids AS recalled FROM context_cache
           WHERE cache_key = $1 AND rendered_at > now() - make_interval(secs => $2)
             AND NOT memsvc_context_stale(space_ids, scopes, rendered_at)",
     )
@@ -109,6 +110,8 @@ pub struct CacheEntry<'a> {
     pub variant: &'a Variant,
     /// Memories the block was rendered from.
     pub hits: i32,
+    /// Memories it renders in full (`access_log.recalled_ids` of a hit).
+    pub recalled: &'a [Uuid],
     /// When the render began (see [`render_start`]), not when it is stored.
     pub rendered_at: DateTime<Utc>,
 }
@@ -123,14 +126,16 @@ pub async fn store(conn: &mut PgConnection, entry: &CacheEntry<'_>, body: &str) 
     let scopes: Vec<String> = entry.scopes.iter().map(Scope::as_text).collect();
     sqlx::query(
         "INSERT INTO context_cache (cache_key, user_id, space_id, space_ids, scopes, device_id, source, body_md, etag,
-                                    token_estimate, rendered_at, client_id, project_key, mode, hit_count, obs_rows, obs_types)
-         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $13, $11, $12, $14, $15, $16, $17)
+                                    token_estimate, rendered_at, client_id, project_key, mode, hit_count, obs_rows, obs_types,
+                                    recalled_ids)
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $13, $11, $12, $14, $15, $16, $17, $18)
          ON CONFLICT (cache_key) DO UPDATE SET
            space_id = EXCLUDED.space_id, space_ids = EXCLUDED.space_ids, scopes = EXCLUDED.scopes,
            device_id = EXCLUDED.device_id, source = EXCLUDED.source, body_md = EXCLUDED.body_md,
            etag = EXCLUDED.etag, token_estimate = EXCLUDED.token_estimate, rendered_at = EXCLUDED.rendered_at,
            client_id = EXCLUDED.client_id, project_key = EXCLUDED.project_key, mode = EXCLUDED.mode,
-           hit_count = EXCLUDED.hit_count, obs_rows = EXCLUDED.obs_rows, obs_types = EXCLUDED.obs_types",
+           hit_count = EXCLUDED.hit_count, obs_rows = EXCLUDED.obs_rows, obs_types = EXCLUDED.obs_types,
+           recalled_ids = EXCLUDED.recalled_ids",
     )
     .bind(entry.key)
     .bind(entry.identity.user_id)
@@ -149,6 +154,7 @@ pub async fn store(conn: &mut PgConnection, entry: &CacheEntry<'_>, body: &str) 
     .bind(entry.hits)
     .bind(i32::try_from(entry.variant.rows).unwrap_or(i32::MAX))
     .bind(&entry.variant.types)
+    .bind(entry.recalled)
     .execute(conn)
     .await?;
     Ok(())
@@ -307,6 +313,7 @@ pub async fn rerender(state: &AppState, payload: &serde_json::Value) -> Result<b
         mode: Some(job.mode),
         rows: u32::try_from(job.obs_rows).ok(),
         types: job.obs_types.iter().filter_map(|t| t.parse().ok()).collect(),
+        rerender: true,
     };
     crate::context::render_context_with(
         state,

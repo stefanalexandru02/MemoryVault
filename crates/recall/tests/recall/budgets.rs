@@ -130,7 +130,12 @@ async fn block(w: &World, mode: InjectionMode) -> String {
 }
 
 async fn block_with_rows(w: &World, rows: u32) -> String {
-    let options = context::ContextOptions { mode: Some(InjectionMode::Full), rows: Some(rows), types: Vec::new() };
+    let options = context::ContextOptions {
+        mode: Some(InjectionMode::Full),
+        rows: Some(rows),
+        types: Vec::new(),
+        rerender: false,
+    };
     context::render_context_with(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", &options)
         .await
         .unwrap()

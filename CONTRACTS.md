@@ -142,6 +142,11 @@ Full DDL of spec 4.1-4.7 plus:
   (except `api_tokens.last_used_at` and `clients.last_seen_at/current_project_key/current_project_at`) and DELETE on
   `jobs`; the SECURITY DEFINER functions are executable by `memsvc_app`/`memsvc_system` only, not PUBLIC.
   Admin writes go through the system role, so they are unaffected.
+- **0901 work recalled** (ingest + recall, numbered after the hardening): nullable `work_tokens` on observations,
+  summaries, facts and procedures (estimated tokens of the session events behind the row), backfilled from
+  `events.token_estimate`; trigger `memsvc_derived_work_tokens` sets it on facts and procedures from their evidence
+  observations; `access_log.session_id`, `.recalled_ids` (the targets whose full body reached the model) and a partial
+  index on `(client_id, created_at)`; `context_cache.recalled_ids`.
 - **0300 memories**: `memory_feedback(id, space_id, user_id, client_id, target_table, target_id, verdict, note,
   created_at)`, append-only, unique on `(user_id, target_id, verdict)` (a repeat is a no-op), forced space RLS
   (writes need owner/writer); `facts.disputed_at` (the planner's queue of facts whose net negative feedback
@@ -466,11 +471,12 @@ Choices made while implementing, with the reason; the spec text stays as written
 - **Same-value test of a fact candidate (10.4 step 3)** is jsonb equality or case-insensitive `value_text` equality;
   the "cosine > 0.95 after embedding" test is not done, because appliers do not get the embedder. Paraphrased
   confirmations land as conflict candidates and consolidation merges them.
-- **Context cache hits write no `access_log` row (5.3, 4.6)**: a cache miss logs what the pack returned
-  (`action = 'context'`), `POST /v1/recall` always logs (`'recall'`); the cached block carries no row ids to log
-  on a hit. A hit does write a `retrieval_log` row (empty candidates and selection, the block's `hit_count`) so
-  `GET /v1/stats/recall` counts every context call, and `tokens` there is the estimate of the text returned,
-  live sections included.
+- **Context cache hits log only the memories the block renders in full (5.3, 4.6)**: a cache miss logs what the pack
+  returned (`action = 'context'`), `POST /v1/recall` always logs (`'recall'`); on a hit the `access_log` row holds the
+  block's profile facts and procedures (`context_cache.recalled_ids`), the only row ids it keeps. A hit also writes a
+  `retrieval_log` row (empty candidates and selection, the block's `hit_count`) so `GET /v1/stats/recall` counts
+  every context call, and `tokens` there is the estimate of the text returned, live sections included. A worker
+  re-render is not served and logs neither.
 - **Windows hook and static build (2, D5)**: mem-hook is `cfg(unix)`/`cfg(windows)` portable (it type-checks for
   `x86_64-pc-windows-gnu`; it has not been run on Windows). The Linux build is a static (`crt-static`) glibc
   binary via `install.sh`; a musl build needs `musl-tools` (see the plugin README).

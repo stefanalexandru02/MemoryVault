@@ -76,6 +76,13 @@ async fn viewer_is_served_with_a_strict_content_security_policy(pool: PgPool) {
     assert!(js.contains("/feedback`") && js.contains("'outdated'"));
     // The header sets the default injection mode and the Work tab shows the tokens served.
     assert!(js.contains("/v1/me/settings") && js.contains("/v1/stats/recall"));
+    // ... with the work recalled under it, labelled as an upper bound and never as a saving; the detail pane's
+    // reads are a person's, so they are not counted as recalled.
+    assert!(
+        js.contains("Work recalled: ~") && js.contains("workRecalled(stats.work)") && js.contains("An upper bound")
+    );
+    assert!(!js.to_lowercase().contains("tokens saved"));
+    assert!(js.contains("body: { ids: [id], display: true }"));
     let css = send(&app, Method::GET, "/viewer/app.css", None, None).await.text();
     assert!(css.contains(".history li.current") && css.contains(".btn.verdict") && css.contains("td.num"));
 }

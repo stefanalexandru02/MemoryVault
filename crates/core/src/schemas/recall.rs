@@ -390,8 +390,8 @@ pub struct StatsQuery {
     pub all: bool,
 }
 
-/// Tokens served by one kind of call (`context` or `recall`) in one injection mode over the window.
-/// `injection` is empty for `recall`, which has no mode.
+/// Tokens served by one kind of call (`context`, `smart` for the first prompt, `recall`, or `get` for memory bodies)
+/// in one injection mode over the window. `injection` is empty for `recall` and `get`, which have no mode.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize, sqlx::FromRow)]
 pub struct ModeStats {
     pub mode: String,
@@ -409,6 +409,32 @@ pub struct RecallStats {
     /// True when the numbers cover every user (admin with `all=true`).
     pub all_users: bool,
     pub modes: Vec<ModeStats>,
+    pub work: WorkRecalled,
+}
+
+/// Work recalled over the same window: the session work behind the memories whose full body reached the model,
+/// next to the tokens served. It is an upper bound on what memory saved, not a saving: it assumes the model would
+/// otherwise have redone that work (read the same files, run the same commands), which it often would not.
+///
+/// A memory counts as recalled when its full body reached the model: `memory_get` bodies (MCP and
+/// `POST /v1/memories/get`), the expanded observations, facts and procedures of `POST /v1/recall`, and the profile
+/// facts and procedures of a session-start block. Index rows (titles of the session-start index, search, timeline,
+/// first-prompt rows, file context) do not. Each memory counts once per session (once per user and UTC day for
+/// calls outside an open session), so fetching it again does not add up.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct WorkRecalled {
+    /// Tokens of every call in `modes`.
+    pub tokens_served: i64,
+    /// Recalled memories, once per session.
+    pub memories_recalled: i64,
+    /// Sum of `work_tokens` over the recalled memories that have one: the estimated tokens of the session events an
+    /// observation or summary was made from, summed over the observations behind a fact or procedure.
+    pub work_tokens_recalled: i64,
+    /// Recalled memories without an estimate (documents, memories written by hand, day and week summaries, rows
+    /// whose events were gone, memories deleted since).
+    pub memories_without_work_estimate: i64,
+    /// `work_tokens_recalled / tokens_served`; null when nothing was served.
+    pub ratio: Option<f64>,
 }
 
 /// `POST /v1/recall/{retrieval_id}/feedback` (memories:write).

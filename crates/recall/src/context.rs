@@ -19,8 +19,8 @@ use uuid::Uuid;
 
 use crate::cache::{self, CacheEntry, Variant};
 use crate::engine::{
-    Pack, PackOptions, RetrievalRecord, build_pack, log_cached_retrieval, log_pack_access, log_retrieval,
-    record_metrics,
+    Pack, PackOptions, Reads, RetrievalRecord, build_pack, cached_reads, log_cached_retrieval, log_reads,
+    log_retrieval, pack_reads, record_metrics,
 };
 use crate::render::{self, SinceRow};
 use crate::settings;
@@ -63,10 +63,10 @@ pub fn context_scopes(project_key: Option<&str>, device_id: &str) -> Vec<Scope> 
     scopes
 }
 
-/// What a block was served from, for `retrieval_log`.
+/// What a block was served from, for `retrieval_log`, and what it read, for `access_log`.
 enum Served {
-    Cache { hits: i32 },
-    Render(Box<Pack>),
+    Cache { hits: i32, reads: Reads },
+    Render(Box<Pack>, Reads),
 }
 
 /// What a context request asks for besides where it comes from.
@@ -79,6 +79,9 @@ pub struct ContextOptions {
     pub rows: Option<u32>,
     /// Observation types the index is limited to; empty = all.
     pub types: Vec<ObservationType>,
+    /// A worker re-render ahead of the next SessionStart ([`cache::rerender`]): the block is cached, not served, so
+    /// neither `retrieval_log` nor `access_log` records it.
+    pub rerender: bool,
 }
 
 /// A rendered block and the mode it was rendered in (None for a `resume`, which has no block).
@@ -137,7 +140,8 @@ pub async fn render_context_with(
     let (body, served) = match cache::lookup(&mut tx, &key).await? {
         Some(cached) => {
             metrics::counter!("memsvc_context_cache_hit_total").increment(1);
-            (cached.body, Served::Cache { hits: cached.hits })
+            let reads = cached_reads(&mut tx, &cached.recalled).await?;
+            (cached.body, Served::Cache { hits: cached.hits, reads })
         }
         None => {
             metrics::counter!("memsvc_context_cache_miss_total").increment(1);
@@ -160,6 +164,7 @@ pub async fn render_context_with(
                 InjectionMode::Full => render::context_body(&pack.slots),
                 InjectionMode::Lean | InjectionMode::Smart => render::lean_body(&pack.slots),
             };
+            let reads = pack_reads(&mut tx, &pack.slots).await?;
             let entry = CacheEntry {
                 key: &key,
                 identity,
@@ -170,10 +175,11 @@ pub async fn render_context_with(
                 source,
                 variant: &variant,
                 hits: hits_of(&pack),
+                recalled: &reads.recalled,
                 rendered_at,
             };
             cache::store(&mut tx, &entry, &body).await?;
-            (body, Served::Render(Box::new(pack)))
+            (body, Served::Render(Box::new(pack), reads))
         }
     };
     let (since, listed) = match (mode, project_key) {
@@ -195,12 +201,14 @@ pub async fn render_context_with(
         hits,
     };
     match &served {
-        Served::Cache { hits } => {
+        _ if options.rerender => {}
+        Served::Cache { hits, reads } => {
             log_cached_retrieval(&mut tx, identity, rec(*hits)).await?;
+            log_reads(&mut tx, identity, "context", reads).await?;
         }
-        Served::Render(pack) => {
+        Served::Render(pack, reads) => {
             log_retrieval(&mut tx, identity, rec(hits_of(pack)), pack).await?;
-            log_pack_access(&mut tx, identity, "context", &pack.slots).await?;
+            log_reads(&mut tx, identity, "context", reads).await?;
             record_metrics("context", pack, started.elapsed().as_secs_f64());
         }
     }

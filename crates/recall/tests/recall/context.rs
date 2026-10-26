@@ -225,9 +225,13 @@ async fn invalidation_deletes_matching_blocks_and_queues_rerender(pool: PgPool) 
         sqlx::query_scalar("SELECT count(*) FROM jobs WHERE type = 'render_context'").fetch_one(&w.pool).await.unwrap();
     assert_eq!(queued, 1);
 
-    // The worker's re-render puts the block back; the next SessionStart is a cache hit.
+    // The worker's re-render puts the block back; the next SessionStart is a cache hit. Nothing was served, so
+    // nothing is logged (no tokens served, no memories recalled).
+    let logged = "SELECT (SELECT count(*) FROM retrieval_log) + (SELECT count(*) FROM access_log)";
+    let before: i64 = sqlx::query_scalar(logged).fetch_one(&w.pool).await.unwrap();
     assert!(cache::rerender(&w.state, payload).await.unwrap());
     assert_eq!(cache_rows(&w.pool).await, 1);
+    assert_eq!(sqlx::query_scalar::<_, i64>(logged).fetch_one(&w.pool).await.unwrap(), before);
     let body: String = sqlx::query_scalar("SELECT body_md FROM context_cache").fetch_one(&w.pool).await.unwrap();
     assert!(first.contains(body.lines().next().unwrap()));
     // A whole-space payload (bare id) also works; unknown clients are skipped by rerender.
@@ -288,6 +292,7 @@ async fn render_racing_with_invalidation_is_not_served(pool: PgPool) {
                 source: "startup",
                 variant: &variant,
                 hits: 0,
+                recalled: &[],
                 rendered_at,
             };
             cache::store(&mut tx, &entry, "body").await.unwrap();
@@ -455,7 +460,7 @@ async fn index_rows_and_types_shape_the_block_and_the_cache(pool: PgPool) {
     let id = &w.alice.identity;
     let state = &w.state;
     let render = |rows: Option<u32>, types: Vec<ObservationType>| async move {
-        let options = context::ContextOptions { mode: Some(InjectionMode::Full), rows, types };
+        let options = context::ContextOptions { mode: Some(InjectionMode::Full), rows, types, rerender: false };
         context::render_context_with(state, id, Some(PROJECT), None, "startup", &options).await.map(|b| b.body)
     };
 
@@ -495,8 +500,12 @@ async fn index_rows_and_types_shape_the_block_and_the_cache(pool: PgPool) {
 
     // The lean block has no index, so rows and types do not split its cache.
     let lean = |rows: Option<u32>| async move {
-        let options =
-            context::ContextOptions { mode: Some(InjectionMode::Lean), rows, types: vec![ObservationType::Bugfix] };
+        let options = context::ContextOptions {
+            mode: Some(InjectionMode::Lean),
+            rows,
+            types: vec![ObservationType::Bugfix],
+            rerender: false,
+        };
         context::render_context_with(state, id, Some(PROJECT), None, "startup", &options).await.map(|b| b.body)
     };
     sqlx::query("DELETE FROM context_cache").execute(&w.pool).await.unwrap();
@@ -528,7 +537,8 @@ async fn the_index_mixes_types_instead_of_filling_up_with_one(pool: PgPool) {
         o.embed = false;
         insert_obs(&w, o).await;
     }
-    let options = context::ContextOptions { mode: Some(InjectionMode::Full), rows: Some(8), types: vec![] };
+    let options =
+        context::ContextOptions { mode: Some(InjectionMode::Full), rows: Some(8), types: vec![], rerender: false };
     let md = context::render_context_with(&w.state, &w.alice.identity, Some(PROJECT), None, "startup", &options)
         .await
         .unwrap()

@@ -215,10 +215,11 @@ nothing. Each answer that adds rows is one `smart` row in `GET /v1/stats/recall`
 nothing are only counted in `memsvc_smart_context_total{outcome}`.
 
 `GET /v1/stats/recall?days=7` returns, for your own calls, the count and the average, median and 95th percentile
-of tokens served (and the average number of memories selected) per call kind (`context`, `recall`) and
-injection mode. Every context call is counted, cached or rendered. `days` is 1 to 90; an admin token can add
-`all=true` for every user. `make connect-status` prints the same table, and the viewer's Work state tab shows it.
-Compare the two modes there before settling on one.
+of tokens served (and the average number of memories selected) per call kind (`context`, `smart`, `recall`, and
+`get` for the bodies `memory_get` returns) and injection mode. Every context call is counted, cached or rendered.
+Its `work` block is the work recalled over the same window (see [Context cost](#context-cost)). `days` is 1 to 90;
+an admin token can add `all=true` for every user. `make connect-status` prints the same table, and the viewer's Work
+state tab shows it. Compare the two modes there before settling on one.
 
 ## Context cost
 
@@ -244,6 +245,20 @@ first read of a file with 5 notes and 300 for skill frontmatter. The index is ch
 differ from each other instead of 28 that often did not. Put the knobs in `~/.memory/config`; `make connect-status`
 and the viewer's Work state tab show what each mode has actually served on your data, and `memvault evals replay`
 compares the modes on a recorded set. Observations made by subagents never enter the session-start index.
+
+What the cost buys back is shown as **work recalled**, never as tokens saved. Each observation keeps `work_tokens`,
+the estimated tokens of the session events it was extracted from, as the extraction window showed them; a prompt or
+session summary keeps those of the events it summarises, and a fact or procedure the sum over the observations it
+was derived from (documents, memories written by hand and day or week summaries have none). A memory counts as
+recalled only when its full body reached the model: a `memory_get` body, an expanded observation, fact or procedure
+of `POST /v1/recall`, or a profile fact or procedure of a session-start block. Index rows (the session-start index,
+search, timeline, first-prompt rows, file context) are titles and do not count, and each memory counts once per
+session (once per day outside one), however often it is fetched. The `work` block of `GET /v1/stats/recall` sums it:
+`tokens_served` (every call of the window), `memories_recalled`, `work_tokens_recalled`,
+`memories_without_work_estimate` and `ratio` (work recalled per token served). `make connect-status` prints it as one
+line (`work recalled: ~X tokens behind N memories, Y served (Zx), upper bound`) and the viewer shows it under the
+tokens served. It is an upper bound: it assumes the model would otherwise have redone that work, reading the same
+files and running the same commands, which it often would not. None of it is put into the model's context.
 
 ## Installing the Claude Code plugin
 

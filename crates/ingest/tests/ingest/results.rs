@@ -4,6 +4,7 @@ use std::time::Duration;
 
 use axum::http::StatusCode;
 use memvault_core::auth::scopes::TokenKind;
+use memvault_core::estimate_tokens;
 use memvault_core::invalidate::{CHANNEL, parse_payload};
 use memvault_core::schemas::common::ScopeKind;
 use memvault_core::test_support::{Seeded, seed_identity};
@@ -25,6 +26,22 @@ async fn leased_extract(c: &Ctx, who: &Seeded) -> (Uuid, String) {
 
 async fn count(pool: &PgPool, sql: &str) -> i64 {
     sqlx::query_scalar(sql).fetch_one(pool).await.unwrap()
+}
+
+/// Estimated tokens of the events `seqs` (every event when empty) of a packet's window, one JSON line each.
+async fn window_tokens(pool: &PgPool, packet: &str, seqs: &[i64]) -> i32 {
+    let inputs: Value = sqlx::query_scalar("SELECT inputs FROM work_packets WHERE id = $1::uuid")
+        .bind(packet)
+        .fetch_one(pool)
+        .await
+        .unwrap();
+    inputs["events"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .filter(|e| seqs.is_empty() || seqs.contains(&e["seq"].as_i64().unwrap()))
+        .map(|e| estimate_tokens(&e.to_string()))
+        .sum()
 }
 
 #[sqlx::test(migrations = "../../migrations")]
@@ -109,6 +126,15 @@ async fn extract_result_applies_once(pool: PgPool) {
     assert_eq!(extracted["runner"], "laptop");
     assert_eq!(extracted["packet_id"], id.as_str());
     assert_eq!(norm.unwrap().len(), 32);
+    // work: the cited events as the window showed them to the extractor; the fact sums its evidence
+    let expected = window_tokens(&pool, &id, &[1, 2]).await;
+    assert!(expected > 0);
+    let work: (Option<i32>, Option<i32>) =
+        sqlx::query_as("SELECT (SELECT work_tokens FROM observations), (SELECT work_tokens FROM facts)")
+            .fetch_one(&pool)
+            .await
+            .unwrap();
+    assert_eq!(work, (Some(expected), Some(expected)));
 
     // fact candidate with a new entity; hint; embed jobs; audit
     let (status, evidence, conflict): (String, Vec<Uuid>, bool) =
@@ -304,6 +330,12 @@ async fn prompt_and_session_summaries(pool: PgPool) {
     assert_eq!(count(&pool, "SELECT count(*) FROM jobs WHERE payload->>'owner_table' = 'summaries'").await, 2);
     let kinds: Vec<String> = c.packets(s).await.into_iter().map(|p| p.0).collect();
     assert_eq!(kinds, ["extract", "summarize_prompt", "summarize_session"]);
+
+    // work: the prompt's one window and the whole session are the same four events here
+    let window = window_tokens(&pool, &id, &[]).await;
+    let work: Vec<Option<i32>> =
+        sqlx::query_scalar("SELECT work_tokens FROM summaries ORDER BY created_at").fetch_all(&pool).await.unwrap();
+    assert_eq!(work, [Some(window), Some(window)]);
 }
 
 #[sqlx::test(migrations = "../../migrations")]
