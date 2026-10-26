@@ -166,7 +166,9 @@ async fn index_rows_are_distinct_mixed_and_cost_a_few_tokens_each(pool: PgPool) 
     let (six, twelve, thirty) =
         (block_with_rows(&w, 6).await, block_with_rows(&w, 12).await, block_with_rows(&w, 30).await);
     assert_eq!([index_rows(&six), index_rows(&twelve), index_rows(&thirty)], [6, 12, 30]);
-    let tokens = |b: &str| estimate_tokens(b);
+    // Day headers are paid per day, not per row, and how many days the rows span depends on the
+    // time of day the test runs, so they are left out of the per-row cost.
+    let tokens = |b: &str| estimate_tokens(&b.lines().filter(|l| !l.starts_with("**")).collect::<Vec<_>>().join("\n"));
     assert!(tokens(&twelve) - tokens(&six) <= 6 * INDEX_ROW_TOKENS, "{} vs {}", tokens(&twelve), tokens(&six));
     assert!(tokens(&thirty) - tokens(&twelve) <= 18 * INDEX_ROW_TOKENS, "{} vs {}", tokens(&thirty), tokens(&twelve));
     // No title appears twice, and no type fills more than a third of the rows (the fixture has six types).
